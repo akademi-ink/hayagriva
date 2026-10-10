@@ -1605,4 +1605,190 @@ mod regression {
         let items = two_articles();
         assert_eq!(bibliography(&style, &items[0..1]), "2021;14(2)");
     }
+
+    /// Render one bibliography entry with citeproc's HTML output format, like
+    /// the audit runner does.
+    fn bibliography_html(
+        style: &citationberg::IndependentStyle,
+        items: &[csl_json::Item],
+    ) -> String {
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            items.iter().map(CitationItem::with_entry).collect(),
+            style,
+            None,
+            &locales,
+            Some(1),
+        ));
+        let rendered = driver.finish(BibliographyRequest::new(style, None, &locales));
+        let mut buf = String::new();
+        citeproc_bib::render(&rendered.bibliography.unwrap(), &mut buf, false).unwrap();
+        buf
+    }
+
+    /// Render citations in plain text, one string per cluster.
+    fn citations_plain(
+        style: &citationberg::IndependentStyle,
+        clusters: Vec<Vec<CitationItem<'_, csl_json::Item>>>,
+    ) -> Vec<String> {
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        for cluster in clusters {
+            driver.citation(CitationRequest::new(
+                cluster,
+                style,
+                None,
+                &locales,
+                Some(1),
+            ));
+        }
+        let rendered = driver.finish(BibliographyRequest::new(style, None, &locales));
+        rendered
+            .citations
+            .iter()
+            .map(|citation| {
+                let mut buf = String::new();
+                citation
+                    .citation
+                    .write_buf(&mut buf, hayagriva::BufWriteFormat::Plain)
+                    .unwrap();
+                buf
+            })
+            .collect()
+    }
+
+    /// `F-122`: adjacent leaves that inherit the same formatting declaration
+    /// must render as one run, even when element containers lie between them.
+    /// citeproc-js closes one `<i>` around the ordinal number and the edition
+    /// label of `future-medicine`'s `locators` group, so the engine must too.
+    /// Rendered from the real archived style (the audit book); expected string
+    /// is a citeproc-js render of the same item.
+    #[test]
+    fn f122_formatted_group_renders_one_run() {
+        let Style::Independent(style) =
+            ArchivedStyle::by_name("future-medicine").unwrap().get()
+        else {
+            panic!("test has dependent style");
+        };
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Scalable Event Processing: Architectures and Patterns",
+              "author": [{ "given": "Márta", "family": "Kovács" }],
+              "edition": "2",
+              "publisher": "Verdant Academic Press",
+              "publisher-place": "Amsterdam",
+              "issued": { "date-parts": [[2020]] }
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\"><div \
+             class=\"csl-left-margin\">1</div><div \
+             class=\"csl-right-inline\">Kovács M. <i>Scalable Event Processing: \
+             Architectures and Patterns</i>. (<i>2nd Edition</i>). Verdant \
+             Academic Press, Amsterdam (2020).</div></div></div>"
+        );
+    }
+
+    /// Guard for `F-122`: a leaf that declares its own formatting must not be
+    /// merged into the surrounding declared run. citeproc-js opens one tag
+    /// pair per formatting declaration, so a redundant inner declaration gets
+    /// its own nested pair. Expected string is a citeproc-js render of the
+    /// same style and item.
+    #[test]
+    fn f122_declared_format_keeps_its_own_run() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f122-guard</id><title>f122-guard</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <group font-style="italic" delimiter=", ">
+                  <text variable="title"/>
+                  <text variable="publisher" font-style="italic"/>
+                </group>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Alpha",
+              "publisher": "Beta Press"
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\">\
+             <i>Alpha, <i>Beta Press</i></i></div></div>"
+        );
+    }
+
+    /// `F-123`: the citation layout's `delimiter` joins the cites of one
+    /// citation; it must not delimit the branches of a top-level `cs:choose`
+    /// (the stray `; ` before a comma-prefixed segment in
+    /// `thomson-reuters-legal-tax-and-accounting-australia`). Expected strings
+    /// are citeproc-js renders of the same style and items.
+    #[test]
+    fn f123_layout_delimiter_not_applied_within_choose() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info><id>f123</id><title>f123</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation>
+                <layout suffix="." delimiter="; ">
+                  <choose>
+                    <if type="book">
+                      <group delimiter=", ">
+                        <text variable="title"/>
+                        <text variable="container-title"/>
+                      </group>
+                      <text variable="URL" prefix=", "/>
+                    </if>
+                  </choose>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = items(
+            r#"[
+              {
+                "id": "ITEM-1",
+                "type": "book",
+                "title": "Alpha",
+                "container-title": "Container",
+                "URL": "https://example.com/alpha"
+              },
+              {
+                "id": "ITEM-2",
+                "type": "book",
+                "title": "Beta",
+                "container-title": "Container Two",
+                "URL": "https://example.com/beta"
+              }
+            ]"#,
+        );
+        let out = citations_plain(
+            &style,
+            vec![
+                vec![CitationItem::new(&items[0], None, None, false, None)],
+                vec![
+                    CitationItem::new(&items[0], None, None, false, None),
+                    CitationItem::new(&items[1], None, None, false, None),
+                ],
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                "Alpha, Container, https://example.com/alpha.",
+                "Alpha, Container, https://example.com/alpha; Beta, Container Two, \
+                 https://example.com/beta.",
+            ]
+        );
+    }
 }

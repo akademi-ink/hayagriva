@@ -1365,16 +1365,32 @@ impl<T: EntryLike> Iterator for BranchConditionIter<'_, '_, T> {
 impl RenderCsl for citationberg::Group {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
         let ambient = *ctx.writing.formatting();
-        let idx = ctx.push_elem(self.to_formatting());
+        // The outer element holds the affixes; citeproc-js writes them outside
+        // the group's formatting tags (F-116).
+        let idx = ctx.push_elem(citationberg::Formatting::default());
         let affixes = self.to_affixes();
 
         let affix_loc = ctx.apply_prefix(&affixes, ambient);
 
         let info = self.will_have_info(ctx).1;
 
+        // citeproc-js opens one formatting tag pair per declaration and keeps
+        // it open for everything that inherits it. In bibliography entries the
+        // declaration is recorded as a scope on the element so that adjacent
+        // leaves inside it render as one run (`<i>2nd Edition</i>` instead of
+        // `<i>2nd </i><i>Edition</i>`, F-122), and so that a child which
+        // re-declares formatting gets its own nested pair, as citeproc-js
+        // does. Citation trees keep their leaves fully formatted and record
+        // no scopes, as before.
+        let scope = ctx.push_scoped_elem(self.to_formatting());
+
         let delim_idx = ctx.writing.push_delimiter(self.delimiter.clone());
         render_with_delimiter(&self.children, ctx);
         ctx.writing.pop_delimiter(delim_idx);
+
+        // Close the formatting scope before writing the suffix so that the
+        // affixes stay outside of it.
+        ctx.commit_elem(scope, None, None);
 
         ctx.apply_suffix(&affixes, affix_loc, ambient);
 
@@ -1475,7 +1491,11 @@ impl RenderCsl for citationberg::LayoutRenderingElement {
 impl RenderCsl for citationberg::Layout {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
         let format_idx = ctx.push_format(self.to_formatting());
-        let delim_idx = ctx.writing.push_delimiter(self.delimiter.clone());
+        // The layout delimiter joins the cites of one citation (handled by the
+        // driver). citeproc-js does not delimit the layout's own children or
+        // the branches of a top-level `cs:choose` with it (F-123), so it must
+        // not be visible to them: only `cs:group` exposes a delimiter.
+        let delim_idx = ctx.writing.push_delimiter(None);
         for e in &self.elements {
             e.render(ctx);
         }
