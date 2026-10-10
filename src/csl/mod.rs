@@ -243,6 +243,22 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 + entries.iter().position(|e| e.entry == item).expect("entry not found")
         };
 
+        // citeproc-js assigns citation numbers lazily: when a citation is
+        // appended, the entries known so far are numbered by the bibliography
+        // sort restricted to them. Later citations can therefore introduce a
+        // number that precedes the numbers of earlier citations (e.g. an
+        // alphabetically earlier author first cited last), and the numbers
+        // shown in a citation reflect that state at append time. The engine
+        // renders all citations in one pass, so we track the entries cited up
+        // to each citation and number only those.
+        let bibliography_sorts = bib_style
+            .csl
+            .bibliography
+            .as_ref()
+            .and_then(|b| b.sort.as_ref())
+            .is_some();
+        let mut cited: HashSet<*const T> = HashSet::new();
+
         let mut seen: HashSet<*const T> = HashSet::new();
         let mut res: Vec<SpeculativeCiteRender<T>> = Vec::new();
         let mut last_cite: Option<&CitationItem<T>> = None;
@@ -250,11 +266,33 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         for citation in &mut self.citations {
             let style = citation.style();
 
+            let numbering: HashMap<*const T, usize> = if bibliography_sorts {
+                cited.extend(citation.items.iter().map(|item| item.entry as *const T));
+                let mut map = HashMap::with_capacity(cited.len());
+                let mut number = self.citation_number_offset;
+                for entry in entries.iter() {
+                    if cited.contains(&(entry.entry as *const T)) {
+                        map.insert(entry.entry as *const T, number);
+                        number += 1;
+                    }
+                }
+                map
+            } else {
+                HashMap::new()
+            };
+            let number_for = |item: &T| {
+                if bibliography_sorts {
+                    *numbering.get(&(item as *const T)).expect("entry not numbered")
+                } else {
+                    citation_number(item)
+                }
+            };
+
             style.sort(
                 &mut citation.items,
                 style.csl.citation.sort.as_ref(),
                 citation.locale.as_ref(),
-                citation_number,
+                number_for,
             );
 
             let items = &citation.items;
@@ -293,7 +331,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     },
                     speculative: SpeculativeCiteProperties::speculate(
                         None,
-                        citation_number(entry),
+                        number_for(entry),
                         IbidState::with_last(item, last_cite),
                     ),
                 };
@@ -582,6 +620,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                             meta: Some(ElemMeta::Entry(
                                 item.cite_props.certain.initial_idx,
                             )),
+                            formatting: Formatting::default(),
                         }));
 
                         if let Some(suffix) = &item.suffix {
@@ -623,12 +662,22 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
         let mut bib_render = if let Some(bibliography) = &request.style.bibliography {
             let mut items = Vec::new();
-            for entry in entries.into_iter() {
+            for (entry_idx, entry) in entries.into_iter().enumerate() {
                 let cited_item = res
                     .iter()
                     .flat_map(|cite| cite.items.iter())
                     .find(|item| item.entry == entry.entry)
                     .unwrap();
+
+                // A sorted bibliography numbers its entries by the final
+                // bibliography order. Citations carry the lazy per-citation
+                // numbers from step 1, so the entry's number must be set
+                // explicitly here.
+                let mut speculative =
+                    cited_item.cite_props.speculative.for_bibliography();
+                if bibliography_sorts {
+                    speculative.citation_number = self.citation_number_offset + entry_idx;
+                }
 
                 items.push((
                     simplify_children(
@@ -637,10 +686,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                                 entry.entry,
                                 CiteProperties {
                                     certain: cited_item.cite_props.certain,
-                                    speculative: cited_item
-                                        .cite_props
-                                        .speculative
-                                        .for_bibliography(),
+                                    speculative,
                                 },
                                 cited_item.locale.as_ref(),
                                 request.locale.as_ref(),
@@ -657,6 +703,12 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 &mut items,
             );
 
+            // The bibliography layout's formatting is applied around the whole
+            // entry (including the second-field-align field divs) by
+            // serializers, mirroring citeproc-js.
+            let entry_formatting =
+                Formatting::default().apply(bibliography.layout.to_formatting());
+
             Some(RenderedBibliography {
                 hanging_indent: bibliography.hanging_indent,
                 second_field_align: bibliography.second_field_align,
@@ -666,9 +718,14 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     .into_iter()
                     .map(|(mut i, key)| {
                         if bibliography.second_field_align.is_some() {
-                            BibliographyItem::new(key, i.remove_any_meta(), i)
+                            BibliographyItem::new(
+                                key,
+                                i.remove_any_meta(),
+                                entry_formatting,
+                                i,
+                            )
                         } else {
-                            BibliographyItem::new(key, None, i)
+                            BibliographyItem::new(key, None, entry_formatting, i)
                         }
                     })
                     .collect(),
@@ -1524,6 +1581,7 @@ fn substitute_subsequent_authors(
                         children: ElemChildren(vec![ElemChild::Text(subs.clone())]),
                         display: e.display,
                         meta: e.meta,
+                        formatting: e.formatting,
                     }),
                     true,
                 );
@@ -1552,6 +1610,7 @@ fn substitute_subsequent_authors(
                     display: e.display,
                     meta: e.meta,
                     children: ElemChildren(children),
+                    formatting: e.formatting,
                 }),
                 changed,
             )
@@ -1715,13 +1774,23 @@ pub struct BibliographyItem {
     /// The item's first field. Only available when required by the
     /// `second-field-align` CSL property.
     pub first_field: Option<ElemChild>,
+    /// The formatting declared by the bibliography layout. Serializers that
+    /// reproduce citeproc-js HTML apply it around the whole entry (including
+    /// the second-field-align field divs), which is where citeproc-js opens
+    /// the layout's formatting tags.
+    pub formatting: Formatting,
     /// The rendered item.
     pub content: ElemChildren,
 }
 
 impl BibliographyItem {
-    fn new(key: String, first_field: Option<ElemChild>, content: ElemChildren) -> Self {
-        Self { key, first_field, content }
+    fn new(
+        key: String,
+        first_field: Option<ElemChild>,
+        formatting: Formatting,
+        content: ElemChildren,
+    ) -> Self {
+        Self { key, first_field, formatting, content }
     }
 }
 
@@ -2537,7 +2606,7 @@ impl WritingContext {
         self.save_to_block();
         let pos = self.elem_stack.len();
         self.elem_stack.push(ElemChildren::new());
-        DisplayLoc::new(pos, self.push_format(format))
+        DisplayLoc::new(pos, self.push_format(format), Formatting::default())
     }
 
     /// Remove the last subtree and discard it.
@@ -2642,11 +2711,14 @@ impl WritingContext {
         self.save_to_block();
         let children = self.elem_stack.pop().unwrap();
 
-        if display.is_some() || meta.is_some() {
+        if display.is_some()
+            || meta.is_some()
+            || (loc.2 != Formatting::default() && children.has_content())
+        {
             self.elem_stack
                 .last_mut()
                 .0
-                .push(Elem { children, display, meta }.into());
+                .push(Elem { children, display, meta, formatting: loc.2 }.into());
         } else {
             self.elem_stack.last_mut().0.extend(children.0);
         }
@@ -3105,6 +3177,17 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// include a new element or to check that the subtree is empty.
     fn push_elem(&mut self, format: citationberg::Formatting) -> DisplayLoc {
         self.writing.push_elem(format)
+    }
+
+    /// Like [`Self::push_elem`], but records the declared formatting on the
+    /// resulting element while rendering a bibliography entry. Serializers
+    /// use it to reproduce citeproc-js's tags for a formatting declaration.
+    fn push_scoped_elem(&mut self, format: citationberg::Formatting) -> DisplayLoc {
+        let mut loc = self.writing.push_elem(format);
+        if self.bibliography {
+            loc.2 = Formatting::default().apply(format);
+        }
+        loc
     }
 
     /// Remove the last subtree and discard it.
@@ -3603,11 +3686,11 @@ impl<'a, T: EntryLike> Context<'a, T> {
 struct FormatIdx(NonZeroUsize);
 
 #[must_use = "element stack must be popped"]
-struct DisplayLoc(NonZeroUsize, FormatIdx);
+struct DisplayLoc(NonZeroUsize, FormatIdx, Formatting);
 
 impl DisplayLoc {
-    fn new(pos: NonZeroUsize, format_idx: FormatIdx) -> Self {
-        Self(pos, format_idx)
+    fn new(pos: NonZeroUsize, format_idx: FormatIdx, formatting: Formatting) -> Self {
+        Self(pos, format_idx, formatting)
     }
 }
 

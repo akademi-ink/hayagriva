@@ -18,6 +18,13 @@ pub struct Elem {
     pub display: Option<Display>,
     /// The CSL construct that created this element.
     pub meta: Option<ElemMeta>,
+    /// The formatting declared by this element, to be applied to everything
+    /// inside of it. This is only recorded while rendering bibliography
+    /// entries, where citeproc-js opens one formatting tag per declaration.
+    /// Serializers that reproduce citeproc-js HTML read this field; others
+    /// can ignore it because [`ElemChild::Text`] leaves already carry their
+    /// fully resolved formatting.
+    pub formatting: Formatting,
 }
 
 impl Elem {
@@ -81,7 +88,9 @@ impl Elem {
     }
 
     pub(super) fn may_inline(&self) -> bool {
-        self.display.is_none() && self.meta.is_none()
+        self.display.is_none()
+            && self.meta.is_none()
+            && self.formatting == Formatting::default()
     }
 }
 
@@ -173,7 +182,8 @@ pub(super) fn coalesce_text_runs(children: &mut ElemChildren, ambient: Formattin
                     ));
                 }
                 ElemChild::Elem(e) => {
-                    let breaks = e.display.is_some();
+                    let breaks =
+                        e.display.is_some() || e.formatting != Formatting::default();
                     if breaks {
                         tokens.push((path.clone(), Token::Break));
                     }
@@ -268,12 +278,20 @@ fn is_collapsible_seam_char(c: char) -> bool {
     matches!(c, ' ' | '\u{a0}' | ':' | '.' | ';' | '!' | '?' | ',')
 }
 
+/// `true` when a leading `.` after this character is redundant: citeproc-js's
+/// left-to-right punctuation map collapses `;.` to `;`, `:.` to `:`, `!.` to
+/// `!` and `?.` to `?` (but keeps `,.` as `,.`).
+fn absorbs_period(last: char) -> bool {
+    matches!(last, ';' | ':' | '!' | '?')
+}
+
 /// Append `next` to `last`, avoiding a duplicated collapsible character at
 /// the seam. This mirrors citeproc-js's output adjustments, which collapse
 /// e.g. a group delimiter `". "` followed by a `" ("` prefix, or a sibling
 /// prefix `". "` after a text ending in `"."`.
 fn merge_text(last: &mut String, next: &str) {
     let next = match (last.chars().next_back(), next.chars().next()) {
+        (Some(a), Some('.')) if absorbs_period(a) => &next[1..],
         (Some(a), Some(b)) if a == b && is_collapsible_seam_char(a) => {
             &next[b.len_utf8()..]
         }
@@ -290,15 +308,21 @@ fn merge_text(last: &mut String, next: &str) {
 fn normalize_seams(children: &mut ElemChildren) {
     let mut last: Option<(char, Formatting)> = None;
 
+    /// Whether the first character of a leaf is made redundant by the last
+    /// character of the preceding leaf.
+    fn seam_collapse(last: char, first: char) -> bool {
+        (last == first && is_collapsible_seam_char(first))
+            || (first == '.' && absorbs_period(last))
+    }
+
     fn visit(children: &mut ElemChildren, last: &mut Option<(char, Formatting)>) {
         for child in &mut children.0 {
             match child {
                 ElemChild::Text(t) => {
                     if let (Some((last_char, last_format)), Some(first)) =
                         (last.as_ref(), t.text.chars().next())
-                        && *last_char == first
                         && *last_format == t.formatting
-                        && is_collapsible_seam_char(first)
+                        && seam_collapse(*last_char, first)
                     {
                         t.text.remove(0);
                     }
@@ -310,9 +334,8 @@ fn normalize_seams(children: &mut ElemChildren) {
                 ElemChild::Link { text, .. } => {
                     if let (Some((last_char, last_format)), Some(first)) =
                         (last.as_ref(), text.text.chars().next())
-                        && *last_char == first
                         && *last_format == text.formatting
-                        && is_collapsible_seam_char(first)
+                        && seam_collapse(*last_char, first)
                     {
                         text.text.remove(0);
                     }

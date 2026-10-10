@@ -1,0 +1,93 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+Citation numbers depend on the bibliography sort among the entries known so
+far. citeproc-js numbers lazily: the first citation only knows the entry it
+cites, so it renders `[1]` even though an alphabetically earlier entry is
+cited later. Once that entry is known, the numbering shifts (F-119).
+
+>>===== RESULT =====>>
+[1]
+[1, 2]
+[1]
+[1, 3]
+<<===== RESULT =====<<
+
+>>===== CITATION-ITEMS =====>>
+[
+    [{ "id": "ferreira" }],
+    [{ "id": "ferreira" }, { "id": "kovacs" }],
+    [{ "id": "ferreira" }],
+    [{ "id": "kovacs" }, { "id": "almeida" }]
+]
+<<===== CITATION-ITEMS =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" version="1.0" class="in-text">
+  <info>
+    <id>x</id>
+    <title>t</title>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation collapse="citation-number">
+    <sort>
+      <key variable="citation-number"/>
+    </sort>
+    <layout prefix="[" suffix="]" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <sort>
+      <key macro="author"/>
+      <key macro="year"/>
+    </sort>
+    <layout>
+      <text variable="citation-number" suffix=". "/>
+      <text macro="author"/>
+      <text macro="year" prefix=" "/>
+    </layout>
+  </bibliography>
+  <macro name="author">
+    <names variable="author">
+      <name initialize-with="" name-as-sort-order="all"/>
+    </names>
+  </macro>
+  <macro name="year">
+    <date variable="issued">
+      <date-part name="year"/>
+    </date>
+  </macro>
+</style>
+<<===== CSL =====<<
+
+>>===== INPUT =====>>
+[
+    {
+        "id": "ferreira",
+        "type": "article-journal",
+        "title": "Article",
+        "author": [{ "family": "Ferreira", "given": "Ana" }],
+        "issued": { "date-parts": [[2021]] }
+    },
+    {
+        "id": "kovacs",
+        "type": "book",
+        "title": "Book",
+        "author": [{ "family": "Kovacs", "given": "Marta" }],
+        "issued": { "date-parts": [[2020]] }
+    },
+    {
+        "id": "almeida",
+        "type": "webpage",
+        "title": "Page",
+        "author": [{ "family": "Almeida", "given": "Sofia" }],
+        "issued": { "date-parts": [[2019]] }
+    }
+]
+<<===== INPUT =====<<
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<

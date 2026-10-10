@@ -44,7 +44,17 @@ impl RenderCsl for citationberg::Text {
         // Whether this is the first thing rendered in the current item,
         // before the element's own affixes are applied.
         let nothing_rendered = ctx.writing.len() == 0;
-        let depth = ctx.push_elem(self.formatting);
+        // While rendering bibliography entries, citeproc-js opens the
+        // formatting scope of a text element around its value only: affixes
+        // and quote marks stay outside and inherit the enclosing formatting.
+        // The value is rendered in its own scope element so that serializers
+        // can reproduce the tags.
+        let scoped = ctx.bibliography && !self.formatting.is_empty();
+        let depth = ctx.push_elem(if scoped {
+            citationberg::Formatting::default()
+        } else {
+            self.formatting
+        });
 
         // Only print affixes if this macro is not used out of its original context.
         #[allow(clippy::match_like_matches_macro)]
@@ -86,6 +96,8 @@ impl RenderCsl for citationberg::Text {
         if self.quotes {
             ctx.push_quotes();
         }
+
+        let scope_depth = scoped.then(|| ctx.push_scoped_elem(self.formatting));
 
         ctx.may_strip_periods(self.strip_periods);
         let cidx = ctx.push_case(self.text_case);
@@ -154,6 +166,10 @@ impl RenderCsl for citationberg::Text {
 
         ctx.pop_case(cidx);
         ctx.stop_stripping_periods();
+
+        if let Some(scope_depth) = scope_depth {
+            ctx.commit_elem(scope_depth, None, None);
+        }
 
         if self.quotes {
             ctx.pop_quotes();
@@ -1278,16 +1294,24 @@ impl<T: EntryLike> Iterator for BranchConditionIter<'_, '_, T> {
                 }
             }
             BranchConditionPos::Type => {
-                if let Some(kind) = &self.cond.type_ {
-                    if self.idx >= kind.len() {
+                if let Some(kinds) = &self.cond.type_ {
+                    if self.idx >= kinds.len() {
                         self.next_case();
                         return self.next();
                     }
 
-                    let kind = kind[self.idx];
-                    self.idx += 1;
+                    // citeproc-js always combines the values of a `type`
+                    // attribute with "any" semantics, regardless of the
+                    // branch's `match` policy (`type="book report"` is true
+                    // for books even under the default `match="all"`).
+                    let mut matched = false;
+                    while self.idx < kinds.len() {
+                        let kind = kinds[self.idx];
+                        self.idx += 1;
+                        matched |= self.ctx.instance.entry.matches_entry_type(kind);
+                    }
 
-                    Some(self.ctx.instance.entry.matches_entry_type(kind))
+                    Some(matched)
                 } else {
                     self.next_case();
                     self.next()

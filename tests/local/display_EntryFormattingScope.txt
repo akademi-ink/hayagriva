@@ -1,0 +1,76 @@
+>>===== MODE =====>>
+bibliography
+<<===== MODE =====<<
+
+Formatting declared on the bibliography layout is opened around the whole
+entry, outside the `second-field-align` field divs, and a text element's own
+formatting wraps its value only — not its affixes. This mirrors citeproc-js's
+tag placement for `thieme-german` (F-118).
+
+>>===== RESULT =====>>
+<div class="csl-bib-body"><div class="csl-entry"><span style="baseline"><div class="csl-left-margin">[<span style="baseline">1</span>]</div><div class="csl-right-inline">Kovacs, M. <i>Alpha Book</i>. Amsterdam: Verdant Academic Press (2020).</div></span></div><div class="csl-entry"><span style="baseline"><div class="csl-left-margin">[<span style="baseline">2</span>]</div><div class="csl-right-inline">Ferreira, A. <i>Beta Book</i>. Lisbon: Akademi Press (2021).</div></span></div></div>
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" version="1.0" class="in-text">
+  <info>
+    <id>x</id>
+    <title>t</title>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography second-field-align="flush">
+    <layout vertical-align="baseline" font-variant="normal">
+      <text variable="citation-number" prefix="[" suffix="]" vertical-align="baseline"/>
+      <text macro="author"/>
+      <text variable="title" font-style="italic" suffix=". "/>
+      <text macro="publisher"/>
+    </layout>
+  </bibliography>
+  <macro name="author">
+    <names variable="author" suffix=". ">
+      <name initialize-with="" name-as-sort-order="all" delimiter=", " delimiter-precedes-last="always"/>
+    </names>
+  </macro>
+  <macro name="publisher">
+    <group delimiter=" " suffix=".">
+      <text variable="publisher-place" suffix=":"/>
+      <text variable="publisher"/>
+      <date variable="issued" prefix="(" suffix=")">
+        <date-part name="year"/>
+      </date>
+    </group>
+  </macro>
+</style>
+<<===== CSL =====<<
+
+>>===== INPUT =====>>
+[
+    {
+        "id": "a",
+        "type": "book",
+        "title": "Alpha Book",
+        "author": [{ "family": "Kovacs", "given": "Marta" }],
+        "publisher": "Verdant Academic Press",
+        "publisher-place": "Amsterdam",
+        "issued": { "date-parts": [[2020]] }
+    },
+    {
+        "id": "b",
+        "type": "book",
+        "title": "Beta Book",
+        "author": [{ "family": "Ferreira", "given": "Ana" }],
+        "publisher": "Akademi Press",
+        "publisher-place": "Lisbon",
+        "issued": { "date-parts": [[2021]] }
+    }
+]
+<<===== INPUT =====<<
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<
