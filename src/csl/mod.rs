@@ -441,63 +441,53 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         }
 
         // 3. Group adjacent citations.
+        //
+        // A cite group is a run of adjacent items that render the same names
+        // element: like citeproc-js, each item is compared with its immediate
+        // predecessor only. Non-adjacent items with the same names start a new
+        // group (and receive a fresh `group_idx`), and item order is never
+        // changed.
         for cite in res.iter_mut() {
-            // This map contains the last index of each entry with this names
-            // elem.
-            let mut map: HashMap<String, usize> = HashMap::new();
+            let Some(delim) =
+                cite.request.style.citation.cite_group_delimiter.as_deref().or_else(
+                    || {
+                        cite.request
+                            .style
+                            .citation
+                            .layout
+                            .delimiter
+                            .as_deref()
+                            .filter(|_| cite.request.style.citation.collapse.is_some())
+                    },
+                )
+            else {
+                continue;
+            };
+
             let mut group_idx = 0;
+            let mut prev_name_elem: Option<String> = None;
 
-            for i in 0..cite.items.len() {
-                let Some(delim) =
-                    cite.request.style.citation.cite_group_delimiter.as_deref().or_else(
-                        || {
-                            cite.request
-                                .style
-                                .citation
-                                .layout
-                                .delimiter
-                                .as_deref()
-                                .filter(|_| {
-                                    cite.request.style.citation.collapse.is_some()
-                                })
-                        },
-                    )
-                else {
-                    continue;
-                };
+            for item in cite.items.iter_mut() {
+                let name_elem = item.rendered.find_names().map(|e| format!("{e:?}"));
 
-                let Some(name_elem) =
-                    cite.items[i].rendered.find_names().map(|e| format!("{e:?}"))
-                else {
-                    continue;
-                };
-
-                let mut prev = None;
-                let target = *map
-                    .entry(name_elem)
-                    .and_modify(|i| {
-                        prev = Some(*i);
-                        *i += 1
-                    })
-                    .or_insert_with(|| {
-                        group_idx += 1;
-                        i
-                    });
-
-                let mut pos = i;
-                while target < pos {
-                    cite.items.swap(pos, pos - 1);
-                    pos -= 1;
+                match name_elem {
+                    Some(name_elem) => {
+                        if prev_name_elem.as_deref() == Some(name_elem.as_str()) {
+                            // Only items that continue the current cite group
+                            // are joined to the preceding item with the
+                            // cite-group delimiter. The first item of each
+                            // group keeps the citation layout delimiter.
+                            item.delim_override = Some(delim);
+                        } else {
+                            group_idx += 1;
+                        }
+                        item.group_idx = Some(group_idx);
+                        prev_name_elem = Some(name_elem);
+                    }
+                    // An item without a names element cannot be part of a
+                    // group and also breaks adjacency for the next item.
+                    None => prev_name_elem = None,
                 }
-
-                // Only items that continue an existing cite group are joined
-                // to the preceding item with the cite-group delimiter. The
-                // first item of each group keeps the citation layout
-                // delimiter.
-                if prev.is_some() {
-                    cite.items[target].delim_override = Some(delim);
-                }
-                cite.items[target].group_idx = Some(group_idx);
             }
         }
 
@@ -1500,7 +1490,7 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                 match group_idx {
                     // This is our group.
                     Some((_, idx)) if Some(idx) == cite.items[i].group_idx => {
-                        if c == Collapse::YearSuffix
+                        if matches!(c, Collapse::YearSuffix | Collapse::YearSuffixRanged)
                             && let DisambiguateState::YearSuffix(s) =
                                 cite.items[i].cite_props.speculative.disambiguation
                             && s > 0
@@ -1531,7 +1521,58 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                 }
             }
 
-            // TODO: Year ranged.
+            // For `year-suffix-ranged`, runs of three or more consecutive
+            // year suffixes collapse into a range (`2000a–e`): the cites in
+            // between are hidden and the range delimiter is placed before the
+            // final cite of the run.
+            if c == Collapse::YearSuffixRanged {
+                fn year_suffix<T: EntryLike>(
+                    item: &SpeculativeItemRender<'_, T>,
+                ) -> Option<u32> {
+                    match item.cite_props.speculative.disambiguation {
+                        DisambiguateState::YearSuffix(s) => Some(u32::from(s)),
+                        _ => None,
+                    }
+                }
+
+                let mut group_start = 0;
+                while group_start < cite.items.len() {
+                    let Some(idx) = cite.items[group_start].group_idx else {
+                        group_start += 1;
+                        continue;
+                    };
+                    let mut group_end = group_start + 1;
+                    while group_end < cite.items.len()
+                        && cite.items[group_end].group_idx == Some(idx)
+                    {
+                        group_end += 1;
+                    }
+
+                    let mut start = group_start;
+                    while start < group_end {
+                        let Some(base) = year_suffix(&cite.items[start]) else {
+                            start += 1;
+                            continue;
+                        };
+                        let mut end = start;
+                        while end + 1 < group_end
+                            && year_suffix(&cite.items[end + 1])
+                                == Some(base + (end + 1 - start) as u32)
+                        {
+                            end += 1;
+                        }
+                        if end > start + 1 {
+                            for item in &mut cite.items[start + 1..end] {
+                                item.hidden = true;
+                            }
+                            cite.items[end].delim_override = Some("–");
+                        }
+                        start = end + 1;
+                    }
+
+                    group_start = group_end;
+                }
+            }
         }
         None => {}
     }
@@ -3034,6 +3075,12 @@ struct CertainCiteProperties {
 impl CertainCiteProperties {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this item is at the first position, honoring a forced position
+    /// override (mirrors the `position="first"` choose test).
+    fn is_first_position(&self) -> bool {
+        self.position.map_or(self.is_first, |p| p == CitePosition::First)
     }
 }
 

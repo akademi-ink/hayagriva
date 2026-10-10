@@ -2028,4 +2028,102 @@ mod regression {
             ]
         );
     }
+
+    /// `F-126`: `first-reference-note-number` is empty on a first reference and
+    /// carries the note of the first citation on later references. Expected
+    /// strings are citeproc-js renders of the same style and clusters
+    /// (`position_ResetNoteNumbers`).
+    #[test]
+    fn f126_first_reference_note_number_empty_on_first_cite() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info><id>f126</id><title>f126</title><updated>2009-08-10T04:49:00+09:00</updated></info>
+              <citation>
+                <layout delimiter="; ">
+                  <choose>
+                    <if position="ibid"><text value="ibid"/></if>
+                    <else>
+                      <group delimiter=", ">
+                        <text variable="title"/>
+                        <group delimiter=" ">
+                          <text value="n"/>
+                          <text variable="first-reference-note-number"/>
+                        </group>
+                      </group>
+                    </else>
+                  </choose>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = items(
+            r#"[
+              { "id": "ITEM-1", "type": "book", "title": "Book A" },
+              { "id": "ITEM-3", "type": "book", "title": "Book C" }
+            ]"#,
+        );
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        let entries = [&items[0], &items[1], &items[0], &items[1]];
+        for (i, entry) in entries.into_iter().enumerate() {
+            driver.citation(CitationRequest::new(
+                vec![CitationItem::with_entry(entry)],
+                &style,
+                None,
+                &locales,
+                Some(i + 1),
+            ));
+        }
+        let rendered = driver.finish(BibliographyRequest::new(&style, None, &locales));
+        let out: Vec<String> = rendered
+            .citations
+            .iter()
+            .map(|citation| {
+                let mut buf = String::new();
+                citation
+                    .citation
+                    .write_buf(&mut buf, hayagriva::BufWriteFormat::Plain)
+                    .unwrap();
+                buf
+            })
+            .collect();
+        assert_eq!(out, vec!["Book A", "Book C", "Book A, n 1", "Book C, n 2"]);
+    }
+
+    /// `F-112`: cite grouping only joins adjacent cites that render the same
+    /// names, never reorders them, and `year-suffix-ranged` collapses runs of
+    /// three or more suffixes. Expected string is a citeproc-js render of the
+    /// same style and items (`name_CiteGroupDelimiterWithYearSuffixCollapse2`).
+    #[test]
+    fn f112_cite_group_keeps_non_adjacent_cites_in_order() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f112</id><title>f112</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation disambiguate-add-year-suffix="true" collapse="year-suffix-ranged" cite-group-delimiter=",">
+                <layout prefix="(" suffix=")" delimiter="; ">
+                  <group delimiter=" ">
+                    <names variable="author"><name form="short"/></names>
+                    <date variable="issued" form="text" date-parts="year"/>
+                  </group>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = items(
+            r#"[
+              { "id": "ITEM-1", "type": "book", "title": "Paper 1", "author": [{ "family": "Aalto", "given": "Alan" }], "issued": { "date-parts": [[2015]] } },
+              { "id": "ITEM-2", "type": "book", "title": "Paper 2", "author": [{ "family": "Aalto", "given": "Alan" }], "issued": { "date-parts": [[2015]] } },
+              { "id": "ITEM-3", "type": "book", "title": "Other", "author": [{ "family": "Bartleby", "given": "Brian" }], "issued": { "date-parts": [[2010]] } },
+              { "id": "ITEM-4", "type": "book", "title": "Paper 4", "author": [{ "family": "Aalto", "given": "Alan" }], "issued": { "date-parts": [[2015]] } },
+              { "id": "ITEM-5", "type": "book", "title": "Paper 5", "author": [{ "family": "Aalto", "given": "Alan" }], "issued": { "date-parts": [[2015]] } },
+              { "id": "ITEM-6", "type": "book", "title": "Paper 6", "author": [{ "family": "Aalto", "given": "Alan" }], "issued": { "date-parts": [[2015]] } }
+            ]"#,
+        );
+        let out = citations_plain(
+            &style,
+            vec![items.iter().map(CitationItem::with_entry).collect()],
+        );
+        assert_eq!(out, vec!["(Aalto 2015a,b; Bartleby 2010; Aalto 2015c–e)"]);
+    }
 }

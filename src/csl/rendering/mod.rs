@@ -1368,32 +1368,26 @@ impl<T: EntryLike> Iterator for BranchConditionIter<'_, '_, T> {
                     self.idx += 1;
 
                     let props = &self.ctx.instance.cite_props;
-                    let forced = props.certain.position;
+                    let is_first = props.certain.is_first_position();
 
                     Some(match spec_pos {
-                        TestPosition::First => {
-                            forced.map_or(props.certain.is_first, |p| p.matches(spec_pos))
-                        }
-                        TestPosition::Subsequent => forced
-                            .map_or(!props.certain.is_first, |p| p.matches(spec_pos)),
-                        TestPosition::Ibid => forced.map_or(
+                        TestPosition::First => is_first,
+                        TestPosition::Subsequent => !is_first,
+                        TestPosition::Ibid => props.certain.position.map_or(
                             matches!(
                                 props.speculative.ibid,
                                 IbidState::Ibid | IbidState::IbidWithLocator
                             ),
                             |p| p.matches(spec_pos),
                         ),
-                        TestPosition::IbidWithLocator => forced.map_or(
+                        TestPosition::IbidWithLocator => props.certain.position.map_or(
                             matches!(props.speculative.ibid, IbidState::IbidWithLocator),
                             |p| p.matches(spec_pos),
                         ),
                         TestPosition::NearNote => {
                             // Like citeproc-js, the near-note test only applies
                             // to citations that are not first.
-                            let subsequent = forced
-                                .map_or(!props.certain.is_first, |p| {
-                                    p.matches(TestPosition::Subsequent)
-                                });
+                            let subsequent = !is_first;
                             let near = props
                                 .certain
                                 .near_note

@@ -52,11 +52,19 @@ impl<'a, T: EntryLike> InstanceContext<'a, T> {
                 ))))
             }
             NumberVariable::FirstReferenceNoteNumber => {
-                self.cite_props.certain.first_note_number.map(|n| {
-                    NumberVariableResult::Regular(MaybeTyped::Typed(Cow::Owned(
-                        Numeric::from(n as u32),
-                    )))
-                })
+                // Per CSL, the variable is empty on a first reference; it
+                // carries the note number of the first citation on later
+                // references (citeproc-js only populates it for subsequent
+                // cites).
+                if self.cite_props.certain.is_first_position() {
+                    None
+                } else {
+                    self.cite_props.certain.first_note_number.map(|n| {
+                        NumberVariableResult::Regular(MaybeTyped::Typed(Cow::Owned(
+                            Numeric::from(n as u32),
+                        )))
+                    })
+                }
             }
             NumberVariable::Locator => {
                 match &self.cite_props.speculative.locator.as_ref()?.1 {
