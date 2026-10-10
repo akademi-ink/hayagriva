@@ -34,12 +34,14 @@ use self::elem::last_text_mut_child;
 pub use self::elem::{
     BufWriteFormat, Elem, ElemChild, ElemChildren, ElemMeta, Formatted, Formatting,
 };
+use self::quotes::{QuoteMarks, SmartQuoter};
 use self::taxonomy::{EntryLike, NumberVariableResult, PageVariableResult};
 
 #[cfg(feature = "archive")]
 pub mod archive;
 mod citation_label;
 mod elem;
+mod quotes;
 mod rendering;
 mod sort;
 mod taxonomy;
@@ -136,6 +138,29 @@ fn should_print_suffix(last_text: Option<&str>, suffix: &str) -> bool {
         !s.is_empty() && s.chars().all(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
     };
     last_text.is_none_or(|t| !(terminal(suffix) && t.ends_with(suffix)))
+}
+
+/// Move the leading punctuation of `text` into a trailing closing quote in
+/// `children`, if there is one. `text` keeps the punctuation if it could not
+/// be moved inside a quote.
+fn pull_leading_punctuation(
+    children: &mut [ElemChild],
+    text: &mut String,
+    marks: &QuoteMarks,
+) {
+    let Some(punct) = text
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
+    else {
+        return;
+    };
+
+    if let Some(last) = last_text_mut_child(children)
+        && quotes::move_punctuation_inside(&mut last.text, punct, marks)
+    {
+        text.remove(0);
+    }
 }
 
 impl<'a, T: EntryLike> BibliographyDriver<'a, T> {
@@ -473,6 +498,8 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
             // 6. Add affixes.
             let formatting = Formatting::default()
                 .apply(cite.request.style.citation.layout.to_formatting());
+            let marks = QuoteMarks::get(&style_ctx);
+            let pull_punctuation = style_ctx.punctuation_in_quotes();
 
             final_citations.push(RenderedCitation {
                 note_number: cite.request.note_number,
@@ -483,7 +510,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
                     if let Some(prefix) = cite.request.prefix() {
                         elem_children.push(ElemChild::Text(Formatted {
-                            text: prefix.to_string(),
+                            text: quotes::apply(prefix, &marks),
                             formatting,
                         }));
                     }
@@ -516,7 +543,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
                         if let Some(prefix) = &item.prefix {
                             elem_children.push(ElemChild::Text(Formatted {
-                                text: prefix.clone(),
+                                text: quotes::apply(prefix, &marks),
                                 formatting,
                             }));
                         }
@@ -530,20 +557,32 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         }));
 
                         if let Some(suffix) = &item.suffix {
-                            elem_children.push(ElemChild::Text(Formatted {
-                                text: suffix.clone(),
-                                formatting,
-                            }));
+                            let mut text = quotes::apply(suffix, &marks);
+                            if pull_punctuation {
+                                pull_leading_punctuation(
+                                    &mut elem_children,
+                                    &mut text,
+                                    &marks,
+                                );
+                            }
+                            elem_children
+                                .push(ElemChild::Text(Formatted { text, formatting }));
                         }
                     }
 
                     if let Some(suffix) = cite.request.suffix() {
+                        let mut text = quotes::apply(suffix, &marks);
+                        if pull_punctuation {
+                            pull_leading_punctuation(
+                                &mut elem_children,
+                                &mut text,
+                                &marks,
+                            );
+                        }
                         let last = last_text_mut_child(&mut elem_children)
                             .map(|t| t.text.as_str());
-                        if should_print_suffix(last, suffix) {
-                            elem_children.push(
-                                Formatted { text: suffix.to_string(), formatting }.into(),
-                            );
+                        if should_print_suffix(last, &text) {
+                            elem_children.push(Formatted { text, formatting }.into());
                         }
                     }
 
@@ -660,10 +699,14 @@ pub fn standalone_citation<T: EntryLike>(
 
     let formatting =
         Formatting::default().apply(style.csl.citation.layout.to_formatting());
+    let marks = QuoteMarks::get(&style);
+    let pull_punctuation = style.punctuation_in_quotes();
 
     if !non_empty.is_empty() && !all_hidden {
         let mut res = if let Some(prefix) = style.csl.citation.layout.prefix.as_ref() {
-            ElemChildren(vec![Formatted { text: prefix.clone(), formatting }.into()])
+            ElemChildren(vec![
+                Formatted { text: quotes::apply(prefix, &marks), formatting }.into(),
+            ])
         } else {
             ElemChildren::new()
         };
@@ -691,9 +734,13 @@ pub fn standalone_citation<T: EntryLike>(
         }
 
         if let Some(suffix) = style.csl.citation.layout.suffix.as_ref() {
+            let mut text = quotes::apply(suffix, &marks);
+            if pull_punctuation {
+                pull_leading_punctuation(&mut res.0, &mut text, &marks);
+            }
             let last = res.last_text().map(|t| t.text.as_str());
-            if should_print_suffix(last, suffix) {
-                res.0.push(Formatted { text: suffix.clone(), formatting }.into());
+            if should_print_suffix(last, &text) {
+                res.0.push(Formatted { text, formatting }.into());
             }
         }
 
@@ -2301,8 +2348,8 @@ pub(crate) struct WritingContext {
     /// Whether to watch out for punctuation that should be pulled inside the
     /// preceding quoted content.
     pull_punctuation: bool,
-    /// Whether we should be using inner quotes.
-    inner_quotes: bool,
+    /// The current state of the smart quote conversion.
+    quoter: SmartQuoter,
     /// Whether to strip periods.
     strip_periods: bool,
     /// Whether to add queried variables to the suppression list.
@@ -2344,7 +2391,7 @@ impl Default for WritingContext {
     fn default() -> Self {
         Self {
             pull_punctuation: false,
-            inner_quotes: false,
+            quoter: SmartQuoter::default(),
             strip_periods: false,
             suppress_queried_variables: false,
             suppressed_variables: RefCell::new(Vec::new()),
@@ -2971,51 +3018,22 @@ impl<'a, T: EntryLike> Context<'a, T> {
 
     /// Add the appropriate opening quotation marks.
     fn push_quotes(&mut self) {
-        let mark = self.term(
-            if self.writing.inner_quotes {
-                OtherTerm::OpenInnerQuote
-            } else {
-                OtherTerm::OpenQuote
-            }
-            .into(),
-            TermForm::default(),
-            false,
-        );
-
-        if let Some(mark) = mark {
-            self.push_str(mark);
-        }
-
-        self.writing.inner_quotes = !self.writing.inner_quotes;
+        let marks = QuoteMarks::get(self.style);
+        let mark = self.writing.quoter.open_quotes(&marks).to_string();
+        self.push_str_raw(&mark);
     }
 
     /// Add the appropriate closing quotation marks.
     fn pop_quotes(&mut self) {
-        self.writing.inner_quotes = !self.writing.inner_quotes;
-
-        let mark = self.term(
-            if self.writing.inner_quotes {
-                OtherTerm::CloseInnerQuote
-            } else {
-                OtherTerm::CloseQuote
-            }
-            .into(),
-            TermForm::default(),
-            false,
-        );
-
-        if let Some(mark) = mark {
-            self.push_str(mark);
-        }
+        let marks = QuoteMarks::get(self.style);
+        let mark = self.writing.quoter.close_quotes(&marks).to_string();
+        self.push_str_raw(&mark);
     }
 
     /// Pull punctuation into a quote if applicable
     fn do_pull_punctuation<'s>(&mut self, mut s: &'s str) -> &'s str {
         if self.writing.pull_punctuation && s.starts_with(['.', ',', ';', '!', '?']) {
-            let close_quote =
-                self.term(OtherTerm::CloseQuote.into(), TermForm::default(), false);
-            let close_inner_quote =
-                self.term(OtherTerm::CloseInnerQuote.into(), TermForm::default(), false);
+            let marks = QuoteMarks::get(self.style);
 
             let mut used_buf = false;
             let buf = if self.writing.buf.is_empty() {
@@ -3033,22 +3051,13 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 self.writing.buf.as_string_mut()
             };
 
-            for quote in [close_quote, close_inner_quote].iter().flatten() {
-                // Check if buf ends with a close quote.
-                // If it does, replace it with the punctuation.
-                if let Some(head) = buf.strip_suffix(quote) {
-                    buf.truncate(head.len());
+            // Check whether the buffer ends in closing quotes. If it does,
+            // move the punctuation inside them.
+            if quotes::move_punctuation_inside(buf, s.chars().next().unwrap(), &marks) {
+                s = &s[s.chars().next().unwrap().len_utf8()..];
 
-                    let punctuation = s.chars().next().unwrap();
-                    s = &s[punctuation.len_utf8()..];
-                    buf.push(punctuation);
-                    buf.push_str(quote);
-
-                    if used_buf {
-                        self.writing.buf.mark_changed();
-                    }
-
-                    break;
+                if used_buf {
+                    self.writing.buf.mark_changed();
                 }
             }
         }
@@ -3056,8 +3065,20 @@ impl<'a, T: EntryLike> Context<'a, T> {
         s
     }
 
+    /// Convert the quotation marks in `s` using the current quote state.
+    fn smart_quote(&mut self, s: &str) -> String {
+        let marks = QuoteMarks::get(self.style);
+        self.writing.quoter.apply(s, &marks)
+    }
+
     /// Add a string to the buffer.
     fn push_str(&mut self, s: &str) {
+        let quoted = self.smart_quote(s);
+        self.push_str_raw(&quoted)
+    }
+
+    /// Add a string to the buffer without smart quote conversion.
+    fn push_str_raw(&mut self, s: &str) {
         let s = self.do_pull_punctuation(s);
 
         self.writing.reconfigure();
@@ -3382,7 +3403,14 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// Apply a prefix, but return a tuple that allows us to undo it if it
     /// wasn't followed by anything.
     fn apply_prefix(&mut self, affixes: &Affixes) -> (DisplayLoc, usize) {
-        self.writing.apply_prefix(affixes)
+        // Smart-quote the prefix and pull leading punctuation into a
+        // preceding quotation before it is written.
+        let mut affixes = affixes.clone();
+        if let Some(prefix) = affixes.prefix.take() {
+            let quoted = self.smart_quote(&prefix);
+            affixes.prefix = Some(self.do_pull_punctuation(&quoted).to_string());
+        }
+        self.writing.apply_prefix(&affixes)
     }
 
     /// Apply a suffix, but only if the location was followed by something.
@@ -4411,10 +4439,11 @@ mod tests {
 
     #[test]
     fn affix_prefix_with_comma() {
-        // Derived from the `affix_CommaAfterQuote` test-suite fixture. The
-        // official fixture expects `“quote”, Hello Thing`, but hayagriva does
-        // not apply citeproc-js's smart-quote flipping to item affixes: they
-        // are literal, so the straight quotes are preserved here.
+        // Derived from the `affix_CommaAfterQuote` test-suite fixture. This
+        // render is locale-less (`locale_files: &[]`), so there are no
+        // `open-quote`/`close-quote` terms to substitute and the quotation
+        // marks stay straight. The locale-aware behavior is covered by the
+        // `quotes_AffixCommaAfterQuote` citeproc fixture.
         let style = IndependentStyle::from_xml(
             r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
               <info>
@@ -4446,7 +4475,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(citation, "'quote', Hello Thing");
+        assert_eq!(citation, "\"quote\", Hello Thing");
     }
 
     #[test]
