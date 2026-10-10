@@ -674,15 +674,15 @@ mod citeproc_bib {
     /// Render one citation's children with citeproc's HTML output format.
     ///
     /// Mirrors the audit runner's `citeproc_bib::render_citation`; links stay
-    /// unexpanded to match citeproc's plain citation output.
+    /// unexpanded to match citeproc's plain citation output. Citation trees
+    /// carry no formatting scopes (the engine only records them for
+    /// bibliography entries), so the inherited formatting is empty and every
+    /// leaf renders with its own formatting, as before.
     pub(super) fn render_citation(
         citation: &hayagriva::ElemChildren,
         output: &mut String,
     ) -> Result<(), fmt::Error> {
-        for child in &citation.0 {
-            render_child(child, output, false)?;
-        }
-        Ok(())
+        render_children(&citation.0, output, false, Formatting::default())
     }
 
     fn render_item(
@@ -690,21 +690,38 @@ mod citeproc_bib {
         output: &mut String,
         is_full: bool,
     ) -> Result<(), fmt::Error> {
+        // citeproc-js opens the bibliography layout's formatting tags around
+        // the whole entry, before the `second-field-align` field divs.
+        let inherited = item.formatting;
+        let (open, close) = formatting_tags(inherited, true);
+
         let mut second_field_align_suffix = "";
         output.push_str(r#"<div class="csl-entry">"#);
+        output.push_str(&open);
         if let Some(field) = &item.first_field {
             // Uses 'second-field-align', so add implicit alignment
             // (cf. test bugreports_AsmJournals.txt)
             output.push_str("<div class=\"csl-left-margin\">");
-            render_child(field, output, is_full)?;
+            render_child(field, output, is_full, inherited)?;
             output.push_str("</div><div class=\"csl-right-inline\">");
             second_field_align_suffix = "</div>";
         }
-        for child in &item.content.0 {
-            render_child(child, output, is_full)?;
-        }
+        render_children(&item.content.0, output, is_full, inherited)?;
         output.push_str(second_field_align_suffix);
+        output.push_str(&close);
         output.push_str("</div>");
+        Ok(())
+    }
+
+    fn render_children(
+        children: &[ElemChild],
+        output: &mut String,
+        is_full: bool,
+        inherited: Formatting,
+    ) -> Result<(), fmt::Error> {
+        for child in children {
+            render_child(child, output, is_full, inherited)?;
+        }
         Ok(())
     }
 
@@ -712,22 +729,70 @@ mod citeproc_bib {
         child: &ElemChild,
         output: &mut String,
         is_full: bool,
+        inherited: Formatting,
     ) -> Result<(), fmt::Error> {
         match child {
-            ElemChild::Text(formatted) => render_formatted_text(formatted, output),
-            ElemChild::Elem(e) => render_elem(e, output, is_full),
+            ElemChild::Text(formatted) => {
+                render_formatted_text(formatted, output, inherited)
+            }
+            ElemChild::Elem(e) => render_elem(e, output, is_full, inherited),
 
             ElemChild::Link { text, url } if is_full => {
                 output.push_str(&format!("<a href=\"{url}\">"));
-                render_formatted_text(text, output)?;
+                render_formatted_text(text, output, inherited)?;
                 output.push_str("</a>");
                 Ok(())
             }
 
             // Citeproc bib tests do not output <a href=...></a> for links
-            ElemChild::Link { text, url: _ } => render_formatted_text(text, output),
+            ElemChild::Link { text, url: _ } => {
+                render_formatted_text(text, output, inherited)
+            }
             elem => elem.write_buf(output, BufWriteFormat::Html),
         }
+    }
+
+    /// Apply the formatting declaration `declared` on top of the formatting
+    /// `base` that is already in effect.
+    fn overlay(mut base: Formatting, declared: Formatting) -> Formatting {
+        if declared.font_style != FontStyle::Normal {
+            base.font_style = declared.font_style;
+        }
+        if declared.font_variant != FontVariant::Normal {
+            base.font_variant = declared.font_variant;
+        }
+        if declared.font_weight != FontWeight::Normal {
+            base.font_weight = declared.font_weight;
+        }
+        if declared.text_decoration != TextDecoration::None {
+            base.text_decoration = declared.text_decoration;
+        }
+        if declared.vertical_align != VerticalAlign::None {
+            base.vertical_align = declared.vertical_align;
+        }
+        base
+    }
+
+    /// The formatting a leaf still has to declare itself: fields that equal
+    /// the inherited formatting are already covered by the enclosing tags.
+    fn residual(formatting: Formatting, inherited: Formatting) -> Formatting {
+        let mut result = Formatting::default();
+        if formatting.font_style != inherited.font_style {
+            result.font_style = formatting.font_style;
+        }
+        if formatting.font_variant != inherited.font_variant {
+            result.font_variant = formatting.font_variant;
+        }
+        if formatting.font_weight != inherited.font_weight {
+            result.font_weight = formatting.font_weight;
+        }
+        if formatting.text_decoration != inherited.text_decoration {
+            result.text_decoration = formatting.text_decoration;
+        }
+        if formatting.vertical_align != inherited.vertical_align {
+            result.vertical_align = formatting.vertical_align;
+        }
+        result
     }
 
     /// Applies the appropriate HTML tags to formatted text, according to
@@ -743,20 +808,33 @@ mod citeproc_bib {
     fn render_formatted_text(
         text: &hayagriva::Formatted,
         output: &mut String,
+        inherited: Formatting,
     ) -> Result<(), fmt::Error> {
-        let formatting = text.formatting;
+        let formatting = residual(text.formatting, inherited);
+        let (open, close) =
+            formatting_tags(formatting, text.text.chars().any(|c| !c.is_whitespace()));
+        output.push_str(&open);
+        output.push_str(&text.text);
+        output.push_str(&close);
+        Ok(())
+    }
+
+    /// The opening and closing tags for one formatting value. `has_text`
+    /// controls whether bold is applied to whitespace-only content (citeproc
+    /// writers never do).
+    fn formatting_tags(formatting: Formatting, has_text: bool) -> (String, String) {
         if formatting == Formatting::default() {
-            output.push_str(&text.text);
-            return Ok(());
+            return (String::new(), String::new());
         }
 
+        let mut open = String::new();
+        let mut close = String::new();
         // NOTE: There are no tests with multiple CSS styles, so for now we
         // join them without any spacing.
         let mut css = String::new();
-        let mut suffix = String::new();
-        let mut push_elem = |start, end| {
-            output.push_str(start);
-            suffix.insert_str(0, end);
+        let mut push_elem = |start: &str, end: &str| {
+            open.push_str(start);
+            close.insert_str(0, end);
         };
 
         match formatting.vertical_align {
@@ -780,7 +858,7 @@ mod citeproc_bib {
                 // whitespace affixes. It does not matter whether such affixes
                 // are bold or regular. Citeproc tests prefer regular at present.
                 // (cf. test sort_VariousNameMacros1.txt)
-                if text.text.chars().any(|c| !c.is_whitespace()) {
+                if has_text {
                     push_elem("<b>", "</b>");
                 }
             }
@@ -817,16 +895,21 @@ mod citeproc_bib {
             push_elem(&format!("<span style=\"{css}\">"), "</span>");
         }
 
-        output.push_str(&text.text);
-        output.push_str(&suffix);
-        Ok(())
+        (open, close)
     }
 
     fn render_elem(
         elem: &Elem,
         output: &mut String,
         is_full: bool,
+        inherited: Formatting,
     ) -> Result<(), fmt::Error> {
+        // The element's declared formatting is rendered as its own tag pair;
+        // children only render what is not already covered by it.
+        let (open, close) = formatting_tags(elem.formatting, true);
+        output.push_str(&open);
+        let inner = overlay(inherited, elem.formatting);
+
         let mut div_suffix = "";
         if let Some(display) = elem.display {
             div_suffix = "</div>";
@@ -841,12 +924,13 @@ mod citeproc_bib {
         }
 
         for child in &elem.children.0 {
-            render_child(child, output, is_full)?;
+            render_child(child, output, is_full, inner)?;
         }
 
         if !div_suffix.is_empty() {
             output.push_str(div_suffix);
         }
+        output.push_str(&close);
         Ok(())
     }
 }

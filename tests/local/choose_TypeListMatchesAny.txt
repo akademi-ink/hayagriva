@@ -1,0 +1,78 @@
+>>===== MODE =====>>
+bibliography
+<<===== MODE =====<<
+
+A `type` condition always tests its values with "any" semantics, even under
+the default `match="all"`: `type="book report"` is true for a book (F-120).
+
+>>===== RESULT =====>>
+<div class="csl-bib-body"><div class="csl-entry">Scalable Event Processing, 2nd ed. Verdant Academic Press, Amsterdam</div></div>
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" version="1.0" class="in-text">
+  <info>
+    <id>x</id>
+    <title>t</title>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="title"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <choose>
+        <if type="book report">
+          <group delimiter=", ">
+            <text variable="title"/>
+            <text macro="edition"/>
+          </group>
+          <text macro="publisher" prefix=". "/>
+        </if>
+        <else>
+          <text value="OTHER"/>
+        </else>
+      </choose>
+    </layout>
+  </bibliography>
+  <macro name="edition">
+    <choose>
+      <if is-numeric="edition">
+        <group delimiter=" ">
+          <number variable="edition" form="ordinal"/>
+          <text term="edition" form="short"/>
+        </group>
+      </if>
+      <else>
+        <text variable="edition"/>
+      </else>
+    </choose>
+  </macro>
+  <macro name="publisher">
+    <group delimiter=", ">
+      <text variable="publisher"/>
+      <text variable="publisher-place"/>
+    </group>
+  </macro>
+</style>
+<<===== CSL =====<<
+
+>>===== INPUT =====>>
+[
+    {
+        "id": "book",
+        "type": "book",
+        "title": "Scalable Event Processing",
+        "edition": "2",
+        "publisher": "Verdant Academic Press",
+        "publisher-place": "Amsterdam",
+        "issued": { "date-parts": [[2020]] }
+    }
+]
+<<===== INPUT =====<<
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<

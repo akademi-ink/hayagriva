@@ -44,6 +44,7 @@ bugreports_UndefinedInName2
 bugreports_UndefinedNotString
 bugreports_UndefinedStr
 bugreports_UnisaHarvardInitialization
+bugreports_YearSuffixInHarvard1
 bugreports_YearSuffixLingers
 bugreports_disambiguate
 bugreports_effingBug
@@ -210,6 +211,7 @@ form_TitleShortNoLong
 form_TitleTestNoLongFalse
 fullstyles_ABdNT
 fullstyles_APA
+fullstyles_ChicagoArticleTitleQuestion
 fullstyles_ChicagoNoteWithBibliographyWithPublisher
 group_ComplexNesting
 group_ShortOutputOnly
