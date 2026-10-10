@@ -799,6 +799,14 @@ impl EntryLike for citationberg::json::Item {
                             alias: None,
                             comma_suffix: false,
                         },
+                        // CSL-JSON `family` is the family name verbatim: no
+                        // particle heuristics. Particles only arrive through
+                        // the explicit `non-dropping-particle` /
+                        // `dropping-particle` fields (next arm). Calling
+                        // `Person::from_strings` here split names like
+                        // "van der Berg" into a dropping particle, which then
+                        // disappeared in short form and reordered in long form
+                        // (cf. upstream issue #382, "Della Porta").
                         csl_json::NameValue::Item(csl_json::NameItem {
                             family,
                             given,
@@ -806,21 +814,14 @@ impl EntryLike for citationberg::json::Item {
                             dropping_particle: None,
                             suffix,
                             comma_suffix,
-                        }) => {
-                            let mut parts = vec![family.as_str()];
-                            if let Some(given) = given {
-                                parts.push(given.as_str());
-                            }
-                            let mut p = Person::from_strings(parts).ok()?;
-                            if let Some(suffix) = suffix {
-                                p.suffix = Some(suffix.as_str().to_owned());
-                            }
-                            if comma_suffix.unwrap_or_default() {
-                                p.comma_suffix = true;
-                            }
-
-                            p
-                        }
+                        }) => Person {
+                            name: family.clone(),
+                            prefix: None,
+                            suffix: suffix.clone(),
+                            given_name: given.clone(),
+                            alias: None,
+                            comma_suffix: comma_suffix.unwrap_or_default(),
+                        },
                         csl_json::NameValue::Item(csl_json::NameItem {
                             family,
                             given,
