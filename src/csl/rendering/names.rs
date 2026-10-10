@@ -244,7 +244,9 @@ impl RenderCsl for Names {
             if let Some(substitute) = &self.substitute() {
                 ctx.writing.start_suppressing_queried_variables();
 
-                let depth = ctx.push_elem(self.to_formatting());
+                // citeproc-js opens one formatting tag pair per declaration;
+                // the `cs:names` declaration scopes the substitute content.
+                let depth = ctx.push_scoped_elem(self.to_formatting());
                 for child in &substitute.children {
                     let len = ctx.writing.len();
                     if let LayoutRenderingElement::Names(names_child) = child {
@@ -266,8 +268,14 @@ impl RenderCsl for Names {
         }
 
         let ambient = *ctx.writing.formatting();
-        let depth = ctx.push_elem(self.to_formatting());
+        // The outer element holds the affixes; citeproc-js writes them outside
+        // the names formatting tags (cf. `Group::render`).
+        let depth = ctx.push_elem(citationberg::Formatting::default());
         let affix_loc = ctx.apply_prefix(&self.to_affixes(), ambient);
+        // citeproc-js opens one formatting tag pair per declaration, so the
+        // `cs:names` declaration scopes everything that follows, including the
+        // delimiters between names (F-125).
+        let scope = ctx.push_scoped_elem(self.to_formatting());
         let cs_name = self.name().cloned().unwrap_or_default();
         let options = cs_name.options(ctx.writing.name_options.last());
 
@@ -300,6 +308,7 @@ impl RenderCsl for Names {
                     .sum::<usize>()
             )
             .unwrap();
+            ctx.commit_elem(scope, None, None);
             ctx.apply_suffix(&self.to_affixes(), affix_loc, ambient);
             ctx.commit_elem(depth, self.display, Some(ElemMeta::Names(meta_people)));
             ctx.writing.pop_name_options();
@@ -374,9 +383,7 @@ impl RenderCsl for Names {
             }
 
             do_label(NameLabelPosition::BeforeName, ctx);
-            let idx = ctx.push_format(cs_name.formatting);
             add_names(self, ctx, persons, &cs_name, forms, variable);
-            ctx.pop_format(idx);
             do_label(NameLabelPosition::AfterName, ctx);
         }
 
@@ -384,6 +391,7 @@ impl RenderCsl for Names {
         // [`NameDisambiguationProperties::disambiguate_list`] on the identical
         // pairs. Rerender if necessary.
 
+        ctx.commit_elem(scope, None, None);
         ctx.apply_suffix(&self.to_affixes(), affix_loc, ambient);
         ctx.commit_elem(depth, self.display, Some(ElemMeta::Names(meta_people)));
         ctx.writing.pop_name_options();
@@ -586,6 +594,9 @@ fn add_names<T: EntryLike>(
             _ => false,
         };
 
+        // citeproc-js opens the `cs:name` formatting declaration around each
+        // individual name; the delimiters between names stay outside it.
+        let scope = ctx.push_scoped_elem(cs_name.formatting);
         write_name(
             name,
             ctx,
@@ -597,6 +608,7 @@ fn add_names<T: EntryLike>(
             variable,
             i,
         );
+        ctx.commit_elem(scope, None, None);
 
         last_inverted = reverse;
         first = false;
@@ -606,6 +618,7 @@ fn add_names<T: EntryLike>(
         if let Some(name) = persons.last() {
             ctx.push_str(name_opts.delimiter);
             ctx.push_str("… ");
+            let scope = ctx.push_scoped_elem(cs_name.formatting);
             write_name(
                 name,
                 ctx,
@@ -617,6 +630,7 @@ fn add_names<T: EntryLike>(
                 variable,
                 persons.len() - 1,
             );
+            ctx.commit_elem(scope, None, None);
         }
     } else if ctx.instance.sorting.is_none() && has_et_al {
         let cs_et_al = names.et_al().cloned().unwrap_or_default();

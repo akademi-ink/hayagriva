@@ -260,8 +260,22 @@ impl FromStr for Numeric {
             s.from(start)
         };
 
+        // A hyphen after a non-numeric prefix belongs to an identifier
+        // (e.g. `TR-2020-14`), not to a number: it is neither a sign nor a
+        // range delimiter. citeproc-js keeps such values verbatim.
+        if !prefix.is_empty() && s.peek() == Some('-') {
+            return Err(NumericError::NoNumber);
+        }
+
         let value = number(&mut s).ok_or(NumericError::NoNumber)?;
         let space_after_value = s.eat_whitespace();
+
+        // A range between bare numbers is delimited by a hyphen; a hyphen
+        // after a prefixed number such as `S10-15` is not converted by
+        // citeproc-js, so it must not become a typed range either.
+        if !prefix.is_empty() && s.peek() == Some('-') {
+            return Err(NumericError::NoNumber);
+        }
 
         let value = match s.peek() {
             Some(c) if is_delimiter(c) => {
@@ -507,5 +521,26 @@ mod test {
                 (39, None)
             ])
         );
+    }
+
+    #[test]
+    fn test_prefixed_hyphen_is_not_a_range() {
+        // `TR-2020-14` is an identifier, not a number range: a hyphen after
+        // a non-numeric prefix is neither a sign nor a range delimiter.
+        // citeproc-js keeps such values verbatim.
+        let val: MaybeTyped<Numeric> = MaybeTyped::infallible_from_str("TR-2020-14");
+        assert_eq!(val, MaybeTyped::String("TR-2020-14".to_string()));
+        let val: MaybeTyped<Numeric> = MaybeTyped::infallible_from_str("XY-1-5");
+        assert_eq!(val, MaybeTyped::String("XY-1-5".to_string()));
+
+        // Ranges between bare numbers still parse and keep converting to an
+        // en dash when displayed.
+        let val: MaybeTyped<Numeric> = MaybeTyped::infallible_from_str("10-20");
+        assert_eq!(&val.to_string(), "10–20");
+
+        // Commas and ampersands still delimit a number set; only the hyphen
+        // is special (citeproc-js pluralizes `S10, 15`).
+        let val: MaybeTyped<Numeric> = MaybeTyped::infallible_from_str("S10, 15");
+        assert!(val.as_typed().is_some());
     }
 }

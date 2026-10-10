@@ -141,7 +141,19 @@ impl RenderCsl for citationberg::Text {
             },
             ResolvedTextTarget::PageVariable(p) => match p {
                 MaybeTyped::Typed(r) => render_page_range(&r, ctx),
-                MaybeTyped::String(s) => ctx.push_str(&s.replace('-', "–")),
+                // A page value that could not be parsed as ranges is not a
+                // range: only roman-numeral ranges keep the citeproc-js en
+                // dash (`xxv–xxviii`), other hyphens stay verbatim (F-111).
+                MaybeTyped::String(s) => {
+                    let delim = ctx
+                        .term(
+                            OtherTerm::PageRangeDelimiter.into(),
+                            TermForm::default(),
+                            false,
+                        )
+                        .unwrap_or("–");
+                    ctx.push_str(&roman_ranges_to_en_dash(&s, delim));
+                }
             },
             ResolvedTextTarget::Macro(mac) => {
                 // Treat macros as groups: don't render if all variables are empty.
@@ -570,6 +582,37 @@ fn render_page_range<T: EntryLike>(range: &PageRanges, ctx: &mut Context<T>) {
             }
         })
         .unwrap();
+}
+
+/// Convert the hyphen of a roman-numeral range (`xxv-xxviii`) in a page value
+/// that could not be parsed as ranges to the page range delimiter. citeproc-js
+/// converts roman-numeral ranges (its numeral set is `ivxlcmIVXLCM`), but keeps
+/// other hyphens in such values verbatim, e.g. the identifier `TR-2020-14`
+/// (F-111).
+fn roman_ranges_to_en_dash(s: &str, delim: &str) -> String {
+    fn is_roman(part: &str) -> bool {
+        !part.is_empty()
+            && part.chars().all(|c| {
+                matches!(
+                    c,
+                    'i' | 'v' | 'x' | 'l' | 'c' | 'm' | 'I' | 'V' | 'X' | 'L' | 'C' | 'M'
+                )
+            })
+    }
+
+    let parts: Vec<&str> = s.split('-').collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            if is_roman(parts[i - 1]) && is_roman(part) {
+                out.push_str(delim);
+            } else {
+                out.push('-');
+            }
+        }
+        out.push_str(part);
+    }
+    out
 }
 
 fn label_pluralization(
@@ -1325,20 +1368,38 @@ impl<T: EntryLike> Iterator for BranchConditionIter<'_, '_, T> {
                     self.idx += 1;
 
                     let props = &self.ctx.instance.cite_props;
+                    let forced = props.certain.position;
 
                     Some(match spec_pos {
-                        TestPosition::First => props.certain.is_first,
-                        TestPosition::Subsequent => !props.certain.is_first,
-                        TestPosition::Ibid => {
+                        TestPosition::First => {
+                            forced.map_or(props.certain.is_first, |p| p.matches(spec_pos))
+                        }
+                        TestPosition::Subsequent => forced
+                            .map_or(!props.certain.is_first, |p| p.matches(spec_pos)),
+                        TestPosition::Ibid => forced.map_or(
                             matches!(
                                 props.speculative.ibid,
                                 IbidState::Ibid | IbidState::IbidWithLocator
-                            )
+                            ),
+                            |p| p.matches(spec_pos),
+                        ),
+                        TestPosition::IbidWithLocator => forced.map_or(
+                            matches!(props.speculative.ibid, IbidState::IbidWithLocator),
+                            |p| p.matches(spec_pos),
+                        ),
+                        TestPosition::NearNote => {
+                            // Like citeproc-js, the near-note test only applies
+                            // to citations that are not first.
+                            let subsequent = forced
+                                .map_or(!props.certain.is_first, |p| {
+                                    p.matches(TestPosition::Subsequent)
+                                });
+                            let near = props
+                                .certain
+                                .near_note
+                                .unwrap_or(props.certain.is_near_note);
+                            subsequent && near
                         }
-                        TestPosition::IbidWithLocator => {
-                            matches!(props.speculative.ibid, IbidState::IbidWithLocator)
-                        }
-                        TestPosition::NearNote => props.certain.is_near_note,
                     })
                 } else {
                     self.next_case();

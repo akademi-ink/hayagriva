@@ -15,8 +15,8 @@ use citationberg::json as csl_json;
 use hayagriva::archive::{ArchivedStyle, locales};
 use hayagriva::io::from_biblatex_str;
 use hayagriva::{
-    BibliographyDriver, BibliographyRequest, CitationItem, CitationRequest, CitePurpose,
-    Entry, LocatorPayload, SpecificLocator,
+    BibliographyDriver, BibliographyRequest, CitationItem, CitationRequest, CitePosition,
+    CitePurpose, Entry, LocatorPayload, SpecificLocator,
 };
 use unscanny::Scanner;
 
@@ -497,13 +497,7 @@ where
 {
     let can_test = case.bib_entries.is_none()
         && case.bib_section.is_none()
-        && case.citations.is_none()
-        && case.citation_items.as_ref().is_none_or(|cites| {
-            cites
-                .iter()
-                .flatten()
-                .all(|i| i.near_note.is_none() && i.position.is_none())
-        });
+        && case.citations.is_none();
 
     let contains_date_ranges = case
         .input
@@ -558,7 +552,7 @@ where
             driver.citation(CitationRequest::new(
                 cite.iter()
                     .map(|i| {
-                        CitationItem::new(
+                        let item = CitationItem::new(
                             case.input
                                 .iter()
                                 .find(|e| e.id().unwrap_or_default() == i.id.as_str())
@@ -580,7 +574,23 @@ where
                                 None
                             },
                         )
-                        .with_affixes(i.prefix.clone(), i.suffix.clone())
+                        .with_affixes(i.prefix.clone(), i.suffix.clone());
+
+                        // The suite's item-level `position` and `near-note`
+                        // force the processor state that citeproc-js's
+                        // `makeCitationCluster` renders with. The numeric
+                        // positions are citeproc-js's internal constants.
+                        let item = match i.position {
+                            Some(0) => item.with_position(CitePosition::First),
+                            Some(1) => item.with_position(CitePosition::Subsequent),
+                            Some(2) => item.with_position(CitePosition::Ibid),
+                            Some(3) => item.with_position(CitePosition::IbidWithLocator),
+                            _ => item,
+                        };
+                        match i.near_note {
+                            Some(near) => item.with_near_note(near),
+                            None => item,
+                        }
                     })
                     .collect(),
                 &style,
@@ -1727,6 +1737,233 @@ mod regression {
             "<div class=\"csl-bib-body\"><div class=\"csl-entry\">\
              <i>Alpha, <i>Beta Press</i></i></div></div>"
         );
+    }
+
+    /// `F-125`: formatting declared on `cs:names` must scope the whole names
+    /// run, including the delimiters between names, instead of fragmenting it
+    /// per leaf. Expected string is a citeproc-js render of the same style and
+    /// item.
+    #[test]
+    fn f125_names_declaration_is_one_run() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f125-names</id><title>f125-names</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <names variable="author" font-style="italic" prefix="[" suffix="]">
+                  <name and="text" delimiter=", "/>
+                </names>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Alpha",
+              "author": [
+                { "given": "Jane", "family": "Doe" },
+                { "given": "John", "family": "Roe" }
+              ]
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\">\
+             [<i>Jane Doe and John Roe</i>]</div></div>"
+        );
+    }
+
+    /// `F-125`: formatting declared on `cs:name` scopes each individual name;
+    /// the delimiters between names stay outside the tags. Expected string is
+    /// a citeproc-js render of the same style and item.
+    #[test]
+    fn f125_name_declaration_scopes_each_name() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f125-name</id><title>f125-name</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <names variable="author">
+                  <name and="text" delimiter=", " font-style="italic"/>
+                </names>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Alpha",
+              "author": [
+                { "given": "Jane", "family": "Doe" },
+                { "given": "John", "family": "Roe" }
+              ]
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\">\
+             <i>Jane Doe</i> and <i>John Roe</i></div></div>"
+        );
+    }
+
+    /// `F-111`: hyphens inside identifiers such as `TR-2020-14` must not be
+    /// converted to en dashes, while real page ranges still use the en dash.
+    /// Expected strings are citeproc-js renders of the same style and items.
+    #[test]
+    fn f111_identifier_hyphens_stay_verbatim() {
+        let Style::Independent(style) = ArchivedStyle::by_name("apa").unwrap().get()
+        else {
+            panic!("test has dependent style");
+        };
+        let items = items(
+            r#"[{
+              "id": "report-citation-benchmarks",
+              "type": "report",
+              "title": "Benchmarking Open-Source Citation Processors",
+              "author": [{ "given": "Daniel", "family": "Okafor" }],
+              "number": "TR-2020-14",
+              "genre": "Technical report",
+              "publisher": "Institute for Applied Computing",
+              "publisher-place": "Berlin",
+              "issued": { "date-parts": [[2020]] }
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\">Okafor, D. \
+             (2020). <i>Benchmarking Open-Source Citation Processors</i> \
+             (Technical Report TR-2020-14). Institute for Applied \
+             Computing.</div></div>"
+        );
+    }
+
+    /// `F-111` guard: restricting the hyphen conversion must not affect real
+    /// page ranges. Expected string is a citeproc-js render of the same style
+    /// and item.
+    #[test]
+    fn f111_page_range_keeps_en_dash() {
+        let Style::Independent(style) = ArchivedStyle::by_name("apa").unwrap().get()
+        else {
+            panic!("test has dependent style");
+        };
+        let items = items(
+            r#"[{
+              "id": "article-low-resource",
+              "type": "article-journal",
+              "title": "Neural Machine Translation for Low-Resource Languages",
+              "author": [
+                { "given": "Ana", "family": "Ferreira" },
+                { "given": "Joost", "family": "van der Berg" }
+              ],
+              "container-title": "Journal of Language Technology",
+              "volume": "14",
+              "issue": "2",
+              "page": "101-118",
+              "issued": { "date-parts": [[2021]] },
+              "DOI": "10.1234/jlt.2021.14.2.101"
+            }]"#,
+        );
+        assert_eq!(
+            bibliography_html(&style, &items),
+            "<div class=\"csl-bib-body\"><div class=\"csl-entry\">Ferreira, A., \
+             & van der Berg, J. (2021). Neural Machine Translation for \
+             Low-Resource Languages. <i>Journal of Language Technology</i>, \
+             <i>14</i>(2), 101–118. \
+             https://doi.org/10.1234/jlt.2021.14.2.101</div></div>"
+        );
+    }
+
+    /// `F-107`: a forced citation position overrides the position derived from
+    /// citation order; like citeproc-js, the position tests are ranked
+    /// (`ibid-with-locator` also satisfies `ibid`, and both also satisfy
+    /// `subsequent`). Expected strings are citeproc-js `makeCitationCluster`
+    /// renders with the same forced item state.
+    #[test]
+    fn f107_forced_position_overrides_derived_state() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info><id>f107-position</id><title>f107-position</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout>
+                <choose>
+                  <if position="first"><text value="FIRST"/></if>
+                  <else-if position="ibid-with-locator"><text value="IBID-LOC"/></else-if>
+                  <else-if position="ibid"><text value="IBID"/></else-if>
+                  <else-if position="subsequent"><text value="SUBSEQUENT"/></else-if>
+                  <else><text value="OTHER"/></else>
+                </choose>
+              </layout></citation>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Alpha",
+              "author": [{ "given": "Jane", "family": "Doe" }]
+            }]"#,
+        );
+        let cluster =
+            |position| vec![CitationItem::with_entry(&items[0]).with_position(position)];
+        let out = citations_html(
+            &style,
+            vec![
+                cluster(CitePosition::First),
+                cluster(CitePosition::Subsequent),
+                cluster(CitePosition::Ibid),
+                cluster(CitePosition::IbidWithLocator),
+            ],
+        );
+        assert_eq!(out, vec!["FIRST", "SUBSEQUENT", "IBID", "IBID-LOC"]);
+    }
+
+    /// `F-107`: a forced near-note state overrides the state derived from the
+    /// note numbers. Like citeproc-js, it only tests true when the position is
+    /// not `first`. Expected strings are citeproc-js `makeCitationCluster`
+    /// renders with the same forced item state.
+    #[test]
+    fn f107_forced_near_note_overrides_derived_state() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info><id>f107-near-note</id><title>f107-near-note</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout>
+                <choose>
+                  <if position="near-note"><text value="NEAR"/></if>
+                  <else><text value="FAR"/></else>
+                </choose>
+              </layout></citation>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "book",
+              "title": "Alpha",
+              "author": [{ "given": "Jane", "family": "Doe" }]
+            }]"#,
+        );
+        let out = citations_html(
+            &style,
+            vec![
+                vec![
+                    CitationItem::with_entry(&items[0])
+                        .with_position(CitePosition::Subsequent)
+                        .with_near_note(true),
+                ],
+                vec![
+                    CitationItem::with_entry(&items[0])
+                        .with_position(CitePosition::Subsequent)
+                        .with_near_note(false),
+                ],
+                vec![
+                    CitationItem::with_entry(&items[0])
+                        .with_position(CitePosition::First)
+                        .with_near_note(true),
+                ],
+            ],
+        );
+        assert_eq!(out, vec!["NEAR", "FAR", "FAR"]);
     }
 
     /// `F-123`: the citation layout's `delimiter` joins the cites of one

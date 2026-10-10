@@ -944,7 +944,8 @@ mod tests {
             entry.serial_number().unwrap().0.get("serial").unwrap(),
             "USDL-26-0599"
         );
-        // But hyphens in number ranges can be converted.
-        assert_eq!(entry.volume().unwrap().to_str(), "XY-1–5");
+        // A hyphen after a non-numeric prefix is part of the identifier, not
+        // a range delimiter: citeproc-js keeps `XY-1-5` verbatim (F-111).
+        assert_eq!(entry.volume().unwrap().to_str(), "XY-1-5");
     }
 }

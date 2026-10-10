@@ -1030,13 +1030,14 @@ mod tests {
                 .to_str(),
             "USDL-26-0599"
         );
-        // But hyphens in number ranges can be converted.
+        // A hyphen after a non-numeric prefix is part of the identifier, not
+        // a range delimiter: citeproc-js keeps `XY-1-5` verbatim (F-111).
         assert_eq!(
             entry
                 .resolve_number_variable(NumberVariable::Volume)
                 .unwrap()
                 .to_str(),
-            "XY-1–5"
+            "XY-1-5"
         );
     }
 }

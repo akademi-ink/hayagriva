@@ -12,8 +12,8 @@ bibliography
     <span style="font-variant:small-caps;">Doe Co.</span>
     <i>Doe Co.</i>
     <i>Doe Co.</i>
-    <b><i><span style="font-variant:small-caps;">Doe Co.</span></i></b>
-    <sup><b><i><u><span style="font-variant:small-caps;">Doe Co.</span></u></i></b></sup>
+    <b><span style="font-variant:small-caps;"><i>Doe Co.</i></span></b>
+    <sup><i><u><b><span style="font-variant:small-caps;">Doe Co.</span></b></u></i></sup>
   </div>
 </div>
 <<===== RESULT =====<<

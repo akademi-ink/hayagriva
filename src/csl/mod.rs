@@ -328,6 +328,8 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         note_number: citation.note_number,
                         first_note_number,
                         is_near_note,
+                        position: item.position,
+                        near_note: item.near_note,
                         is_first: seen.insert(*entry),
                         initial_idx: item.initial_idx,
                     },
@@ -2318,6 +2320,45 @@ impl<'a> BibliographyRequest<'a> {
     }
 }
 
+/// The position of a citation relative to earlier citations of the same
+/// entry.
+///
+/// Processors derive this from citation order and note numbers. Setting it
+/// on a [`CitationItem`] overrides the derived state, e.g. when replaying a
+/// document whose position state is managed externally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CitePosition {
+    /// The first citation of the entry.
+    First,
+    /// The entry was cited before.
+    Subsequent,
+    /// Directly following a citation of the same entry with the same locator.
+    Ibid,
+    /// Directly following a citation of the same entry with a different
+    /// locator.
+    IbidWithLocator,
+}
+
+impl CitePosition {
+    /// Whether this position satisfies the given CSL position test.
+    ///
+    /// Like citeproc-js, the tests are ranked: `ibid-with-locator` also
+    /// satisfies `ibid`, and both also satisfy `subsequent`.
+    pub(crate) fn matches(self, test: citationberg::TestPosition) -> bool {
+        use citationberg::TestPosition;
+
+        match test {
+            TestPosition::First => self == Self::First,
+            TestPosition::Subsequent => self != Self::First,
+            TestPosition::Ibid => matches!(self, Self::Ibid | Self::IbidWithLocator),
+            TestPosition::IbidWithLocator => self == Self::IbidWithLocator,
+            // `near-note` also depends on the near-note flag and is handled
+            // by the renderer.
+            TestPosition::NearNote => false,
+        }
+    }
+}
+
 /// A reference to an [`crate::Entry`] within a [`CitationRequest`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitationItem<'a, T: EntryLike> {
@@ -2343,6 +2384,14 @@ pub struct CitationItem<'a, T: EntryLike> {
     /// The suffix is inserted inside the citation layout's inter-item
     /// delimiters. It is not processed with locale or quote handling.
     pub suffix: Option<String>,
+    /// Overrides the citation position derived from citation order.
+    pub position: Option<CitePosition>,
+    /// Overrides whether this citation is within `near-note-distance` of the
+    /// previous citation of the same entry.
+    ///
+    /// Like citeproc-js, `near-note` only tests true when the position is not
+    /// `first`.
+    pub near_note: Option<bool>,
     /// The initial index of this item in the list of items.
     initial_idx: usize,
 }
@@ -2358,6 +2407,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             purpose: None,
             prefix: None,
             suffix: None,
+            position: None,
+            near_note: None,
             initial_idx: 0,
         }
     }
@@ -2372,6 +2423,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             purpose: None,
             prefix: None,
             suffix: None,
+            position: None,
+            near_note: None,
             initial_idx: 0,
         }
     }
@@ -2392,6 +2445,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             purpose,
             prefix: None,
             suffix: None,
+            position: None,
+            near_note: None,
             initial_idx: 0,
         }
     }
@@ -2412,6 +2467,20 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
     ) -> Self {
         self.prefix = prefix;
         self.suffix = suffix;
+        self
+    }
+
+    /// Force the citation position of this item instead of deriving it from
+    /// citation order.
+    pub fn with_position(mut self, position: CitePosition) -> Self {
+        self.position = Some(position);
+        self
+    }
+
+    /// Force whether this item counts as a near note, instead of deriving it
+    /// from the previous citation's note number.
+    pub fn with_near_note(mut self, near_note: bool) -> Self {
+        self.near_note = Some(near_note);
         self
     }
 }
@@ -2947,6 +3016,12 @@ struct CertainCiteProperties {
     /// Whether the item is within `near-note-distance` to the previous citation
     /// of the same item.
     pub is_near_note: bool,
+    /// A forced position from the citation item, overriding the position
+    /// derived from citation order.
+    pub position: Option<CitePosition>,
+    /// A forced near-note state from the citation item, overriding the state
+    /// derived from the note numbers.
+    pub near_note: Option<bool>,
     /// Whether this citation is the first citation of the entry.
     ///
     /// Only depends on insertion order. The entry cannot be switched with

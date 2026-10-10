@@ -156,9 +156,10 @@ pub use crate::csl::archive;
 pub use citationberg;
 pub use csl::{
     BibliographyDriver, BibliographyItem, BibliographyRequest, Brackets, BufWriteFormat,
-    CitationItem, CitationRequest, CitePurpose, Elem, ElemChild, ElemChildren, ElemMeta,
-    Formatted, Formatting, LocatorPayload, Rendered, RenderedBibliography,
-    RenderedCitation, SpecificLocator, TransparentLocator, standalone_citation,
+    CitationItem, CitationRequest, CitePosition, CitePurpose, Elem, ElemChild,
+    ElemChildren, ElemMeta, Formatted, Formatting, LocatorPayload, Rendered,
+    RenderedBibliography, RenderedCitation, SpecificLocator, TransparentLocator,
+    standalone_citation,
 };
 pub use selectors::{Selector, SelectorError};
 
