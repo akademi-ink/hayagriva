@@ -72,6 +72,8 @@ struct SpeculativeItemRender<'a, T: EntryLike> {
     hidden: bool,
     locale: Option<LocaleCode>,
     purpose: Option<CitePurpose>,
+    prefix: Option<String>,
+    suffix: Option<String>,
     collapse_verdict: Option<CollapseVerdict>,
     style_uses_year_suffix_var: bool,
 }
@@ -80,6 +82,48 @@ struct SpeculativeItemRender<'a, T: EntryLike> {
 struct SpeculativeCiteRender<'a, 'b, T: EntryLike> {
     items: Vec<SpeculativeItemRender<'a, T>>,
     request: &'b CitationRequest<'a, T>,
+}
+
+/// Returns the inter-item delimiter to place before an item, mirroring
+/// citeproc-js's suppression rules for item affixes (cf. the test case
+/// `magic_SuppressLayoutDelimiterIfPrefixComma`).
+///
+/// If the preceding item's suffix ends in `;`, `.` or `,`, only the part of
+/// the delimiter from its first space onwards is kept. If the current item's
+/// prefix starts with one of those characters, the delimiter is dropped
+/// entirely. Returns `None` if no delimiter should be printed.
+fn item_delimiter<'a, T: EntryLike>(
+    prev: &SpeculativeItemRender<'a, T>,
+    item: &SpeculativeItemRender<'a, T>,
+    delimiter: &'a str,
+) -> Option<&'a str> {
+    const TERMINAL: [char; 3] = [';', '.', ','];
+
+    let prev_ends_with_terminal = prev
+        .suffix
+        .as_deref()
+        .and_then(|s| s.chars().next_back())
+        .is_some_and(|c| TERMINAL.contains(&c));
+    let item_starts_with_terminal = prev.suffix.is_none()
+        && item
+            .prefix
+            .as_deref()
+            .and_then(|s| s.chars().next())
+            .is_some_and(|c| TERMINAL.contains(&c));
+
+    if prev_ends_with_terminal {
+        if item_starts_with_terminal {
+            None
+        } else {
+            // Keep the part of the delimiter starting at its first space or
+            // drop it if it contains none.
+            Some(delimiter.find(' ').map_or("", |i| &delimiter[i..]))
+        }
+    } else if item_starts_with_terminal {
+        None
+    } else {
+        Some(delimiter)
+    }
 }
 
 impl<'a, T: EntryLike> BibliographyDriver<'a, T> {
@@ -219,6 +263,8 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     hidden: item.hidden,
                     locale: item.locale.clone(),
                     purpose: item.purpose,
+                    prefix: item.prefix.clone(),
+                    suffix: item.suffix.clone(),
                     collapse_verdict: None,
                     style_uses_year_suffix_var: uses_year_suffix_var(&style),
                 });
@@ -447,9 +493,18 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                                     .layout
                                     .delimiter
                                     .as_deref())
+                            && let Some(delim) =
+                                item_delimiter(&cite.items[i - 1], item, delim)
                         {
                             elem_children.push(ElemChild::Text(Formatted {
                                 text: delim.to_string(),
+                                formatting,
+                            }));
+                        }
+
+                        if let Some(prefix) = &item.prefix {
+                            elem_children.push(ElemChild::Text(Formatted {
+                                text: prefix.clone(),
                                 formatting,
                             }));
                         }
@@ -461,6 +516,13 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                                 item.cite_props.certain.initial_idx,
                             )),
                         }));
+
+                        if let Some(suffix) = &item.suffix {
+                            elem_children.push(ElemChild::Text(Formatted {
+                                text: suffix.clone(),
+                                formatting,
+                            }));
+                        }
                     }
 
                     if let Some(suffix) = cite.request.suffix() {
@@ -2072,6 +2134,16 @@ pub struct CitationItem<'a, T: EntryLike> {
     pub hidden: bool,
     /// Format the item in a special way.
     pub purpose: Option<CitePurpose>,
+    /// Literal text placed directly before the item's rendered content.
+    ///
+    /// The prefix is inserted inside the citation layout's inter-item
+    /// delimiters. It is not processed with locale or quote handling.
+    pub prefix: Option<String>,
+    /// Literal text placed directly after the item's rendered content.
+    ///
+    /// The suffix is inserted inside the citation layout's inter-item
+    /// delimiters. It is not processed with locale or quote handling.
+    pub suffix: Option<String>,
     /// The initial index of this item in the list of items.
     initial_idx: usize,
 }
@@ -2085,6 +2157,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             locale: None,
             hidden: false,
             purpose: None,
+            prefix: None,
+            suffix: None,
             initial_idx: 0,
         }
     }
@@ -2097,6 +2171,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             locale: None,
             hidden: false,
             purpose: None,
+            prefix: None,
+            suffix: None,
             initial_idx: 0,
         }
     }
@@ -2115,6 +2191,8 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
             locale,
             hidden,
             purpose,
+            prefix: None,
+            suffix: None,
             initial_idx: 0,
         }
     }
@@ -2122,6 +2200,19 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
     /// Change the `kind` of this item.
     pub fn kind(mut self, purpose: CitePurpose) -> Self {
         self.purpose = Some(purpose);
+        self
+    }
+
+    /// Set literal affixes that are placed directly before and after this
+    /// item's rendered content, inside the citation layout's inter-item
+    /// delimiters.
+    pub fn with_affixes(
+        mut self,
+        prefix: Option<String>,
+        suffix: Option<String>,
+    ) -> Self {
+        self.prefix = prefix;
+        self.suffix = suffix;
         self
     }
 }
@@ -4243,5 +4334,233 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, ["(33)", "()", "(34)"]);
+    }
+
+    /// Render a single citation with `style` as plain text.
+    fn render_citation<T: EntryLike + Hash + PartialEq + Eq + Debug>(
+        style: &IndependentStyle,
+        items: Vec<CitationItem<'_, T>>,
+    ) -> String {
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(items, style, None, &[], Some(1)));
+        let finished = driver.finish(BibliographyRequest::new(style, None, &[]));
+        let mut s = String::new();
+        finished.citations[0]
+            .citation
+            .write_buf(&mut s, BufWriteFormat::Plain)
+            .unwrap();
+        s
+    }
+
+    #[test]
+    fn affix_prefix_in_layout_affixes() {
+        // Derived from the `affix_PrefixFullCitationTextOnly` test-suite
+        // fixture. The item prefix is inserted inside the layout's affixes.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-test</id>
+                <title>Affix Test</title>
+                <updated>2007-10-26T21:32:52+02:00</updated>
+              </info>
+              <citation>
+                <layout prefix="(" suffix=")">
+                  <group delimiter=" ">
+                    <names variable="author"><name form="short"/></names>
+                    <date variable="issued"><date-part name="year"/></date>
+                  </group>
+                </layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            smith:
+                type: Book
+                title: Book C
+                author: "Smith, John"
+                date: 2000
+            "#,
+        )
+        .unwrap();
+
+        let citation = render_citation(
+            &style,
+            vec![
+                CitationItem::with_entry(library.get("smith").unwrap())
+                    .with_affixes(Some("As written in ".to_string()), None),
+            ],
+        );
+
+        assert_eq!(citation, "(As written in Smith 2000)");
+    }
+
+    #[test]
+    fn affix_prefix_with_comma() {
+        // Derived from the `affix_CommaAfterQuote` test-suite fixture. The
+        // official fixture expects `“quote”, Hello Thing`, but hayagriva does
+        // not apply citeproc-js's smart-quote flipping to item affixes: they
+        // are literal, so the straight quotes are preserved here.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-test</id>
+                <title>Affix Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: Hello Thing
+            "#,
+        )
+        .unwrap();
+
+        let citation = render_citation(
+            &style,
+            vec![
+                CitationItem::with_entry(library.get("item").unwrap())
+                    .with_affixes(Some("'quote', ".to_string()), None),
+            ],
+        );
+
+        assert_eq!(citation, "'quote', Hello Thing");
+    }
+
+    #[test]
+    fn affix_suffix() {
+        // The suffix is literal and rendered directly after the item's
+        // content. Cf. the second line of the
+        // `affix_WordProcessorAffixNoSpace` fixture.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-test</id>
+                <title>Affix Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: My Title
+            "#,
+        )
+        .unwrap();
+
+        let citation = render_citation(
+            &style,
+            vec![
+                CitationItem::with_entry(library.get("item").unwrap())
+                    .with_affixes(None, Some(", My Suffix".to_string())),
+            ],
+        );
+
+        assert_eq!(citation, "My Title, My Suffix");
+    }
+
+    #[test]
+    fn affix_prefix_and_suffix_on_multi_item_citation() {
+        // Both affixes are placed inside the layout's inter-item delimiter.
+        // The prefix and suffix are the second line of the
+        // `affix_WordProcessorAffixNoSpace` fixture.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-test</id>
+                <title>Affix Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout delimiter="; "><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: My Title
+            other:
+                type: Book
+                title: Book Two
+            "#,
+        )
+        .unwrap();
+
+        let citation = render_citation(
+            &style,
+            vec![
+                CitationItem::with_entry(library.get("item").unwrap()).with_affixes(
+                    Some("My Prefix. ".to_string()),
+                    Some(", My Suffix".to_string()),
+                ),
+                CitationItem::with_entry(library.get("other").unwrap()),
+            ],
+        );
+
+        assert_eq!(citation, "My Prefix. My Title, My Suffix; Book Two");
+    }
+
+    #[test]
+    fn affix_prefix_comma_suppresses_delimiter() {
+        // Exact expected output of the
+        // `magic_SuppressLayoutDelimiterIfPrefixComma` test-suite fixture: a
+        // prefix starting with a comma suppresses the layout delimiter.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-test</id>
+                <title>Affix Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout delimiter="; "><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: Book A
+            other:
+                type: Book
+                title: Book B
+            "#,
+        )
+        .unwrap();
+
+        let citation = render_citation(
+            &style,
+            vec![
+                CitationItem::with_entry(library.get("item").unwrap()),
+                CitationItem::with_entry(library.get("other").unwrap())
+                    .with_affixes(Some(", cited in ".to_string()), None),
+            ],
+        );
+
+        assert_eq!(citation, "Book A, cited in Book B");
     }
 }

@@ -499,12 +499,10 @@ where
         && case.bib_section.is_none()
         && case.citations.is_none()
         && case.citation_items.as_ref().is_none_or(|cites| {
-            cites.iter().flatten().all(|i| {
-                i.prefix.is_none()
-                    && i.suffix.is_none()
-                    && i.near_note.is_none()
-                    && i.position.is_none()
-            })
+            cites
+                .iter()
+                .flatten()
+                .all(|i| i.near_note.is_none() && i.position.is_none())
         });
 
     let contains_date_ranges = case
@@ -582,6 +580,7 @@ where
                                 None
                             },
                         )
+                        .with_affixes(i.prefix.clone(), i.suffix.clone())
                     })
                     .collect(),
                 &style,
