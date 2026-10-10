@@ -126,6 +126,18 @@ fn item_delimiter<'a, T: EntryLike>(
     }
 }
 
+/// Whether a citation or element suffix should be printed.
+///
+/// Mirrors citeproc-js: a suffix is collapsed only when it duplicates
+/// terminal punctuation already present ("." after "."), never closing
+/// delimiters — content ending in `)` plus a `)` suffix renders `))`.
+fn should_print_suffix(last_text: Option<&str>, suffix: &str) -> bool {
+    let terminal = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+    };
+    last_text.is_none_or(|t| !(terminal(suffix) && t.ends_with(suffix)))
+}
+
 impl<'a, T: EntryLike> BibliographyDriver<'a, T> {
     /// Create a new bibliography driver.
     pub fn new() -> Self {
@@ -526,9 +538,9 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     }
 
                     if let Some(suffix) = cite.request.suffix() {
-                        let print = last_text_mut_child(&mut elem_children)
-                            .is_none_or(|t| !t.text.ends_with(suffix));
-                        if print {
+                        let last = last_text_mut_child(&mut elem_children)
+                            .map(|t| t.text.as_str());
+                        if should_print_suffix(last, suffix) {
                             elem_children.push(
                                 Formatted { text: suffix.to_string(), formatting }.into(),
                             );
@@ -679,18 +691,8 @@ pub fn standalone_citation<T: EntryLike>(
         }
 
         if let Some(suffix) = style.csl.citation.layout.suffix.as_ref() {
-            // citeproc-js collapses a layout suffix only when it duplicates
-            // terminal punctuation already present ("." after "."), never
-            // closing delimiters: content ending in ")" plus layout suffix ")"
-            // renders "))".
-            let terminal = |s: &str| {
-                !s.is_empty()
-                    && s.chars().all(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
-            };
-            let print = res
-                .last_text()
-                .is_none_or(|t| !(terminal(suffix) && t.text.ends_with(suffix)));
-            if print {
+            let last = res.last_text().map(|t| t.text.as_str());
+            if should_print_suffix(last, suffix) {
                 res.0.push(Formatted { text: suffix.clone(), formatting }.into());
             }
         }
