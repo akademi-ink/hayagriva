@@ -1053,3 +1053,214 @@ fn no_author() {
         .unwrap();
     assert_eq!(buf, "(Definition and Objectives of Systems Development, 2016)");
 }
+
+/// Regression tests for the spacing and delimiter findings (F-101, F-102,
+/// F-105, F-106). Expected strings were verified against citeproc-js.
+mod regression {
+    use super::*;
+
+    fn inline_style(xml: &str) -> citationberg::IndependentStyle {
+        match Style::from_xml(xml).unwrap() {
+            Style::Independent(style) => style,
+            Style::Dependent(_) => panic!("expected an independent style"),
+        }
+    }
+
+    fn items(json: &str) -> Vec<csl_json::Item> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn write_plain(elems: &hayagriva::ElemChildren) -> String {
+        let mut buf = String::new();
+        elems.write_buf(&mut buf, hayagriva::BufWriteFormat::Plain).unwrap();
+        buf
+    }
+
+    fn bibliography(
+        style: &citationberg::IndependentStyle,
+        items: &[csl_json::Item],
+    ) -> String {
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            items.iter().map(CitationItem::with_entry).collect(),
+            style,
+            None,
+            &locales,
+            Some(1),
+        ));
+        let rendered = driver.finish(BibliographyRequest::new(style, None, &locales));
+        write_plain(&rendered.bibliography.unwrap().items[0].content)
+    }
+
+    /// `F-101`: a group delimiter ending in a space must not produce a double
+    /// space before a child whose prefix begins with a space
+    /// (`springer-socpsych-author-date` bibliography).
+    #[test]
+    fn f101_delimiter_space_plus_prefix_space() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f101</id><title>f101</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <group delimiter=". ">
+                  <names variable="author">
+                    <name name-as-sort-order="all" sort-separator=", " initialize-with=". " delimiter=", " delimiter-precedes-last="always"/>
+                  </names>
+                  <date variable="issued" prefix=" (" suffix=")"><date-part name="year"/></date>
+                  <text variable="title" prefix=" "/>
+                </group>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "webpage",
+              "title": "CSL-JSON Item Schema",
+              "author": [{ "given": "Sofia", "family": "Almeida" }],
+              "issued": { "date-parts": [[2019]] }
+            }]"#,
+        );
+        assert_eq!(
+            bibliography(&style, &items),
+            "Almeida, S. (2019). CSL-JSON Item Schema"
+        );
+    }
+
+    /// `F-102`: the `cite-group-delimiter` only joins items within a cite
+    /// group; different groups are joined with the citation layout delimiter
+    /// (`elsevier-harvard`).
+    #[test]
+    fn f102_cite_group_delimiter_only_within_group() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f102</id><title>f102</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation et-al-min="3" et-al-use-first="1" collapse="year" cite-group-delimiter=", ">
+                <layout prefix="(" suffix=")" delimiter="; ">
+                  <group delimiter=", ">
+                    <names variable="author"><name form="short" and="text"/></names>
+                    <date variable="issued"><date-part name="year"/></date>
+                    <group delimiter=" ">
+                      <label variable="locator" form="short"/>
+                      <text variable="locator"/>
+                    </group>
+                  </group>
+                </layout>
+              </citation>
+              <bibliography><layout><text variable="title"/></layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[
+              {
+                "id": "ITEM-1",
+                "type": "article-journal",
+                "title": "Neural Machine Translation",
+                "author": [
+                  { "given": "Ana", "family": "Ferreira" },
+                  { "given": "Joost", "family": "van der Berg" }
+                ],
+                "issued": { "date-parts": [[2021]] }
+              },
+              {
+                "id": "ITEM-2",
+                "type": "book",
+                "title": "Scalable Event Processing",
+                "author": [{ "given": "Márta", "family": "Kovács" }],
+                "issued": { "date-parts": [[2020]] }
+              }
+            ]"#,
+        );
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![
+                CitationItem::new(&items[0], None, None, false, None),
+                CitationItem::new(
+                    &items[1],
+                    Some(SpecificLocator(Locator::Page, LocatorPayload::Str("23"))),
+                    None,
+                    false,
+                    None,
+                ),
+            ],
+            &style,
+            None,
+            &locales,
+            Some(1),
+        ));
+        let rendered = driver.finish(BibliographyRequest::new(&style, None, &locales));
+        assert_eq!(
+            write_plain(&rendered.citations[0].citation),
+            "(Ferreira and van der Berg, 2021; Kovács, 2020, p. 23)"
+        );
+    }
+
+    /// `F-105`: a term at the start of a note-style citation is capitalized;
+    /// an item prefix suppresses that unless it looks like a sentence (ends
+    /// with terminal punctuation after at least one space)
+    /// (`bugreports_CapsAfterOneWordPrefix`).
+    #[test]
+    fn f105_ibid_capitalization_after_prefix() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info><id>f105</id><title>f105</title><updated>2009-08-10T04:49:00+09:00</updated></info>
+              <citation><layout delimiter="; "><text term="ibid"/></layout></citation>
+            </style>"#,
+        );
+        let items = items(r#"[{ "id": "ITEM-1", "title": "Title", "type": "book" }]"#);
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        for prefix in ["Nocapsafter. ", "Caps after. "] {
+            driver.citation(CitationRequest::new(
+                vec![
+                    CitationItem::with_entry(&items[0])
+                        .with_affixes(Some(prefix.into()), None),
+                ],
+                &style,
+                None,
+                &locales,
+                Some(1),
+            ));
+        }
+        let rendered = driver.finish(BibliographyRequest::new(&style, None, &locales));
+        assert_eq!(write_plain(&rendered.citations[0].citation), "Nocapsafter. ibid.");
+        assert_eq!(write_plain(&rendered.citations[1].citation), "Caps after. Ibid.");
+    }
+
+    /// `F-106`: a terminal period must not be doubled when a sibling's prefix
+    /// starts with the same punctuation (`elsevier-harvard` bibliography).
+    #[test]
+    fn f106_no_double_terminal_period() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f106</id><title>f106</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <group suffix=".">
+                  <text variable="title"/>
+                  <text variable="container-title" prefix=". "/>
+                </group>
+                <text variable="URL" prefix=". "/>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = items(
+            r#"[{
+              "id": "ITEM-1",
+              "type": "webpage",
+              "title": "CSL-JSON Item Schema",
+              "container-title": "Citation Style Language",
+              "URL": "https://citationstyles.org/schema/csl-json"
+            }]"#,
+        );
+        assert_eq!(
+            bibliography(&style, &items),
+            "CSL-JSON Item Schema. Citation Style Language. https://citationstyles.org/schema/csl-json"
+        );
+    }
+}

@@ -21,7 +21,9 @@ use crate::lang::{Case, SentenceCase, TitleCase};
 use crate::types::{ChunkedString, Date, MaybeTyped, Numeric};
 
 use super::taxonomy::{EntryLike, NumberOrPageVariableResult};
-use super::{Context, ElemMeta, IbidState, SpecialForm, UsageInfo, write_year};
+use super::{
+    Context, ElemMeta, IbidState, SpecialForm, UsageInfo, capitalize_first, write_year,
+};
 
 pub mod names;
 
@@ -39,6 +41,9 @@ pub(crate) trait RenderCsl {
 impl RenderCsl for citationberg::Text {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
         let Some(target) = ResolvedTextTarget::compute(self, ctx) else { return };
+        // Whether this is the first thing rendered in the current item,
+        // before the element's own affixes are applied.
+        let nothing_rendered = ctx.writing.len() == 0;
         let depth = ctx.push_elem(self.formatting);
 
         // Only print affixes if this macro is not used out of its original context.
@@ -137,7 +142,13 @@ impl RenderCsl for citationberg::Text {
                     ctx.writing.pop_delimiter(idx);
                 }
             }
-            ResolvedTextTarget::Term(s) => ctx.push_str(s),
+            ResolvedTextTarget::Term(s) => {
+                if nothing_rendered && ctx.should_capitalize_term() {
+                    ctx.push_str(&capitalize_first(s));
+                } else {
+                    ctx.push_str(s);
+                }
+            }
             ResolvedTextTarget::Value(val) => ctx.push_str(val),
         }
 

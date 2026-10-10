@@ -95,28 +95,101 @@ impl fmt::Display for Elem {
     }
 }
 
-/// Merge adjacent text nodes with the same formatting.
+/// Merge adjacent text nodes with the same formatting and collapse duplicated
+/// collapsible characters at the seams between adjacent text leaves.
 pub(super) fn simplify_children(children: ElemChildren) -> ElemChildren {
-    ElemChildren(children.0.into_iter().fold(Vec::new(), |mut acc, child| {
-        match (child, acc.last_mut()) {
-            (ElemChild::Text(t), Some(ElemChild::Text(last)))
-                if last.formatting == t.formatting =>
-            {
-                last.text.push_str(&t.text);
-                return acc;
+    let mut children =
+        ElemChildren(children.0.into_iter().fold(Vec::new(), |mut acc, child| {
+            match (child, acc.last_mut()) {
+                (ElemChild::Text(t), Some(ElemChild::Text(last)))
+                    if last.formatting == t.formatting =>
+                {
+                    merge_text(&mut last.text, &t.text);
+                    return acc;
+                }
+                (ElemChild::Elem(e), _) if e.may_inline() => {
+                    acc.extend(e.children.0);
+                }
+                (ElemChild::Elem(e), _) => {
+                    acc.push(ElemChild::Elem(e.simplify()));
+                }
+                (child, _) => {
+                    acc.push(child);
+                }
             }
-            (ElemChild::Elem(e), _) if e.may_inline() => {
-                acc.extend(e.children.0);
-            }
-            (ElemChild::Elem(e), _) => {
-                acc.push(ElemChild::Elem(e.simplify()));
-            }
-            (child, _) => {
-                acc.push(child);
+            acc
+        }));
+    normalize_seams(&mut children);
+    children
+}
+
+/// `true` for characters whose duplication at the seam of two concatenated
+/// text runs is collapsed by citeproc-js (punctuation and spaces).
+fn is_collapsible_seam_char(c: char) -> bool {
+    matches!(c, ' ' | '\u{a0}' | ':' | '.' | ';' | '!' | '?' | ',')
+}
+
+/// Append `next` to `last`, avoiding a duplicated collapsible character at
+/// the seam. This mirrors citeproc-js's output adjustments, which collapse
+/// e.g. a group delimiter `". "` followed by a `" ("` prefix, or a sibling
+/// prefix `". "` after a text ending in `"."`.
+fn merge_text(last: &mut String, next: &str) {
+    let next = match (last.chars().next_back(), next.chars().next()) {
+        (Some(a), Some(b)) if a == b && is_collapsible_seam_char(a) => {
+            &next[b.len_utf8()..]
+        }
+        _ => next,
+    };
+
+    last.push_str(next);
+}
+
+/// Collapse duplicated collapsible characters at the seams between adjacent
+/// text leaves, also across element boundaries (e.g. a group suffix followed
+/// by a sibling's prefix). Seams between differently formatted leaves are
+/// left untouched.
+fn normalize_seams(children: &mut ElemChildren) {
+    let mut last: Option<(char, Formatting)> = None;
+
+    fn visit(children: &mut ElemChildren, last: &mut Option<(char, Formatting)>) {
+        for child in &mut children.0 {
+            match child {
+                ElemChild::Text(t) => {
+                    if let (Some((last_char, last_format)), Some(first)) =
+                        (last.as_ref(), t.text.chars().next())
+                        && *last_char == first
+                        && *last_format == t.formatting
+                        && is_collapsible_seam_char(first)
+                    {
+                        t.text.remove(0);
+                    }
+
+                    if let Some(c) = t.text.chars().next_back() {
+                        *last = Some((c, t.formatting));
+                    }
+                }
+                ElemChild::Link { text, .. } => {
+                    if let (Some((last_char, last_format)), Some(first)) =
+                        (last.as_ref(), text.text.chars().next())
+                        && *last_char == first
+                        && *last_format == text.formatting
+                        && is_collapsible_seam_char(first)
+                    {
+                        text.text.remove(0);
+                    }
+
+                    if let Some(c) = text.text.chars().next_back() {
+                        *last = Some((c, text.formatting));
+                    }
+                }
+                ElemChild::Elem(e) => visit(&mut e.children, last),
+                // Markup is opaque, and transparent elements write nothing.
+                ElemChild::Markup(_) | ElemChild::Transparent { .. } => *last = None,
             }
         }
-        acc
-    }))
+    }
+
+    visit(children, &mut last);
 }
 
 /// Which CSL construct created an element.

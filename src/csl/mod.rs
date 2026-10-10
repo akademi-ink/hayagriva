@@ -126,6 +126,30 @@ fn item_delimiter<'a, T: EntryLike>(
     }
 }
 
+/// Whether a citation item prefix reads like a complete sentence, i.e. it
+/// ends in terminal punctuation after at least one space.
+///
+/// Mirrors citeproc-js's `checkIgnorePredecessor`: only such prefixes make a
+/// following term start a new sentence (and thus be capitalized).
+fn prefix_starts_sentence(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}' | '\u{202f}')
+    });
+    let ends_in_terminal_punctuation =
+        matches!(trimmed.chars().next_back(), Some(':' | '.' | ';' | '!' | '?'));
+    ends_in_terminal_punctuation && prefix.trim().contains(' ')
+}
+
+/// Capitalize the first character of a term.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Whether a citation or element suffix should be printed.
 ///
 /// Mirrors citeproc-js: a suffix is collapsed only when it duplicates
@@ -256,6 +280,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     citation.locale.as_ref(),
                     item.purpose,
                     None,
+                    item.prefix.as_deref(),
                 );
 
                 // Copy the identifier usage from the context. Assume it does
@@ -398,11 +423,14 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     pos -= 1;
                 }
 
-                cite.items[target].delim_override = Some(delim);
-                cite.items[target].group_idx = Some(group_idx);
-                if let Some(prev) = prev {
-                    cite.items[prev].delim_override = None;
+                // Only items that continue an existing cite group are joined
+                // to the preceding item with the cite-group delimiter. The
+                // first item of each group keeps the citation layout
+                // delimiter.
+                if prev.is_some() {
+                    cite.items[target].delim_override = Some(delim);
                 }
+                cite.items[target].group_idx = Some(group_idx);
             }
         }
 
@@ -652,6 +680,7 @@ pub fn standalone_citation<T: EntryLike>(
                 req.locale.as_ref(),
                 item.purpose,
                 None,
+                item.prefix.as_deref(),
             )
         });
     }
@@ -715,6 +744,7 @@ fn do_rerender<T: EntryLike>(
         request.locale.as_ref(),
         item.purpose,
         item.collapse_verdict,
+        item.prefix.as_deref(),
     )
 }
 
@@ -734,7 +764,7 @@ fn date_replacement<T: EntryLike>(
     ElemChildren(vec![ElemChild::Text(Formatted {
         text: if let Some(date) = date {
             let mut s = String::with_capacity(4);
-            let c = ctx.ctx(entry, cite_props.clone(), locale, term_locale, false);
+            let c = ctx.ctx(entry, cite_props.clone(), locale, term_locale, false, None);
             let ad = c
                 .term(Term::Other(OtherTerm::Ad), TermForm::default(), false)
                 .unwrap_or(" AD");
@@ -744,7 +774,7 @@ fn date_replacement<T: EntryLike>(
             write_year(date.year, false, &mut s, ad, bc).unwrap();
             s
         } else if let Some(no_date) = ctx
-            .ctx(entry, cite_props.clone(), locale, term_locale, false)
+            .ctx(entry, cite_props.clone(), locale, term_locale, false, None)
             .term(Term::Other(OtherTerm::NoDate), TermForm::default(), false)
         {
             no_date.to_string()
@@ -1722,6 +1752,7 @@ impl<'a> StyleContext<'a> {
         locale: Option<&'b LocaleCode>,
         term_locale: Option<&'b LocaleCode>,
         bibliography: bool,
+        cite_prefix: Option<&'b str>,
     ) -> Context<'b, T> {
         Context {
             instance: InstanceContext::new(
@@ -1735,6 +1766,7 @@ impl<'a> StyleContext<'a> {
             style: self,
             writing: WritingContext::new(self.csl.settings.options.clone()),
             bibliography,
+            cite_prefix,
         }
     }
 
@@ -1758,10 +1790,12 @@ impl<'a> StyleContext<'a> {
             style: self,
             writing: WritingContext::new(self.csl.settings.options.clone()),
             bibliography,
+            cite_prefix: None,
         }
     }
 
     /// Render the given item within a citation.
+    #[allow(clippy::too_many_arguments)]
     fn citation<T: EntryLike>(
         &self,
         entry: &T,
@@ -1770,9 +1804,17 @@ impl<'a> StyleContext<'a> {
         term_locale: Option<&LocaleCode>,
         kind: Option<CitePurpose>,
         collapse_verdict: Option<CollapseVerdict>,
+        cite_prefix: Option<&str>,
     ) -> ElemChildren {
-        let ctx =
-            self.do_citation(entry, props, locale, term_locale, kind, collapse_verdict);
+        let ctx = self.do_citation(
+            entry,
+            props,
+            locale,
+            term_locale,
+            kind,
+            collapse_verdict,
+            cite_prefix,
+        );
         ctx.flush()
     }
 
@@ -1789,6 +1831,7 @@ impl<'a> StyleContext<'a> {
     }
 
     /// Render the given item within a citation.
+    #[allow(clippy::too_many_arguments)]
     fn do_citation<'b, T: EntryLike>(
         &'b self,
         entry: &'b T,
@@ -1797,8 +1840,9 @@ impl<'a> StyleContext<'a> {
         term_locale: Option<&'b LocaleCode>,
         kind: Option<CitePurpose>,
         collapse_verdict: Option<CollapseVerdict>,
+        cite_prefix: Option<&'b str>,
     ) -> Context<'b, T> {
-        let mut ctx = self.ctx(entry, props, locale, term_locale, false);
+        let mut ctx = self.ctx(entry, props, locale, term_locale, false, cite_prefix);
 
         let do_regular = |ctx: &mut Context<'b, T>| {
             let reset = if ctx.instance.kind.is_none() {
@@ -2000,7 +2044,7 @@ impl<'a> StyleContext<'a> {
         locale: Option<&'b LocaleCode>,
         term_locale: Option<&'b LocaleCode>,
     ) -> Option<Context<'b, T>> {
-        let mut ctx = self.ctx(entry, props, locale, term_locale, true);
+        let mut ctx = self.ctx(entry, props, locale, term_locale, true, None);
         ctx.writing
             .push_name_options(&self.csl.bibliography.as_ref()?.name_options);
 
@@ -2655,6 +2699,9 @@ pub(crate) struct Context<'a, T: EntryLike> {
     style: &'a StyleContext<'a>,
     writing: WritingContext,
     bibliography: bool,
+    /// The literal prefix of the citation item being rendered, if any. Used
+    /// to decide whether a leading term starts a new sentence.
+    cite_prefix: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2929,6 +2976,19 @@ impl<T: PartialEq + 'static> TransparentLocatorPayload for T {
 }
 
 impl<'a, T: EntryLike> Context<'a, T> {
+    /// Whether a term rendered now should be capitalized to start a sentence.
+    ///
+    /// Mirrors citeproc-js: the first term of a note-style citation is
+    /// capitalized unless the citation item carries a prefix that does not
+    /// itself look like the start of a new sentence (i.e. it does not end in
+    /// terminal punctuation after at least one space).
+    fn should_capitalize_term(&self) -> bool {
+        !self.bibliography
+            && self.style.csl.settings.class == StyleClass::Note
+            && self.instance.cite_props.certain.initial_idx == 0
+            && self.cite_prefix.is_none_or(prefix_starts_sentence)
+    }
+
     /// Push a format on top of the stack if it is not empty.
     fn push_format(&mut self, format: citationberg::Formatting) -> FormatIdx {
         self.writing.push_format(format)

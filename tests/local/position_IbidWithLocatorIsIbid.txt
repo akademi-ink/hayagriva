@@ -4,8 +4,8 @@ citation
 
 >>===== RESULT =====>>
 A 33
-ibid.
-ibid.
+Ibid.
+Ibid.
 <<===== RESULT =====<<
 
 >>===== CITATION-ITEMS =====>>
