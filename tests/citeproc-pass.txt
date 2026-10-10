@@ -322,6 +322,7 @@ name_EditorTranslatorSameWithTerm
 name_EditorTranslatorWithTranslatorOnlyBib
 name_EtAlKanji
 name_EtAlUseLast
+name_EtAlWithCombined
 name_FirstInitialFullForm
 name_FormattingOfParticles
 name_GreekSimple
