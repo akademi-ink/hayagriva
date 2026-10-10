@@ -481,6 +481,35 @@ enum EndDelim {
     DelimAnd(NameAnd),
 }
 
+/// Whether `text` starts with a character that citeproc-js treats as
+/// "Romanesque" when deciding whether an et-al term may be preceded by a
+/// bare space.
+///
+/// Mirrors `CSL.STARTSWITH_ROMANESQUE_REGEXP`: ASCII letters and `&` plus the
+/// Latin, Greek, Cyrillic, Hebrew, Arabic and Thai ranges. Terms outside
+/// these ranges (e.g. the CJK `等`) get their space-only prefix dropped.
+fn starts_with_romanesque(text: &str) -> bool {
+    fn is_romanesque(c: char) -> bool {
+        c == '&'
+            || c.is_ascii_alphabetic()
+            || matches!(
+                c as u32,
+                0x00c0..=0x017f // Latin-1 Supplement, Latin Extended-A
+                    | 0x0218..=0x021b // Latin Extended-B (Romanian)
+                    | 0x0370..=0x03ff // Greek
+                    | 0x0400..=0x052f // Cyrillic
+                    | 0x0590..=0x05d4 | 0x05d6..=0x05ff // Hebrew
+                    | 0x0600..=0x06ff // Arabic
+                    | 0x0e01..=0x0e5b // Thai
+                    | 0x1f00..=0x1fff // Greek Extended
+                    | 0x200c..=0x200e // ZWNJ, ZWJ, LRM
+                    | 0x202a..=0x202e // Bidi control characters
+            )
+    }
+
+    text.chars().next().is_some_and(is_romanesque)
+}
+
 fn add_names<T: EntryLike>(
     names: &citationberg::Names,
     ctx: &mut Context<T>,
@@ -599,12 +628,21 @@ fn add_names<T: EntryLike>(
                 _ => false,
             };
 
-            if delim {
+            // citeproc-js drops a space-only prefix before the et-al term
+            // when the term does not start with a Romanesque character (e.g.
+            // the CJK `等`), but keeps a name delimiter (`Ferreira等` vs
+            // `Ferreira, 等`).
+            let space_prefix = !delim || name_opts.delimiter == " ";
+            let suppress_space = space_prefix && !starts_with_romanesque(term);
+
+            if delim && !suppress_space {
                 ctx.push_str(name_opts.delimiter);
             }
 
             let idx = ctx.push_format(cs_et_al.formatting);
-            ctx.ensure_space();
+            if !suppress_space {
+                ctx.ensure_space();
+            }
             ctx.push_str(term);
             ctx.pop_format(idx);
         }

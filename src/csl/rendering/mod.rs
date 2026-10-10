@@ -492,7 +492,62 @@ fn render_typed_num<T: EntryLike>(
     gender: Option<GrammarGender>,
     ctx: &mut Context<T>,
 ) {
-    num.with_form(ctx, form, gender, &ctx.ordinal_lookup()).unwrap();
+    let lookup = ctx.ordinal_lookup();
+    num.with_form(&mut SuperscriptWriter(ctx), form, gender, &lookup)
+        .unwrap();
+}
+
+/// A writer that renders Unicode superscript characters as superscript runs
+/// with their baseline equivalents.
+///
+/// citeproc-js's HTML escaping maps characters like `ᵉ` to `<sup>e</sup>`, so
+/// an ordinal suffix such as the French `ᵉ` becomes a superscript run. The
+/// writer is used for ordinal terms; all other characters pass through
+/// unchanged.
+struct SuperscriptWriter<'a, 'b, T: EntryLike>(&'a mut Context<'b, T>);
+
+impl<T: EntryLike> Write for SuperscriptWriter<'_, '_, T> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        push_with_superscripts(self.0, s);
+        Ok(())
+    }
+}
+
+/// Write `text`, rendering each Unicode superscript character as its own
+/// superscript run with the lowered character. Characters without a
+/// superscript equivalent pass through unchanged.
+///
+/// The mapping covers the characters used by CSL ordinal terms across the
+/// bundled locales (`ª`, `º`, `ʳ`, `ᵉ`); citeproc-js applies the same
+/// lowering to every superscript character in its output.
+fn push_with_superscripts<T: EntryLike>(ctx: &mut Context<T>, text: &str) {
+    let mut rest = text;
+    while let Some((pos, c)) =
+        rest.char_indices().find(|(_, c)| superscript_baseline(*c).is_some())
+    {
+        ctx.push_str(&rest[..pos]);
+        let fmt = ctx.push_format(citationberg::Formatting {
+            vertical_align: Some(citationberg::VerticalAlign::Sup),
+            ..Default::default()
+        });
+        ctx.push_str(superscript_baseline(c).unwrap());
+        ctx.pop_format(fmt);
+        rest = &rest[pos + c.len_utf8()..];
+    }
+
+    ctx.push_str(rest);
+}
+
+/// The baseline equivalent of a Unicode superscript character used in CSL
+/// ordinal terms.
+fn superscript_baseline(c: char) -> Option<&'static str> {
+    Some(match c {
+        'ª' => "a",
+        'º' => "o",
+        'ʳ' => "r",
+        'ᵉ' => "e",
+        _ => return None,
+    })
 }
 
 fn render_page_range<T: EntryLike>(range: &PageRanges, ctx: &mut Context<T>) {
@@ -932,13 +987,7 @@ fn render_date_part<T: EntryLike>(
                 if val == 1
                     || !ctx
                         .style
-                        .lookup_locale(|l| {
-                            Some(
-                                l.style_options
-                                    .and_then(|o| o.limit_day_ordinals_to_day_1)
-                                    .unwrap_or_default(),
-                            )
-                        })
+                        .lookup_locale(|l| l.style_options?.limit_day_ordinals_to_day_1)
                         .unwrap_or_default() =>
             {
                 let gender = date
@@ -946,13 +995,9 @@ fn render_date_part<T: EntryLike>(
                     .and_then(OtherTerm::month)
                     .and_then(|m| ctx.gender(m.into()));
 
-                write!(
-                    ctx,
-                    "{}{}",
-                    val,
-                    ctx.ordinal_lookup().lookup(val, gender).unwrap_or_default()
-                )
-                .unwrap();
+                let suffix = ctx.ordinal_lookup().lookup(val, gender).unwrap_or_default();
+                write!(ctx, "{val}").unwrap();
+                push_with_superscripts(ctx, suffix);
             }
             DateStrongAnyForm::Day(DateDayForm::Numeric | DateDayForm::Ordinal)
             | DateStrongAnyForm::Month(DateMonthForm::Numeric) => {
