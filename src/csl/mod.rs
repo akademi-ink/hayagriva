@@ -23,7 +23,7 @@ use citationberg::{
 use citationberg::{DateForm, LongShortForm, OrdinalLookup, TextCase};
 use indexmap::IndexSet;
 
-use crate::csl::elem::{NonEmptyStack, simplify_children};
+use crate::csl::elem::{NonEmptyStack, coalesce_text_runs, simplify_children};
 use crate::csl::rendering::RenderCsl;
 use crate::csl::rendering::names::{DisambiguatedNameForm, NameDisambiguationProperties};
 use crate::csl::taxonomy::NumberOrPageVariableResult;
@@ -614,12 +614,14 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         }
                     }
 
-                    simplify_children(ElemChildren(elem_children))
+                    let mut children = simplify_children(ElemChildren(elem_children));
+                    coalesce_text_runs(&mut children, formatting);
+                    children
                 },
             })
         }
 
-        let bib_render = if let Some(bibliography) = &request.style.bibliography {
+        let mut bib_render = if let Some(bibliography) = &request.style.bibliography {
             let mut items = Vec::new();
             for entry in entries.into_iter() {
                 let cited_item = res
@@ -674,6 +676,23 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         } else {
             None
         };
+
+        // Coalesce equal-formatting text runs across inline containers so
+        // that serializers produce one formatting tag per run, matching
+        // citeproc-js. Only leaves inheriting the layout formatting join a
+        // run; separately declared formatting keeps its own tag pair.
+        if let Some(bibliography) = &request.style.bibliography {
+            let ambient =
+                Formatting::default().apply(bibliography.layout.to_formatting());
+            if let Some(bib) = &mut bib_render {
+                for item in &mut bib.items {
+                    coalesce_text_runs(&mut item.content, ambient);
+                    if let Some(ElemChild::Elem(field)) = &mut item.first_field {
+                        coalesce_text_runs(&mut field.children, ambient);
+                    }
+                }
+            }
+        }
 
         Rendered {
             bibliography: bib_render,
@@ -773,7 +792,9 @@ pub fn standalone_citation<T: EntryLike>(
             }
         }
 
-        simplify_children(res)
+        let mut res = simplify_children(res);
+        coalesce_text_runs(&mut res, formatting);
+        res
     } else {
         ElemChildren::new()
     }
@@ -2568,6 +2589,40 @@ impl WritingContext {
         (pos, affixes.prefix.as_ref().map(|p| p.len()).unwrap_or_default())
     }
 
+    /// Nest the last subtree into its ancestor like [`Self::commit_elem`],
+    /// but prepend `delimiter` (in the enclosing formatting) when the subtree
+    /// rendered any content. Returns whether it did.
+    ///
+    /// This mirrors the CSL spec: a delimiter "delimits non-empty pieces of
+    /// output", so a piece that renders nothing must not leave its delimiter
+    /// behind.
+    fn commit_elem_with_delimiter(
+        &mut self,
+        loc: DisplayLoc,
+        delimiter: Option<&str>,
+    ) -> bool {
+        assert_eq!(
+            self.elem_stack.len().get(),
+            loc.0.get() + 1,
+            "stack location does not match"
+        );
+        self.pop_format(loc.1);
+
+        self.save_to_block();
+        let mut children = self.elem_stack.pop().unwrap();
+        let has_content = children.has_content();
+
+        if has_content && let Some(delimiter) = delimiter {
+            let formatting = *self.formatting();
+            children
+                .0
+                .insert(0, ElemChild::Text(formatting.add_text(delimiter.to_string())));
+        }
+
+        self.elem_stack.last_mut().0.extend(children.0);
+        has_content
+    }
+
     /// Nest the last subtree into its ancestor. If the `display` argument is
     /// some, a new element child will be created there. Otherwise, we will
     /// append the children of the last subtree to the children of its ancestor.
@@ -3069,6 +3124,16 @@ impl<'a, T: EntryLike> Context<'a, T> {
         meta: Option<ElemMeta>,
     ) {
         self.writing.commit_elem(loc, display, meta)
+    }
+
+    /// Nest the last subtree into its ancestor, prepending `delimiter` when
+    /// the subtree rendered content. Returns whether it did.
+    fn commit_elem_with_delimiter(
+        &mut self,
+        loc: DisplayLoc,
+        delimiter: Option<&str>,
+    ) -> bool {
+        self.writing.commit_elem_with_delimiter(loc, delimiter)
     }
 
     /// Ensure that the buffer is either empty or the last character is a space.

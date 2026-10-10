@@ -743,7 +743,7 @@ impl RenderCsl for citationberg::Date {
         let parts = self.parts.or(base.and_then(|b| b.parts)).unwrap_or_default();
 
         // TODO: Date ranges
-        let mut last_was_empty = true;
+        let mut first_part = true;
 
         // Localized (base) delimiter takes precedence over the cs:date
         // element's delimiter attribute, which should be ignored if a locale's
@@ -769,18 +769,22 @@ impl RenderCsl for citationberg::Date {
                 _ => {}
             }
 
-            let cursor = ctx.writing.len();
-            if !last_was_empty && let Some(delim) = chosen_delim {
-                ctx.push_str(delim);
-            }
-
             let over_ride = base
                 .is_some()
                 .then(|| self.date_part.iter().find(|p| p.name == part.name))
                 .flatten();
 
+            // Render the part in an isolated subtree so that the delimiter is
+            // only printed when the part actually rendered something. A part
+            // can be empty even after the checks above (e.g. a month without a
+            // value), and pushing the delimiter unconditionally would leave a
+            // trailing delimiter behind (`2021 ;14(2)`, F-114).
+            let loc = ctx.push_elem(citationberg::Formatting::default());
             render_date_part(part, &date, ctx, over_ride, first);
-            last_was_empty = cursor == ctx.writing.len();
+            let delimiter = if first_part { None } else { chosen_delim };
+            if ctx.commit_elem_with_delimiter(loc, delimiter) {
+                first_part = false;
+            }
         }
 
         ctx.pop_case(cidx);

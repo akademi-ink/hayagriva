@@ -671,6 +671,20 @@ mod citeproc_bib {
         Ok(())
     }
 
+    /// Render one citation's children with citeproc's HTML output format.
+    ///
+    /// Mirrors the audit runner's `citeproc_bib::render_citation`; links stay
+    /// unexpanded to match citeproc's plain citation output.
+    pub(super) fn render_citation(
+        citation: &hayagriva::ElemChildren,
+        output: &mut String,
+    ) -> Result<(), fmt::Error> {
+        for child in &citation.0 {
+            render_child(child, output, false)?;
+        }
+        Ok(())
+    }
+
     fn render_item(
         item: &hayagriva::BibliographyItem,
         output: &mut String,
@@ -1262,5 +1276,192 @@ mod regression {
             bibliography(&style, &items),
             "CSL-JSON Item Schema. Citation Style Language. https://citationstyles.org/schema/csl-json"
         );
+    }
+
+    /// Render citations with citeproc's HTML output format, like the audit
+    /// runner does.
+    fn citations_html(
+        style: &citationberg::IndependentStyle,
+        clusters: Vec<Vec<CitationItem<'_, csl_json::Item>>>,
+    ) -> Vec<String> {
+        let locales = locales();
+        let mut driver: BibliographyDriver<'_, csl_json::Item> =
+            BibliographyDriver::new();
+        for cluster in clusters {
+            driver.citation(CitationRequest::new(
+                cluster,
+                style,
+                None,
+                &locales,
+                Some(1),
+            ));
+        }
+        let rendered = driver.finish(BibliographyRequest::new(style, None, &locales));
+        rendered
+            .citations
+            .iter()
+            .map(|citation| {
+                let mut buf = String::new();
+                citeproc_bib::render_citation(&citation.citation, &mut buf).unwrap();
+                buf
+            })
+            .collect()
+    }
+
+    fn two_articles() -> Vec<csl_json::Item> {
+        items(
+            r#"[
+              {
+                "id": "ITEM-1",
+                "type": "article-journal",
+                "title": "First",
+                "volume": "14",
+                "issue": "2",
+                "issued": { "date-parts": [[2021]] }
+              },
+              {
+                "id": "ITEM-2",
+                "type": "article-journal",
+                "title": "Second",
+                "issued": { "date-parts": [[2020]] }
+              }
+            ]"#,
+        )
+    }
+
+    /// `F-113`: a layout prefix/suffix and the citation number must render as
+    /// one superscript span, because citeproc-js emits one decoration run
+    /// (`china-national-standard-gb-t-7714-2015-numeric`; the reduced style's
+    /// expected strings are citeproc-js renders).
+    #[test]
+    fn f113_superscript_layout_is_one_run() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f113-gbt</id><title>f113-gbt</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation collapse="citation-number">
+                <sort><key variable="citation-number"/></sort>
+                <layout vertical-align="sup" delimiter="," prefix="[" suffix="]">
+                  <text variable="citation-number"/>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = two_articles();
+        let out = citations_html(
+            &style,
+            vec![
+                vec![CitationItem::new(&items[0], None, None, false, None)],
+                vec![
+                    CitationItem::new(&items[0], None, None, false, None),
+                    CitationItem::new(&items[1], None, None, false, None),
+                ],
+            ],
+        );
+        assert_eq!(out, vec!["<sup>[1]</sup>", "<sup>[1,2]</sup>"]);
+    }
+
+    /// `F-113`: the cite delimiter and a locator group must not split the
+    /// superscript run (`american-medical-association`; expected string is a
+    /// citeproc-js render of the style's citation layout).
+    #[test]
+    fn f113_multi_cite_with_locator_is_one_run() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f113-ama</id><title>f113-ama</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation collapse="citation-number">
+                <sort><key variable="citation-number"/></sort>
+                <layout delimiter="," vertical-align="sup">
+                  <text variable="citation-number"/>
+                  <group prefix="(" suffix=")">
+                    <label form="short" strip-periods="true" variable="locator"/>
+                    <text variable="locator"/>
+                  </group>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = two_articles();
+        let out = citations_html(
+            &style,
+            vec![vec![
+                CitationItem::new(&items[0], None, None, false, None),
+                CitationItem::new(
+                    &items[1],
+                    Some(SpecificLocator(Locator::Page, LocatorPayload::Str("23"))),
+                    None,
+                    false,
+                    None,
+                ),
+            ]],
+        );
+        assert_eq!(out, vec!["<sup>1,2(p23)</sup>"]);
+    }
+
+    /// `F-113`: the same coalescing must apply to non-superscript layouts
+    /// (`future-medicine` uses `vertical-align="baseline"`; expected strings
+    /// are citeproc-js renders).
+    #[test]
+    fn f113_baseline_layout_is_one_run() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f113-future</id><title>f113-future</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <citation collapse="citation-number">
+                <sort><key variable="citation-number"/></sort>
+                <layout vertical-align="baseline" delimiter="," prefix="[" suffix="]">
+                  <text variable="citation-number"/>
+                </layout>
+              </citation>
+            </style>"#,
+        );
+        let items = two_articles();
+        let out = citations_html(
+            &style,
+            vec![
+                vec![CitationItem::new(&items[0], None, None, false, None)],
+                vec![
+                    CitationItem::new(&items[0], None, None, false, None),
+                    CitationItem::new(&items[1], None, None, false, None),
+                ],
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                r#"<span style="baseline">[1]</span>"#,
+                r#"<span style="baseline">[1,2]</span>"#
+            ]
+        );
+    }
+
+    /// `F-114`: a locale date form whose month/day parts are absent must not
+    /// leave a delimiter behind before the next sibling
+    /// (`nlm-citation-sequence`; expected string is a citeproc-js render of
+    /// the same date/volume/issue nesting).
+    #[test]
+    fn f114_empty_date_parts_do_not_leave_delimiter() {
+        let style = inline_style(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+              <info><id>f114</id><title>f114</title><updated>2020-01-01T00:00:00+00:00</updated></info>
+              <locale xml:lang="en">
+                <date delimiter=" " form="text">
+                  <date-part name="year"/>
+                  <date-part form="short" name="month" strip-periods="true"/>
+                  <date-part name="day"/>
+                </date>
+              </locale>
+              <citation><layout><text variable="title"/></layout></citation>
+              <bibliography><layout>
+                <group delimiter=";">
+                  <date form="text" variable="issued"/>
+                  <group>
+                    <text variable="volume"/>
+                    <group prefix="(" suffix=")"><text variable="issue"/></group>
+                  </group>
+                </group>
+              </layout></bibliography>
+            </style>"#,
+        );
+        let items = two_articles();
+        assert_eq!(bibliography(&style, &items[0..1]), "2021;14(2)");
     }
 }

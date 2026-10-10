@@ -123,6 +123,145 @@ pub(super) fn simplify_children(children: ElemChildren) -> ElemChildren {
     children
 }
 
+/// Merge runs of adjacent text leaves with the same formatting across inline
+/// container boundaries.
+///
+/// citeproc-js opens one pair of formatting tags per formatting declaration
+/// and keeps it open for everything that inherits it, no matter which CSL
+/// construct produced each piece. The element tree keeps semantic containers
+/// between the leaves (e.g. a layout's `[`/`]` are siblings of the element
+/// holding the citation number), which would otherwise fragment one run into
+/// several tag pairs (`<sup>[</sup><sup>1</sup><sup>]</sup>` instead of
+/// `<sup>[1]</sup>`).
+///
+/// Only leaves whose formatting equals `ambient` — the formatting of the
+/// citation/bibliography layout, inherited by its content — join a run.
+/// Leaves that declare their own formatting are not merged even when that
+/// formatting happens to be equal, because citeproc-js gives each declaration
+/// its own tag pair (e.g. two sibling `cs:names` with the same
+/// `font-style="italic"` render as two `<i>` runs).
+///
+/// The pass appends the text of every leaf in a run to the run's first leaf
+/// and empties the remaining leaves, so that serializers emit a single tag
+/// pair while consumers of structured runs get a single run. Containers with
+/// meta or display information stay in the tree as (possibly empty) markers,
+/// preserving [`ElemMeta`] lookups for consumers.
+///
+/// Links, markup, transparent children and `display` boundaries break runs
+/// because they serialize differently.
+pub(super) fn coalesce_text_runs(children: &mut ElemChildren, ambient: Formatting) {
+    enum Token {
+        Text { formatting: Formatting, only_ws: bool },
+        Break,
+    }
+
+    fn collect(
+        children: &ElemChildren,
+        path: &mut Vec<usize>,
+        tokens: &mut Vec<(Vec<usize>, Token)>,
+    ) {
+        for (i, child) in children.0.iter().enumerate() {
+            path.push(i);
+            match child {
+                ElemChild::Text(t) => {
+                    tokens.push((
+                        path.clone(),
+                        Token::Text {
+                            formatting: t.formatting,
+                            only_ws: t.text.chars().all(char::is_whitespace),
+                        },
+                    ));
+                }
+                ElemChild::Elem(e) => {
+                    let breaks = e.display.is_some();
+                    if breaks {
+                        tokens.push((path.clone(), Token::Break));
+                    }
+                    collect(&e.children, path, tokens);
+                    if breaks {
+                        tokens.push((path.clone(), Token::Break));
+                    }
+                }
+                ElemChild::Link { .. }
+                | ElemChild::Markup(_)
+                | ElemChild::Transparent { .. } => {
+                    tokens.push((path.clone(), Token::Break));
+                }
+            }
+            path.pop();
+        }
+    }
+
+    fn formatted_at<'a>(
+        children: &'a mut ElemChildren,
+        path: &[usize],
+    ) -> &'a mut Formatted {
+        let (idx, rest) = path.split_first().expect("empty text path");
+        match &mut children.0[*idx] {
+            ElemChild::Text(t) => {
+                debug_assert!(rest.is_empty());
+                t
+            }
+            ElemChild::Elem(e) => formatted_at(&mut e.children, rest),
+            _ => unreachable!("path does not point at text"),
+        }
+    }
+
+    /// Drop text leaves that were emptied by the merge, keeping meta and
+    /// display containers even when they no longer hold any text.
+    fn prune(children: &mut ElemChildren) {
+        children.0.retain_mut(|child| match child {
+            ElemChild::Text(t) => !t.text.is_empty(),
+            ElemChild::Link { text, .. } => !text.text.is_empty(),
+            ElemChild::Elem(e) => {
+                prune(&mut e.children);
+                e.meta.is_some() || e.display.is_some() || !e.children.0.is_empty()
+            }
+            ElemChild::Markup(_) | ElemChild::Transparent { .. } => true,
+        });
+    }
+
+    let mut tokens = Vec::new();
+    collect(children, &mut Vec::new(), &mut tokens);
+
+    let mut run: Option<usize> = None;
+    for i in 0..tokens.len() {
+        let (format, only_ws) = match &tokens[i].1 {
+            Token::Text { formatting, only_ws } => (formatting, *only_ws),
+            Token::Break => {
+                run = None;
+                continue;
+            }
+        };
+
+        if *format != ambient {
+            run = None;
+            continue;
+        }
+
+        let start = run.and_then(|s| match &tokens[s].1 {
+            // citeproc writers never apply bold to whitespace-only text (cf.
+            // tests/citeproc.rs), so such leaves must not merge with
+            // non-whitespace neighbours under bold formatting.
+            Token::Text { only_ws: first_ws, .. }
+                if format.font_weight != FontWeight::Bold || *first_ws == only_ws =>
+            {
+                Some(s)
+            }
+            _ => None,
+        });
+        let Some(start) = start else {
+            run = Some(i);
+            continue;
+        };
+
+        let text = mem::take(&mut formatted_at(children, &tokens[i].0).text);
+        merge_text(&mut formatted_at(children, &tokens[start].0).text, &text);
+    }
+
+    prune(children);
+}
+
 /// `true` for characters whose duplication at the seam of two concatenated
 /// text runs is collapsed by citeproc-js (punctuation and spaces).
 fn is_collapsible_seam_char(c: char) -> bool {
