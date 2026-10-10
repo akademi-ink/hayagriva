@@ -679,7 +679,17 @@ pub fn standalone_citation<T: EntryLike>(
         }
 
         if let Some(suffix) = style.csl.citation.layout.suffix.as_ref() {
-            let print = res.last_text().is_none_or(|t| !t.text.ends_with(suffix));
+            // citeproc-js collapses a layout suffix only when it duplicates
+            // terminal punctuation already present ("." after "."), never
+            // closing delimiters: content ending in ")" plus layout suffix ")"
+            // renders "))".
+            let terminal = |s: &str| {
+                !s.is_empty()
+                    && s.chars().all(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+            };
+            let print = res
+                .last_text()
+                .is_none_or(|t| !(terminal(suffix) && t.text.ends_with(suffix)));
             if print {
                 res.0.push(Formatted { text: suffix.clone(), formatting }.into());
             }
