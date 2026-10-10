@@ -23,7 +23,9 @@ use citationberg::{
 use citationberg::{DateForm, LongShortForm, OrdinalLookup, TextCase};
 use indexmap::IndexSet;
 
-use crate::csl::elem::{NonEmptyStack, coalesce_text_runs, simplify_children};
+use crate::csl::elem::{
+    NonEmptyStack, coalesce_text_runs, simplify_children, trim_trailing_whitespace,
+};
 use crate::csl::rendering::RenderCsl;
 use crate::csl::rendering::names::{DisambiguatedNameForm, NameDisambiguationProperties};
 use crate::csl::taxonomy::NumberOrPageVariableResult;
@@ -666,7 +668,13 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     .into_iter()
                     .map(|(mut i, key)| {
                         if bibliography.second_field_align.is_some() {
-                            BibliographyItem::new(key, i.remove_any_meta(), i)
+                            let first_field = i.remove_any_meta();
+                            // citeproc-js keeps the right-inline content
+                            // free of trailing whitespace: the last
+                            // element's suffix whitespace migrates out of
+                            // the block (F-117).
+                            trim_trailing_whitespace(&mut i);
+                            BibliographyItem::new(key, first_field, i)
                         } else {
                             BibliographyItem::new(key, None, i)
                         }
@@ -2030,10 +2038,11 @@ impl<'a> StyleContext<'a> {
                 }
             }
             (Some(CitePurpose::Prose), _) => {
-                let author_loc = ctx.apply_prefix(&Affixes::default());
+                let ambient = *ctx.writing.formatting();
+                let author_loc = ctx.apply_prefix(&Affixes::default(), ambient);
                 do_author(&mut ctx);
                 let has_author = ctx.writing.has_content_since(&author_loc);
-                ctx.apply_suffix(&Affixes::default(), author_loc);
+                ctx.apply_suffix(&Affixes::default(), author_loc, ambient);
 
                 if self.csl.info.category.iter().any(|c| {
                     matches!(
@@ -2085,12 +2094,13 @@ impl<'a> StyleContext<'a> {
                                 .unwrap_or_else(|| ")".to_string()),
                         ),
                     };
-                    let affix_loc = ctx.apply_prefix(&affixes);
+                    let ambient = *ctx.writing.formatting();
+                    let affix_loc = ctx.apply_prefix(&affixes, ambient);
                     ctx.set_special_form(Some(SpecialForm::SuppressAuthor));
                     do_regular(&mut ctx);
                     ctx.set_special_form(None);
                     if has_author {
-                        ctx.apply_suffix(&affixes, affix_loc);
+                        ctx.apply_suffix(&affixes, affix_loc, ambient);
                     } else {
                         ctx.push_str(affixes.suffix.as_deref().unwrap());
                         ctx.commit_elem(affix_loc.0, None, None);
@@ -2119,9 +2129,10 @@ impl<'a> StyleContext<'a> {
         let layout = &self.csl.bibliography.as_ref()?.layout;
         let affixes = layout.to_affixes();
 
-        let affix_loc = ctx.apply_prefix(&affixes);
+        let ambient = *ctx.writing.formatting();
+        let affix_loc = ctx.apply_prefix(&affixes, ambient);
         layout.render(&mut ctx);
-        ctx.apply_suffix(&affixes, affix_loc);
+        ctx.apply_suffix(&affixes, affix_loc, ambient);
 
         Some(ctx)
     }
@@ -2580,13 +2591,43 @@ impl WritingContext {
 
     /// Apply a prefix, but return a tuple that allows us to undo it if it
     /// wasn't followed by anything.
-    fn apply_prefix(&mut self, affixes: &Affixes) -> (DisplayLoc, usize) {
+    ///
+    /// `ambient` is the formatting that was in effect before the element's
+    /// own formatting was applied. Affixes are decorated by their element's
+    /// ancestors but not by the element itself (citeproc-js appends
+    /// prefix/suffix after the element's own decorations), so when the
+    /// element re-declares formatting, the prefix is written as its own run
+    /// under `ambient`.
+    fn apply_prefix(
+        &mut self,
+        affixes: &Affixes,
+        ambient: Formatting,
+    ) -> (DisplayLoc, usize) {
         let pos = self.push_elem(citationberg::Formatting::default());
         if let Some(prefix) = &affixes.prefix {
-            self.buf.push_str(prefix);
+            self.push_affix_text(prefix, ambient);
         };
 
         (pos, affixes.prefix.as_ref().map(|p| p.len()).unwrap_or_default())
+    }
+
+    /// Add `text` to the buffer as an affix.
+    ///
+    /// If the element re-declared formatting, the buffered content is flushed
+    /// first and the affix is written as its own run under `ambient`, the
+    /// element's ancestor formatting. Otherwise the affix simply joins the
+    /// surrounding run.
+    fn push_affix_text(&mut self, text: &str, ambient: Formatting) {
+        if ambient == *self.formatting() {
+            self.buf.push_str(text);
+            return;
+        }
+
+        self.save_to_block();
+        let prev = mem::replace(self.format_stack.last_mut(), ambient);
+        self.buf.push_str(text);
+        self.save_to_block();
+        *self.format_stack.last_mut() = prev;
     }
 
     /// Nest the last subtree into its ancestor like [`Self::commit_elem`],
@@ -3527,7 +3568,14 @@ impl<'a, T: EntryLike> Context<'a, T> {
 
     /// Apply a prefix, but return a tuple that allows us to undo it if it
     /// wasn't followed by anything.
-    fn apply_prefix(&mut self, affixes: &Affixes) -> (DisplayLoc, usize) {
+    ///
+    /// `ambient` is the formatting that was in effect before the element's
+    /// own formatting was applied.
+    fn apply_prefix(
+        &mut self,
+        affixes: &Affixes,
+        ambient: Formatting,
+    ) -> (DisplayLoc, usize) {
         // Smart-quote the prefix and pull leading punctuation into a
         // preceding quotation before it is written.
         let mut affixes = affixes.clone();
@@ -3535,12 +3583,20 @@ impl<'a, T: EntryLike> Context<'a, T> {
             let quoted = self.smart_quote(&prefix);
             affixes.prefix = Some(self.do_pull_punctuation(&quoted).to_string());
         }
-        self.writing.apply_prefix(&affixes)
+        self.writing.apply_prefix(&affixes, ambient)
     }
 
     /// Apply a suffix, but only if the location was followed by something.
     /// Delete any prefix if not.
-    fn apply_suffix(&mut self, affixes: &Affixes, loc: (DisplayLoc, usize)) {
+    ///
+    /// `ambient` is the formatting that was in effect before the element's
+    /// own formatting was applied.
+    fn apply_suffix(
+        &mut self,
+        affixes: &Affixes,
+        loc: (DisplayLoc, usize),
+        ambient: Formatting,
+    ) {
         if !self.writing.has_content_since(&loc) {
             self.discard_elem(loc.0);
         } else {
@@ -3554,11 +3610,28 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 };
 
                 if do_suffix {
-                    self.push_str(suffix);
+                    self.push_affix_str(suffix, ambient);
                 }
             }
             self.commit_elem(loc.0, None, None);
         }
+    }
+
+    /// Push an affix string, like [`Self::push_str`], but if the element
+    /// re-declared formatting, the buffered content is flushed first and the
+    /// affix is written as its own run under `ambient`, the element's
+    /// ancestor formatting.
+    fn push_affix_str(&mut self, s: &str, ambient: Formatting) {
+        if ambient == *self.writing.formatting() {
+            self.push_str(s);
+            return;
+        }
+
+        self.writing.save_to_block();
+        let prev = mem::replace(self.writing.format_stack.last_mut(), ambient);
+        self.push_str(s);
+        self.writing.save_to_block();
+        *self.writing.format_stack.last_mut() = prev;
     }
 
     /// Test whether this entry should disambiguate via `cs:choose`.

@@ -1016,6 +1016,63 @@ fn access_date() {
     assert_eq!(buf, "(n.d.). Retrieved 2021, from https://example.com/");
 }
 
+/// Punctuation that follows a formatted element belongs to the enclosing
+/// run, not to the element's own formatting: citeproc-js renders the suffix
+/// after the element's decorations (`<b>title</b>. <i>journal</i>`), which
+/// the ISO-690 full-note citation exercises (F-116). Verified against the
+/// citeproc-js oracle.
+#[test]
+fn affix_formatting_boundary_citation() {
+    let style = Style::from_xml(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+  <info>
+    <title>Affix formatting boundary note</title>
+    <id>affix-formatting-boundary-note</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout suffix=".">
+      <text variable="title" font-weight="bold" suffix=". "/>
+      <text variable="container-title" font-style="italic"/>
+    </layout>
+  </citation>
+</style>"#,
+    )
+    .unwrap();
+    let Style::Independent(style) = style else {
+        panic!("test has dependent style");
+    };
+
+    let item: csl_json::Item = serde_json::from_str(
+        r#"{
+        "id": "ITEM-1",
+        "type": "article-journal",
+        "title": "Neural Machine Translation for Low-Resource Languages",
+        "container-title": "Journal of Language Technology"
+    }"#,
+    )
+    .unwrap();
+
+    let mut driver: BibliographyDriver<'_, csl_json::Item> = BibliographyDriver::new();
+    driver.citation(CitationRequest::new(
+        vec![CitationItem::new(&item, None, None, false, None)],
+        &style,
+        None,
+        &[],
+        Some(1),
+    ));
+
+    let rendered = driver.finish(BibliographyRequest::new(&style, None, &[]));
+    let mut output = String::new();
+    citeproc_bib::render_citation(&rendered.citations[0].citation, &mut output).unwrap();
+    assert_eq!(
+        output,
+        "<b>Neural Machine Translation for Low-Resource Languages</b>. \
+         <i>Journal of Language Technology</i>."
+    );
+}
+
 #[test]
 fn no_author() {
     let style = ArchivedStyle::by_name("apa").unwrap().get();

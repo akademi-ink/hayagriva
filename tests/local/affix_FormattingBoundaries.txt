@@ -1,0 +1,85 @@
+>>===== MODE =====>>
+bibliography
+<<===== MODE =====<<
+
+
+>>===== RESULT =====>>
+<div class="csl-bib-body">
+  <div class="csl-entry"><b>Neural Machine Translation for Low-Resource Languages</b>. <i>Journal of Language Technology</i> <b>14,</b> 101–118.</div>
+  <div class="csl-entry"><i>Scalable Event Processing: Architectures and Patterns</i>., <b>2</b>,.</div>
+</div>
+<<===== RESULT =====<<
+
+
+>>===== CSL =====>>
+<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Affix formatting boundary</title>
+    <id>affix-formatting-boundary</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="title"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout suffix=".">
+      <choose>
+        <if type="book">
+          <text variable="title" font-style="italic" suffix="."/>
+          <text variable="edition" font-weight="bold" prefix=", " suffix=","/>
+        </if>
+        <else>
+          <text variable="title" font-weight="bold" suffix=". "/>
+          <text variable="container-title" font-style="italic"/>
+          <group font-weight="bold" prefix=" " suffix=" ">
+            <text variable="volume" suffix=","/>
+          </group>
+          <text variable="page"/>
+        </else>
+      </choose>
+    </layout>
+  </bibliography>
+</style>
+<<===== CSL =====<<
+
+
+>>===== INPUT =====>>
+[
+    {
+        "id": "ITEM-1",
+        "type": "article-journal",
+        "title": "Neural Machine Translation for Low-Resource Languages",
+        "container-title": "Journal of Language Technology",
+        "volume": "14",
+        "page": "101-118",
+        "issued": {
+            "date-parts": [
+                [
+                    2021
+                ]
+            ]
+        }
+    },
+    {
+        "id": "ITEM-2",
+        "type": "book",
+        "title": "Scalable Event Processing: Architectures and Patterns",
+        "edition": "2",
+        "issued": {
+            "date-parts": [
+                [
+                    2020
+                ]
+            ]
+        }
+    }
+]
+<<===== INPUT =====<<
+
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<

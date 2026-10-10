@@ -283,6 +283,41 @@ fn merge_text(last: &mut String, next: &str) {
     last.push_str(next);
 }
 
+/// Remove trailing whitespace from the last text run of `children`.
+///
+/// citeproc-js migrates the trailing whitespace of an entry's last element
+/// affix out of the `second-field-align` right-inline block, where it is
+/// invisible to HTML consumers and dropped by the audit's tag whitespace
+/// normalization. The flattened element tree keeps such whitespace inside
+/// the entry content, so it is trimmed here.
+pub(super) fn trim_trailing_whitespace(children: &mut ElemChildren) {
+    loop {
+        let Some(last) = children.0.last_mut() else { return };
+        let may_continue = match last {
+            ElemChild::Text(t) => {
+                t.text.truncate(t.text.trim_end().len());
+                t.text.is_empty()
+            }
+            ElemChild::Link { text, .. } => {
+                text.text.truncate(text.text.trim_end().len());
+                text.text.is_empty()
+            }
+            ElemChild::Elem(e) => {
+                trim_trailing_whitespace(&mut e.children);
+                e.children.0.is_empty() && e.meta.is_none() && e.display.is_none()
+            }
+            // Markup is opaque, and transparent elements are placeholders.
+            ElemChild::Markup(_) | ElemChild::Transparent { .. } => return,
+        };
+
+        if !may_continue {
+            return;
+        }
+
+        children.0.pop();
+    }
+}
+
 /// Collapse duplicated collapsible characters at the seams between adjacent
 /// text leaves, also across element boundaries (e.g. a group suffix followed
 /// by a sibling's prefix). Seams between differently formatted leaves are

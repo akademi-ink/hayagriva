@@ -44,6 +44,9 @@ impl RenderCsl for citationberg::Text {
         // Whether this is the first thing rendered in the current item,
         // before the element's own affixes are applied.
         let nothing_rendered = ctx.writing.len() == 0;
+        // The formatting inherited from the element's ancestors; affixes are
+        // decorated by it but not by the element's own formatting.
+        let ambient = *ctx.writing.formatting();
         let depth = ctx.push_elem(self.formatting);
 
         // Only print affixes if this macro is not used out of its original context.
@@ -81,7 +84,7 @@ impl RenderCsl for citationberg::Text {
         };
 
         let affix_loc = (print_affixes && !affix_is_url_prefix)
-            .then(|| ctx.apply_prefix(&self.affixes));
+            .then(|| ctx.apply_prefix(&self.affixes, ambient));
 
         if self.quotes {
             ctx.push_quotes();
@@ -161,7 +164,7 @@ impl RenderCsl for citationberg::Text {
         }
 
         if let Some(affix_loc) = affix_loc {
-            ctx.apply_suffix(&self.affixes, affix_loc);
+            ctx.apply_suffix(&self.affixes, affix_loc, ambient);
         }
         if should_render {
             ctx.commit_elem(
@@ -368,8 +371,9 @@ impl RenderCsl for citationberg::Number {
             }
         }
 
+        let ambient = *ctx.writing.formatting();
         let depth = ctx.push_elem(self.formatting);
-        let affix_loc = ctx.apply_prefix(&self.affixes);
+        let affix_loc = ctx.apply_prefix(&self.affixes, ambient);
         let cidx = ctx.push_case(self.text_case);
         let gender = ctx.gender(self.variable.into());
 
@@ -404,7 +408,7 @@ impl RenderCsl for citationberg::Number {
         }
 
         ctx.pop_case(cidx);
-        ctx.apply_suffix(&self.affixes, affix_loc);
+        ctx.apply_suffix(&self.affixes, affix_loc, ambient);
         ctx.commit_elem(
             depth,
             self.display,
@@ -630,10 +634,11 @@ fn render_label_with_var<T: EntryLike>(
         return;
     }
 
+    let ambient = *ctx.writing.formatting();
     let idx = ctx.push_format(label.formatting);
 
     let affixes = &label.affixes;
-    let affix_loc = ctx.apply_prefix(affixes);
+    let affix_loc = ctx.apply_prefix(affixes, ambient);
 
     ctx.may_strip_periods(label.strip_periods);
     let cidx = ctx.push_case(label.text_case);
@@ -642,7 +647,7 @@ fn render_label_with_var<T: EntryLike>(
 
     ctx.pop_case(cidx);
     ctx.stop_stripping_periods();
-    ctx.apply_suffix(affixes, affix_loc);
+    ctx.apply_suffix(affixes, affix_loc, ambient);
     ctx.pop_format(idx);
 }
 
@@ -734,9 +739,10 @@ impl RenderCsl for citationberg::Date {
         let formatting = base
             .map(|b| self.formatting.apply(b.formatting))
             .unwrap_or(self.formatting);
+        let ambient = *ctx.writing.formatting();
         let depth = ctx.push_elem(formatting);
 
-        let affix_loc = ctx.apply_prefix(&self.affixes);
+        let affix_loc = ctx.apply_prefix(&self.affixes, ambient);
 
         let cidx = ctx.push_case(self.text_case.or(base.and_then(|b| b.text_case)));
 
@@ -788,7 +794,7 @@ impl RenderCsl for citationberg::Date {
         }
 
         ctx.pop_case(cidx);
-        ctx.apply_suffix(&self.affixes, affix_loc);
+        ctx.apply_suffix(&self.affixes, affix_loc, ambient);
         ctx.commit_elem(depth, self.display, Some(ElemMeta::Date));
     }
 
@@ -876,10 +882,11 @@ fn render_date_part<T: EntryLike>(
         .map(|p| p.formatting.apply(date_part.formatting))
         .unwrap_or(date_part.formatting);
 
+    let ambient = *ctx.writing.formatting();
     let idx = ctx.push_format(formatting);
 
     let affixes = &date_part.affixes;
-    let affix_loc = (!is_only_suffix).then(|| ctx.apply_prefix(affixes));
+    let affix_loc = (!is_only_suffix).then(|| ctx.apply_prefix(affixes, ambient));
     if date_part.name == DatePartName::Month {
         ctx.may_strip_periods(date_part.strip_periods);
     }
@@ -972,7 +979,7 @@ fn render_date_part<T: EntryLike>(
     }
 
     if let Some(affix_loc) = affix_loc {
-        ctx.apply_suffix(affixes, affix_loc);
+        ctx.apply_suffix(affixes, affix_loc, ambient);
     }
     ctx.stop_stripping_periods();
     ctx.pop_case(cidx);
@@ -1333,10 +1340,11 @@ impl<T: EntryLike> Iterator for BranchConditionIter<'_, '_, T> {
 
 impl RenderCsl for citationberg::Group {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
+        let ambient = *ctx.writing.formatting();
         let idx = ctx.push_elem(self.to_formatting());
         let affixes = self.to_affixes();
 
-        let affix_loc = ctx.apply_prefix(&affixes);
+        let affix_loc = ctx.apply_prefix(&affixes, ambient);
 
         let info = self.will_have_info(ctx).1;
 
@@ -1344,7 +1352,7 @@ impl RenderCsl for citationberg::Group {
         render_with_delimiter(&self.children, ctx);
         ctx.writing.pop_delimiter(delim_idx);
 
-        ctx.apply_suffix(&affixes, affix_loc);
+        ctx.apply_suffix(&affixes, affix_loc, ambient);
 
         if info.should_render_group() {
             ctx.commit_elem(idx, self.display, None);

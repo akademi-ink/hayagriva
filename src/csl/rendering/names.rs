@@ -265,8 +265,9 @@ impl RenderCsl for Names {
             return;
         }
 
+        let ambient = *ctx.writing.formatting();
         let depth = ctx.push_elem(self.to_formatting());
-        let affix_loc = ctx.apply_prefix(&self.to_affixes());
+        let affix_loc = ctx.apply_prefix(&self.to_affixes(), ambient);
         let cs_name = self.name().cloned().unwrap_or_default();
         let options = cs_name.options(ctx.writing.name_options.last());
 
@@ -299,7 +300,7 @@ impl RenderCsl for Names {
                     .sum::<usize>()
             )
             .unwrap();
-            ctx.apply_suffix(&self.to_affixes(), affix_loc);
+            ctx.apply_suffix(&self.to_affixes(), affix_loc, ambient);
             ctx.commit_elem(depth, self.display, Some(ElemMeta::Names(meta_people)));
             ctx.writing.pop_name_options();
             return;
@@ -383,7 +384,7 @@ impl RenderCsl for Names {
         // [`NameDisambiguationProperties::disambiguate_list`] on the identical
         // pairs. Rerender if necessary.
 
-        ctx.apply_suffix(&self.to_affixes(), affix_loc);
+        ctx.apply_suffix(&self.to_affixes(), affix_loc, ambient);
         ctx.commit_elem(depth, self.display, Some(ElemMeta::Names(meta_people)));
         ctx.writing.pop_name_options();
         ctx.writing.first_name_properties(|| props);
