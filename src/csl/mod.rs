@@ -2252,6 +2252,11 @@ impl<'a> StyleContext<'a> {
                     }
                 }
             }
+            (Some(CitePurpose::SuppressAuthor), _) => {
+                ctx.set_special_form(Some(SpecialForm::SuppressAuthor));
+                do_regular(&mut ctx);
+                ctx.set_special_form(None);
+            }
             (Some(CitePurpose::Year) | Some(CitePurpose::Full) | None, _) => {
                 do_regular(&mut ctx);
             }
@@ -4006,6 +4011,9 @@ pub enum CitePurpose {
     Full,
     /// The citation will be well-suited for inclusion in prose.
     Prose,
+    /// The regular citation is rendered with the author suppressed
+    /// (citeproc-js `suppress-author`).
+    SuppressAuthor,
 }
 
 /// A special citation form to use for the [`CitationItem`].
