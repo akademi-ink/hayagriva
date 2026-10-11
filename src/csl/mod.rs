@@ -1416,7 +1416,10 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
     // to the layout delimiter, which makes those rules no-ops.
     let has_after_collapse_delim = style.citation.after_collapse_delimiter.is_some();
 
-    let group_delimiter = style.citation.cite_group_delimiter.as_deref();
+    // CSL 1.0.2: `cite-group-delimiter` defaults to ", " (it both activates
+    // cite grouping and sets the delimiter for cites within a group).
+    let group_delimiter =
+        Some(style.citation.cite_group_delimiter.as_deref().unwrap_or(", "));
     let year_suffix_delimiter = style
         .citation
         .year_suffix_delimiter
