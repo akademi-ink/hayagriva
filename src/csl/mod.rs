@@ -580,6 +580,18 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                             continue;
                         }
 
+                        // An item that renders nothing is dropped entirely,
+                        // including its preceding delimiter: citeproc-js
+                        // attaches the splice delimiter only to non-empty
+                        // cite buffers, while the layout affixes survive. A
+                        // per-item prefix or suffix keeps the cite alive.
+                        if !item.rendered.has_content()
+                            && item.prefix.is_none()
+                            && item.suffix.is_none()
+                        {
+                            continue;
+                        }
+
                         if i != 0
                             && let Some(delim) = cite
                                 .items
@@ -1399,6 +1411,11 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
         .as_deref()
         .or(style.citation.layout.delimiter.as_deref());
 
+    // citeproc-js applies its `after-collapse-delimiter` splice rules only
+    // when the attribute is declared; without it the fallback above resolves
+    // to the layout delimiter, which makes those rules no-ops.
+    let has_after_collapse_delim = style.citation.after_collapse_delimiter.is_some();
+
     let group_delimiter = style.citation.cite_group_delimiter.as_deref();
     let year_suffix_delimiter = style
         .citation
@@ -1490,6 +1507,12 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                 match group_idx {
                     // This is our group.
                     Some((_, idx)) if Some(idx) == cite.items[i].group_idx => {
+                        // citeproc-js always splices with the
+                        // after-collapse delimiter after a cite that carried
+                        // a locator, even before a collapsed continuation.
+                        let locator_after_collapse = has_after_collapse_delim
+                            && i > 0
+                            && cite.items[i - 1].locator.is_some();
                         if matches!(c, Collapse::YearSuffix | Collapse::YearSuffixRanged)
                             && let DisambiguateState::YearSuffix(s) =
                                 cite.items[i].cite_props.speculative.disambiguation
@@ -1500,13 +1523,21 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                             // than zero, which means it follows another item
                             // with the same year. In this case, we collapse
                             // the year suffix.
-                            cite.items[i].delim_override = year_suffix_delimiter;
+                            cite.items[i].delim_override = if locator_after_collapse {
+                                after_collapse_delim
+                            } else {
+                                year_suffix_delimiter
+                            };
                             cite.items[i].collapse_verdict =
                                 Some(CollapseVerdict::YearSuffix);
                             continue;
                         }
                         // FIXME: Retains delimiter in names.
-                        cite.items[i].delim_override = group_delimiter;
+                        cite.items[i].delim_override = if locator_after_collapse {
+                            after_collapse_delim
+                        } else {
+                            group_delimiter
+                        };
                         cite.items[i].collapse_verdict = Some(CollapseVerdict::First);
                     }
                     // This is a different group.
@@ -1514,8 +1545,15 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                         cite.items[i].delim_override = after_collapse_delim;
                         group_idx = cite.items[i].group_idx.map(|idx| (i, idx));
                     }
-                    // We are at the beginning.
+                    // We are at the beginning, or the previous group held a
+                    // single item: the current item is not a collapsed
+                    // continuation, so the after-collapse delimiter follows —
+                    // except under `collapse="year-suffix"`, where citeproc-js
+                    // keeps the layout delimiter between two uncollapsed cites.
                     _ => {
+                        if i > 0 && c != Collapse::YearSuffix {
+                            cite.items[i].delim_override = after_collapse_delim;
+                        }
                         group_idx = cite.items[i].group_idx.map(|idx| (i, idx));
                     }
                 }
