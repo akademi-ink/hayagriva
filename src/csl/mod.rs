@@ -2349,8 +2349,15 @@ impl<'a, T: EntryLike> CitationRequest<'a, T> {
         StyleContext::new(self.style, self.locale.clone(), self.locale_files)
     }
 
+    /// Whether the request's layout affixes (citation prefix/suffix) apply.
+    /// Suppressed-author citations keep the layout affixes (citeproc-js
+    /// renders `suppress-author` as `(2006)` for author-date styles); the
+    /// purposes that carry their own affixes (prose, author-only, year, full)
+    /// do not.
     fn shall_affix(&self) -> bool {
-        self.items.iter().all(|p| p.purpose.is_none())
+        self.items
+            .iter()
+            .all(|p| matches!(p.purpose, None | Some(CitePurpose::SuppressAuthor)))
     }
 
     fn prefix(&self) -> Option<&'a str> {
