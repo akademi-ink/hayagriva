@@ -1,0 +1,48 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+Locator labels use plural forms for locator lists and ranges, format page
+ranges with the style's page-range-format, and keep escaped hyphens literal.
+
+>>===== RESULT =====>>
+pages 100–103
+pages 213 and 235
+page 327-30
+<<===== RESULT =====<<
+
+>>===== CITATION-ITEMS =====>>
+[
+  [{"id": "ITEM-1", "label": "page", "locator": "100 - 103"}],
+  [{"id": "ITEM-1", "label": "page", "locator": "213 and 235"}],
+  [{"id": "ITEM-1", "label": "page", "locator": "327\\-30"}]
+]
+<<===== CITATION-ITEMS =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0" page-range-format="expanded">
+  <info>
+    <id />
+    <title />
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout delimiter="; ">
+      <group delimiter=" ">
+        <label variable="locator"/>
+        <text variable="locator"/>
+      </group>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== INPUT =====>>
+[
+  {"id": "ITEM-1", "title": "Book One", "type": "book"}
+]
+<<===== INPUT =====<<
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<

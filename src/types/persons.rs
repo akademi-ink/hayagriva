@@ -102,6 +102,13 @@ derive_or_from_str! {
         pub comma_suffix: bool,
         /// Another name (often user name) the person might be known under.
         pub alias: Option<String>,
+        /// Whether the family name arrived quoted (`"van Happel"`): citeproc
+        /// treats it verbatim and does not split an implicit particle.
+        #[serde(default)]
+        pub literal_family: bool,
+        /// An explicit CSL-JSON `non-dropping-particle`. Kept separately from
+        /// the family name so that sort decisions do not have to guess.
+        pub non_dropping_particle: Option<String>,
     }
 }
 
@@ -150,6 +157,22 @@ pub enum PersonError {
     /// The role is unknown.
     #[error("unknown role")]
     UnknownRole,
+}
+
+fn split_implicit_particle(name: String) -> (String, Option<String>) {
+    for (idx, ch) in name.char_indices().rev() {
+        if ch != ' ' {
+            continue;
+        }
+        let particle = &name[..idx];
+        if NAME_PARTICLES
+            .binary_search(&particle.to_lowercase().as_str())
+            .is_ok()
+        {
+            return (name[idx + 1..].to_string(), Some(particle.to_string()));
+        }
+    }
+    (name, None)
 }
 
 impl Person {
@@ -231,6 +254,9 @@ impl Person {
             name = name.trim_start().to_string();
         }
 
+        // BibTeX family strings may carry an implicit non-dropping particle
+        // with any capitalization; keep that behavior for this parser only.
+        let (name, particle) = split_implicit_particle(name);
         Ok(Person {
             name,
             given_name,
@@ -238,6 +264,8 @@ impl Person {
             suffix,
             comma_suffix: false,
             alias: None,
+            literal_family: false,
+            non_dropping_particle: particle,
         })
     }
 
@@ -397,14 +425,37 @@ impl Person {
 
     /// Get the non-dropping name particle in the family name.
     pub fn name_particle(&self) -> Option<&str> {
+        if let Some(particle) = &self.non_dropping_particle {
+            return Some(particle);
+        }
+        if self.literal_family {
+            return None;
+        }
+        // Only a lower-case leading word is an implicit particle:
+        // "van Gogh" is, "De Quincey" is not (citeproc-js's own name parser
+        // keys on case).
         for (idx, char) in self.name.char_indices().rev() {
             if char != ' ' {
                 continue;
             }
 
             let particle = &self.name[0..idx];
+            if !particle.starts_with(|c: char| c.is_lowercase()) {
+                continue;
+            }
             let lowercase = particle.to_lowercase();
             if NAME_PARTICLES.binary_search(&lowercase.as_str()).is_ok() {
+                return Some(particle);
+            }
+        }
+
+        // Hyphenated particles: `al-One` -> particle `al-`, family `One`.
+        if let Some(idx) = self.name.rfind('-') {
+            let particle = &self.name[..=idx];
+            let base = &self.name[..idx];
+            if particle.starts_with(|c: char| c.is_lowercase())
+                && NAME_PARTICLES.binary_search(&base.to_lowercase().as_str()).is_ok()
+            {
                 return Some(particle);
             }
         }
@@ -414,21 +465,32 @@ impl Person {
 
     /// Get the family name without the non-dropping particle.
     pub fn name_without_particle(&self) -> &str {
-        if let Some(particle) = self.name_particle() {
+        if self.non_dropping_particle.is_some() {
+            self.name.as_str()
+        } else if let Some(particle) = self.name_particle() {
             self.name[particle.len()..].trim_start()
         } else {
             self.name.as_str()
         }
     }
 
+    /// The particle as it must be printed (explicit particle, if any,
+    /// otherwise the implicit prefix retained in the family string).
+    pub fn display_particle(&self) -> Option<Cow<'_, str>> {
+        if let Some(particle) = &self.non_dropping_particle {
+            return Some(Cow::Borrowed(particle.as_str()));
+        }
+        self.name_particle().map(Cow::Borrowed)
+    }
+
     /// Get only the dropping and non-dropping particle of the family name.
     pub fn name_particles(&self) -> Option<Cow<'_, str>> {
-        match (&self.prefix, self.name_particle()) {
+        match (&self.prefix, self.display_particle()) {
             (Some(dropping), Some(non_dropping)) => {
                 Some(Cow::Owned(format!("{dropping} {non_dropping}")))
             }
             (Some(dropping), None) => Some(Cow::Borrowed(dropping.as_str())),
-            (None, Some(non_dropping)) => Some(Cow::Borrowed(non_dropping)),
+            (None, Some(non_dropping)) => Some(non_dropping),
             (None, None) => None,
         }
     }
@@ -538,7 +600,6 @@ impl FromStr for Person {
     }
 }
 
-
 /// The result of splitting a given name like citeproc-js's `nameDoppel`:
 /// alternating name fragments and separators (whitespace, hyphens, and the
 /// rich-text tags citeproc-js understands).
@@ -565,15 +626,8 @@ fn markup_tag_len(s: &str) -> Option<usize> {
         i += 1;
     }
 
-    const TAGS: [&str; 7] = [
-        "span class=\"nocase\"",
-        "span class=\"nodecor\"",
-        "i",
-        "sc",
-        "b",
-        "sub",
-        "sup",
-    ];
+    const TAGS: [&str; 7] =
+        ["span class=\"nocase\"", "span class=\"nodecor\"", "i", "sc", "b", "sub", "sup"];
 
     for tag in TAGS {
         // A closing `</span>` carries no class attribute.
@@ -946,7 +1000,10 @@ fn initialize_name_list(namelist: &mut Vec<String>, terminator: &str) {
         }
 
         let mut m = match_initial(&n);
-        if m.is_none() && !starts_with_romanesque(&n) && n.len() > 1 && terminator.contains("%s")
+        if m.is_none()
+            && !starts_with_romanesque(&n)
+            && n.len() > 1
+            && terminator.contains("%s")
         {
             let mut chars = n.chars();
             let first = chars.next().unwrap();
@@ -957,10 +1014,8 @@ fn initialize_name_list(namelist: &mut Vec<String>, terminator: &str) {
             if m1.chars().next().is_some_and(char::is_uppercase) {
                 let mut extra = String::new();
                 if !m2.is_empty() {
-                    let upper: String = m2
-                        .chars()
-                        .take_while(|c| c.is_uppercase())
-                        .collect();
+                    let upper: String =
+                        m2.chars().take_while(|c| c.is_uppercase()).collect();
                     if upper.len() < m2.len() {
                         extra = upper.to_lowercase();
                     }
@@ -1010,7 +1065,10 @@ fn restore_hyphens(s: String) -> String {
 fn finish_name_list(namelist: &[String]) -> String {
     let joined = namelist.join("");
     let trimmed = joined.trim_end_matches(|c: char| {
-        matches!(c, '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r' | ' ' | '\u{feff}' | '\u{a0}')
+        matches!(
+            c,
+            '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r' | ' ' | '\u{feff}' | '\u{a0}'
+        )
     });
 
     // Normalize hyphens and compress ASCII whitespace, like citeproc-js.
@@ -1078,11 +1136,7 @@ fn initialize_given_name(
         return name.to_string();
     }
 
-    let mut name = if with_hyphen {
-        name.to_string()
-    } else {
-        name.replace('-', " ")
-    };
+    let mut name = if with_hyphen { name.to_string() } else { name.replace('-', " ") };
 
     name = normalize_hyphen_spacing(&collapse_whitespace(&name));
     name = hyphen_lowercase_to_en_dash(&name);

@@ -650,7 +650,13 @@ impl CaseFolder {
         self.buf[self.case_start.min(data.start)..data.start]
             .chars()
             .rev()
-            .find(|c| !c.is_whitespace() && !matches!(c, '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '"' | '\''))
+            .find(|c| {
+                !c.is_whitespace()
+                    && !matches!(
+                        c,
+                        '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '"' | '\''
+                    )
+            })
             .is_some_and(|c| matches!(c, '!' | '?' | ':'))
     }
 
@@ -693,7 +699,10 @@ impl CaseFolder {
         // citeproc-js's `_capitalise` leaves lone Greek letters untouched
         // (they are often math symbols in titles).
         if chars == 1
-            && word.chars().next().is_some_and(|c| ('\u{0370}'..='\u{03ff}').contains(&c))
+            && word
+                .chars()
+                .next()
+                .is_some_and(|c| ('\u{0370}'..='\u{03ff}').contains(&c))
         {
             return;
         }
@@ -805,6 +814,11 @@ impl CaseFolder {
     /// Whether the buffer contains only whitespace.
     pub fn has_content(&self) -> bool {
         !self.buf.chars().all(char::is_whitespace)
+    }
+
+    /// Yield the buffer as a string.
+    pub fn as_string(&self) -> &str {
+        &self.buf
     }
 
     /// Yield the buffer as a mutable string. Must call [`Self::mark_changed`]

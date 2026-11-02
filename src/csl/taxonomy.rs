@@ -964,6 +964,25 @@ fn unquote_family(family: &str) -> String {
     }
 }
 
+/// Move a trailing lower-case particle in the given name (`François Hédelin
+/// d'`) into the dropping-particle slot, matching citeproc-js's name parser.
+fn split_given_particle(given: Option<String>) -> (Option<String>, Option<String>) {
+    let Some(given) = given else { return (None, None) };
+    let Some(idx) = given.rfind(' ') else { return (Some(given), None) };
+    let particle = &given[idx + 1..];
+    let base = &given[..idx];
+    if particle.starts_with(|c: char| c.is_lowercase())
+        && (particle.ends_with('\'') || particle.ends_with('\u{2019}'))
+        && crate::lang::name::NAME_PARTICLES
+            .binary_search(&particle.to_lowercase().as_str())
+            .is_ok()
+    {
+        (Some(base.to_string()), Some(particle.to_string()))
+    } else {
+        (Some(given), None)
+    }
+}
+
 fn split_given_suffix(
     given: Option<&str>,
     suffix: Option<&str>,
@@ -1133,6 +1152,8 @@ impl EntryLike for citationberg::json::Item {
                             given_name: None,
                             alias: None,
                             comma_suffix: false,
+                            literal_family: true,
+                            non_dropping_particle: None,
                         },
                         // CSL-JSON `family` is the family name verbatim: no
                         // particle heuristics. Particles only arrive through
@@ -1155,13 +1176,19 @@ impl EntryLike for citationberg::json::Item {
                                 suffix.as_deref(),
                                 comma_suffix.unwrap_or_default(),
                             );
+                            let given = given.filter(|given| !given.is_empty());
+                            let (given, given_particle) = split_given_particle(given);
+                            let literal_family =
+                                family.starts_with('"') && family.ends_with('"');
                             Person {
                                 name: unquote_family(family),
-                                prefix: None,
+                                prefix: given_particle,
                                 suffix,
                                 given_name: given,
                                 alias: None,
                                 comma_suffix,
+                                literal_family,
+                                non_dropping_particle: None,
                             }
                         }
                         csl_json::NameValue::Item(csl_json::NameItem {
@@ -1177,17 +1204,17 @@ impl EntryLike for citationberg::json::Item {
                                 suffix.as_deref(),
                                 comma_suffix.unwrap_or_default(),
                             );
+                            let given = given.filter(|given| !given.is_empty());
+                            let (given, given_particle) = split_given_particle(given);
                             Person {
-                                name: if let Some(non_drop) = non_dropping_particle {
-                                    format!("{non_drop} {}", unquote_family(family))
-                                } else {
-                                    unquote_family(family)
-                                },
-                                prefix: dropping_particle.clone(),
+                                name: unquote_family(family),
+                                prefix: dropping_particle.clone().or(given_particle),
                                 suffix,
                                 given_name: given,
                                 alias: None,
                                 comma_suffix,
+                                literal_family: false,
+                                non_dropping_particle: non_dropping_particle.clone(),
                             }
                         }
                     })

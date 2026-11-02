@@ -305,8 +305,20 @@ fn apply_name_registry(
     }
 }
 
+/// Print the family name with an explicit non-dropping particle in front.
+fn push_family_name<T: EntryLike>(ctx: &mut Context<T>, person: &Person) {
+    if let Some(particle) = &person.non_dropping_particle {
+        ctx.push_str(particle);
+        if !particle.ends_with('\'') && !particle.ends_with('\u{2019}') {
+            ctx.ensure_space();
+        }
+    }
+    ctx.push_str(&person.name);
+}
+
 impl RenderCsl for Names {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
+        ctx.saw_names = true;
         // The editor and translator variables need to be merged if they are
         // both present and identical.
         let people: Vec<(Vec<Cow<'_, Person>>, NameVariable)> = if self.variable.len()
@@ -369,12 +381,27 @@ impl RenderCsl for Names {
                 for child in &substitute.children {
                     let len = ctx.writing.len();
                     if let LayoutRenderingElement::Names(names_child) = child {
-                        self.from_names_substitute(names_child).render(ctx)
+                        self.from_names_substitute(names_child).render(ctx);
+                        if len < ctx.writing.len() {
+                            break;
+                        }
+                    } else if matches!(
+                        child,
+                        LayoutRenderingElement::Text(text)
+                            if matches!(&text.target, citationberg::TextTarget::Term { .. })
+                    ) {
+                        // A defined-but-empty term (`<term name="editor"/>`)
+                        // still counts as the successful substitute and ends
+                        // the chain.
+                        if child.will_have_info(ctx).0 {
+                            child.render(ctx);
+                        }
+                        break;
                     } else {
                         child.render(ctx);
-                    }
-                    if len < ctx.writing.len() {
-                        break;
+                        if len < ctx.writing.len() {
+                            break;
+                        }
                     }
                 }
 
@@ -497,8 +524,12 @@ impl RenderCsl for Names {
             .filter(|(p, _)| !p.0.is_empty())
             .enumerate()
         {
-            let plural = persons.len() != 1;
             let label = self.label();
+            let plural = match label.map(|(label, _)| label.plural) {
+                Some(citationberg::LabelPluralize::Always) => true,
+                Some(citationberg::LabelPluralize::Never) => false,
+                _ => persons.len() != 1,
+            };
             let do_label = |requested_pos: NameLabelPosition,
                             ctx: &mut Context<'_, T>| {
                 if ctx.instance.sorting.is_none()
@@ -892,7 +923,7 @@ fn write_name<T: EntryLike>(
         if let Some(prefix) = family_affixes[0] {
             ctx.push_str(prefix);
         }
-        ctx.push_str(&name.name);
+        push_family_name(ctx, &name);
         ctx.pop_case(cidx);
         ctx.pop_format(idx);
         if let Some(suffix) = family_affixes[1] {
@@ -908,7 +939,7 @@ fn write_name<T: EntryLike>(
             ctx.push_str(prefix);
         }
 
-        ctx.push_str(&name.name);
+        push_family_name(ctx, &name);
 
         ctx.pop_case(cidx);
         ctx.pop_format(idx);
@@ -1021,8 +1052,10 @@ fn write_name<T: EntryLike>(
         _ if name.is_institutional() && ctx.instance.sorting.is_some() => {
             let idx = ctx.push_format(family_format);
             let cidx = ctx.push_case(family_case);
-            // TODO make locale aware
-            ctx.push_str(name.name_without_article());
+            // Institutional names sort by their full family string: a
+            // leading `A` in `A kasernes fællesvirke` is part of the name,
+            // not an article to strip.
+            push_family_name(ctx, &name);
             ctx.pop_case(cidx);
             ctx.pop_format(idx);
         }
@@ -1087,11 +1120,16 @@ fn write_name<T: EntryLike>(
             // the particle keeps its case (`van DER MEER`).
             if let Some(prefix) = &name.prefix {
                 ctx.push_str(prefix);
-                ctx.ensure_space();
+                if !prefix.ends_with('\'')
+                    && !prefix.ends_with('\u{2019}')
+                    && !prefix.ends_with('-')
+                {
+                    ctx.ensure_space();
+                }
             }
 
             let cidx = ctx.push_case(family_case);
-            ctx.push_str(&name.name);
+            push_family_name(ctx, &name);
 
             ctx.pop_case(cidx);
             ctx.pop_format(idx);

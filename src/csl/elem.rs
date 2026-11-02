@@ -83,6 +83,10 @@ impl Elem {
         self.children.has_content()
     }
 
+    pub(super) fn has_content_visible(&self) -> bool {
+        self.children.has_visible_content()
+    }
+
     pub(super) fn simplify(self) -> Self {
         Self { children: simplify_children(self.children), ..self }
     }
@@ -129,6 +133,12 @@ pub(super) fn simplify_children(children: ElemChildren) -> ElemChildren {
             acc
         }));
     normalize_seams(&mut children);
+    // An empty display block must not reach the serializer: citeproc-js drops
+    // `csl-block`/`csl-left-margin` divs whose content is empty.
+    children.0.retain(|child| match child {
+        ElemChild::Elem(e) if e.display.is_some() => e.children.has_content(),
+        _ => true,
+    });
     children
 }
 
@@ -488,6 +498,12 @@ impl ElemChildren {
         self.0.iter().any(|e| e.has_content())
     }
 
+    /// Content that a serializer would actually print. Zero-width markers
+    /// (e.g. a zero-width space) do not count.
+    pub(super) fn has_visible_content(&self) -> bool {
+        self.0.iter().any(|e| e.has_visible_content())
+    }
+
     /// Retrieve a reference to the first child with a matching meta by
     /// DFS.
     pub fn find_meta(&self, meta: &ElemMeta) -> Option<&Elem> {
@@ -670,6 +686,17 @@ impl ElemChild {
                 text.chars().any(|c| !c.is_whitespace())
             }
             ElemChild::Elem(e) => e.has_content(),
+            ElemChild::Link { .. } => true,
+            ElemChild::Transparent { .. } => true,
+        }
+    }
+
+    pub(super) fn has_visible_content(&self) -> bool {
+        match self {
+            ElemChild::Text(Formatted { text, .. }) | ElemChild::Markup(text) => {
+                text.chars().any(|c| !c.is_whitespace() && c != '\u{200b}')
+            }
+            ElemChild::Elem(e) => e.children.has_visible_content(),
             ElemChild::Link { .. } => true,
             ElemChild::Transparent { .. } => true,
         }

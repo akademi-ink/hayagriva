@@ -308,7 +308,8 @@ impl FromStr for PageRangesPart {
             let start = parts.next().ok_or(PageRangesPartErr::Empty)?;
             let end = parts.next().ok_or(PageRangesPartErr::Empty)?;
 
-            let r = Self::EscapedRange(parse_page_number(start)?, parse_page_number(end)?);
+            let r =
+                Self::EscapedRange(parse_page_number(start)?, parse_page_number(end)?);
             if parts.next().is_some() {
                 return Err(PageRangesPartErr::Malformed);
             }

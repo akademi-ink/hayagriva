@@ -2,11 +2,10 @@ use std::cmp::Ordering;
 
 use citationberg::taxonomy::Variable;
 use citationberg::{
-    DemoteNonDroppingParticle, InheritableNameOptions, LocaleCode, LongShortForm, Sort,
-    SortDirection, SortKey,
+    InheritableNameOptions, LocaleCode, LongShortForm, Sort, SortDirection, SortKey,
 };
-use icu_collator::Collator;
-use icu_collator::options::CollatorOptions;
+use icu_collator::options::{CollatorOptions, Strength};
+use icu_collator::{Collator, CollatorPreferences};
 use icu_locale::Locale as IcuLocale;
 
 use crate::csl::BufWriteFormat;
@@ -15,6 +14,66 @@ use crate::csl::rendering::RenderCsl;
 use super::taxonomy::EntryLike;
 use super::{CitationItem, InstanceContext, StyleContext};
 
+/// Remove punctuation from a sort key while preserving spaces, mirroring
+/// citeproc-js's `ignorePunctuation: true`. Leading quotation marks,
+/// brackets and apostrophes are dropped, and internal apostrophes are
+/// removed (they are punctuation in `localeCompare`).
+pub(crate) fn normalize_sort_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_alphanumeric() || c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The sort component of one person, honoring the style's
+/// `demote-non-dropping-particle` setting.
+pub(crate) fn person_sort_key(person: &crate::types::Person, demote: bool) -> String {
+    let mut key = String::new();
+    if demote {
+        key.push_str(&normalize_name_sort_key(person.name_without_particle()));
+        key.push(' ');
+        if let Some(given) = &person.given_name {
+            key.push_str(&normalize_name_sort_key(given));
+        }
+        if let Some(particle) = person.name_particle() {
+            key.push(' ');
+            key.push_str(&normalize_name_sort_key(particle));
+        }
+    } else {
+        if let Some(particle) = &person.non_dropping_particle {
+            key.push_str(&normalize_name_sort_key(particle));
+            key.push(' ');
+        }
+        key.push_str(&normalize_name_sort_key(&person.name));
+        key.push(' ');
+        if let Some(given) = &person.given_name {
+            key.push_str(&normalize_name_sort_key(given));
+        }
+    }
+    key
+}
+
+/// Name sort keys follow citeproc-js's structured name keys: an apostrophe
+/// splits the family name into separately collated components (`d'Wander`
+/// -> `d`, `Wander`), and joining words are not part of the key.
+pub(crate) fn normalize_name_sort_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\'' || c == '\u{2019}' {
+            out.push(' ');
+        } else if c.is_alphanumeric() || c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out.split_whitespace()
+        .filter(|word| !word.eq_ignore_ascii_case("and") && *word != "&")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 trait CollationOrd: Ord {
     fn collation_cmp(&self, other: &Self, locale: LocaleCode) -> Ordering;
 }
@@ -22,9 +81,18 @@ trait CollationOrd: Ord {
 impl CollationOrd for str {
     fn collation_cmp(&self, other: &Self, locale: LocaleCode) -> Ordering {
         if let Ok(locale) = locale.0.parse::<IcuLocale>() {
-            let options = CollatorOptions::default();
-            let collator = Collator::try_new(locale.into(), options).unwrap();
-            collator.compare(self, other)
+            // citeproc-js compares sort keys with `localeCompare` configured
+            // as `sensitivity: "base"`, `ignorePunctuation: true`, and
+            // `numeric: true`. Mirror all three: base letters only (case and
+            // accents are ignored), punctuation removed before comparison
+            // (spaces stay significant), and digit runs compared by value.
+            let mut options = CollatorOptions::default();
+            options.strength = Some(Strength::Primary);
+            let preferences: CollatorPreferences = locale.into();
+            let collator = Collator::try_new(preferences, options).unwrap();
+            let a = normalize_sort_key(self);
+            let b = normalize_sort_key(other);
+            collator.compare(&a, &b)
         } else {
             self.cmp(other)
         }
@@ -82,31 +150,28 @@ impl StyleContext<'_> {
                 }
             }
             SortKey::Variable { variable: Variable::Name(n), .. } => {
-                let a = a.entry.resolve_name_variable(*n);
-                let b = b.entry.resolve_name_variable(*n);
-
-                for (a_pers, b_pers) in a.iter().zip(b.iter()) {
-                    let ord = a_pers.csl_cmp(
-                        b_pers,
-                        LongShortForm::Long,
-                        self.csl.settings.demote_non_dropping_particle
-                            != DemoteNonDroppingParticle::Never,
-                    );
-                    if ord != Ordering::Equal {
-                        return ord;
+                // citeproc-js builds a structured key for name variables:
+                // each person contributes its family-name components followed
+                // by the given name, with apostrophes splitting family
+                // components (`d'Wander` -> `d`, `Wander`) and joining words
+                // left out. Comparing the same shape keeps particle-less CJK
+                // and apostrophe names in citeproc order.
+                let demote = self.csl.settings.demote_non_dropping_particle
+                    != citationberg::DemoteNonDroppingParticle::Never;
+                let key = |entry: &CitationItem<T>| {
+                    let people = entry.entry.resolve_name_variable(*n);
+                    let mut key = String::new();
+                    for (idx, person) in people.iter().enumerate() {
+                        if idx > 0 {
+                            key.push(' ');
+                        }
+                        key.push_str(&person_sort_key(person, demote));
                     }
-                }
-
-                (
-                    if a.len() < b.len() {
-                        Ordering::Less
-                    } else if a.len() > b.len() {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Equal
-                    },
-                    false,
-                )
+                    key
+                };
+                let a_key = key(a);
+                let b_key = key(b);
+                (a_key.collation_cmp(&b_key, self.locale()), false)
             }
             SortKey::Variable { variable: Variable::Number(n), .. } => {
                 let a = InstanceContext::variable_sort_instance(a, a_idx)
@@ -162,10 +227,18 @@ impl StyleContext<'_> {
                         for child in &m.children {
                             child.render(&mut ctx)
                         }
-                        ctx.flush().0.into_iter().fold(String::new(), |mut s, f| {
-                            f.write_buf(&mut s, BufWriteFormat::Plain).unwrap();
-                            s.to_lowercase()
-                        })
+                        let saw_names = ctx.saw_names;
+                        let rendered =
+                            ctx.flush().0.into_iter().fold(String::new(), |mut s, f| {
+                                f.write_buf(&mut s, BufWriteFormat::Plain).unwrap();
+                                s
+                            });
+                        let out = if saw_names {
+                            normalize_name_sort_key(&rendered)
+                        } else {
+                            normalize_sort_key(&rendered)
+                        };
+                        out
                     })
                 };
 
@@ -183,6 +256,124 @@ impl StyleContext<'_> {
             ordering.reverse()
         } else {
             ordering
+        }
+    }
+
+    /// Compare two already-normalized sort keys with the style's locale
+    /// collation. Cite grouping uses the same comparison as sorting.
+    pub(crate) fn compare_sort_strings(&self, a: &str, b: &str) -> Ordering {
+        a.collation_cmp(b, self.locale())
+    }
+
+    /// The string citeproc-js uses as the first key of a cite group: the
+    /// value of the first sort key (an internal name key when the key is a
+    /// names macro), normalized for comparison.
+    pub(crate) fn group_sort_key<T: EntryLike>(
+        &self,
+        item: &CitationItem<T>,
+        idx: usize,
+        key: &SortKey,
+        term_locale: Option<&LocaleCode>,
+    ) -> (String, bool) {
+        match key {
+            SortKey::Variable { variable, .. } => match variable {
+                Variable::Standard(s) => (
+                    InstanceContext::variable_sort_instance(item, idx)
+                        .resolve_standard_variable(LongShortForm::default(), *s)
+                        .map(|s| normalize_sort_key(&s.to_string()))
+                        .unwrap_or_default(),
+                    false,
+                ),
+                Variable::Date(d) => (
+                    item.entry
+                        .resolve_date_variable(*d)
+                        .map(|d| {
+                            format!(
+                                "{:09}{:02}{:02}",
+                                d.year + 100_000,
+                                d.month.unwrap_or(0),
+                                d.day.unwrap_or(0)
+                            )
+                        })
+                        .unwrap_or_default(),
+                    false,
+                ),
+                Variable::Name(n) => {
+                    let people = item.entry.resolve_name_variable(*n);
+                    let demote = self.csl.settings.demote_non_dropping_particle
+                        != citationberg::DemoteNonDroppingParticle::Never;
+                    let mut key = String::new();
+                    for (i, person) in people.iter().enumerate() {
+                        if i > 0 {
+                            key.push(' ');
+                        }
+                        key.push_str(&person_sort_key(person, demote));
+                    }
+                    (key, true)
+                }
+                Variable::Number(n) => (
+                    InstanceContext::variable_sort_instance(item, idx)
+                        .resolve_number_variable(*n)
+                        .map(|n| match n {
+                            crate::csl::taxonomy::NumberVariableResult::Regular(n) => {
+                                n.to_string()
+                            }
+                            crate::csl::taxonomy::NumberVariableResult::Transparent(
+                                i,
+                            ) => i.to_string(),
+                        })
+                        .unwrap_or_default(),
+                    false,
+                ),
+                Variable::Page(p) => (
+                    InstanceContext::variable_sort_instance(item, idx)
+                        .resolve_page_variable(*p)
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                    false,
+                ),
+            },
+            SortKey::MacroName {
+                name,
+                names_min,
+                names_use_first,
+                names_use_last,
+                ..
+            } => {
+                let mut ctx = self.macro_sorting_ctx(
+                    item,
+                    idx,
+                    item.locale.as_ref(),
+                    term_locale,
+                    false,
+                );
+                ctx.writing.name_options.push(InheritableNameOptions {
+                    et_al_min: *names_min,
+                    et_al_subsequent_min: *names_min,
+                    et_al_use_first: *names_use_first,
+                    et_al_subsequent_use_first: *names_use_first,
+                    et_al_use_last: *names_use_last,
+                    ..Default::default()
+                });
+                self.get_macro(name)
+                    .map(|m| {
+                        for child in &m.children {
+                            child.render(&mut ctx);
+                        }
+                        let saw_names = ctx.saw_names;
+                        let rendered =
+                            ctx.flush().0.into_iter().fold(String::new(), |mut s, f| {
+                                f.write_buf(&mut s, BufWriteFormat::Plain).unwrap();
+                                s
+                            });
+                        if saw_names {
+                            (normalize_name_sort_key(&rendered), true)
+                        } else {
+                            (normalize_sort_key(&rendered), false)
+                        }
+                    })
+                    .unwrap_or_default()
+            }
         }
     }
 
@@ -214,4 +405,9 @@ impl StyleContext<'_> {
             });
         }
     }
+}
+
+/// Public-in-crate wrapper used by citation grouping.
+pub(crate) fn normalize_name_sort_key_public(s: &str) -> String {
+    normalize_name_sort_key(s)
 }

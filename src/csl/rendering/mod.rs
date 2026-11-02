@@ -144,6 +144,15 @@ impl RenderCsl for citationberg::Text {
                     }
                 }
             }
+            ResolvedTextTarget::NumberVariable(var, n)
+                if var == NumberVariable::Locator =>
+            {
+                let raw = ctx.locator_string().map(str::to_string).unwrap_or_default();
+                match n {
+                    NumberVariableResult::Transparent(n) => ctx.push_transparent(n),
+                    _ => ctx.push_locator_text(&raw),
+                }
+            }
             ResolvedTextTarget::NumberVariable(_, n) => match n {
                 NumberVariableResult::Regular(MaybeTyped::Typed(num))
                     if num.will_transform() =>
@@ -159,14 +168,8 @@ impl RenderCsl for citationberg::Text {
                 // range: only roman-numeral ranges keep the citeproc-js en
                 // dash (`xxv–xxviii`), other hyphens stay verbatim (F-111).
                 MaybeTyped::String(s) => {
-                    let delim = ctx
-                        .term(
-                            OtherTerm::PageRangeDelimiter.into(),
-                            TermForm::default(),
-                            false,
-                        )
-                        .unwrap_or("–");
-                    ctx.push_str(&roman_ranges_to_en_dash(&s, delim));
+                    let formatted = format_page_string(&s, ctx, true);
+                    ctx.push_str(&formatted);
                 }
             },
             ResolvedTextTarget::Macro(mac) => {
@@ -184,7 +187,9 @@ impl RenderCsl for citationberg::Text {
                 }
             }
             ResolvedTextTarget::Term(s) => {
-                if nothing_rendered && ctx.should_capitalize_term() {
+                if (nothing_rendered && ctx.should_capitalize_term())
+                    || ctx.last_text_ends_sentence()
+                {
                     ctx.push_str(&capitalize_first(s));
                 } else {
                     ctx.push_str(s);
@@ -419,6 +424,19 @@ impl RenderCsl for citationberg::Number {
         let cidx = ctx.push_case(self.text_case);
         let gender = ctx.gender(self.variable.into());
 
+        if self.variable == NumberOrPageVariable::Number(NumberVariable::Locator)
+            && let Some(NumberOrPageVariableResult::Number(
+                NumberVariableResult::Regular(_),
+            )) = &value
+        {
+            let raw = ctx.locator_string().map(str::to_string).unwrap_or_default();
+            ctx.push_locator_text(&raw);
+            ctx.pop_case(cidx);
+            ctx.apply_suffix(&self.affixes, affix_loc, ambient);
+            ctx.commit_elem(depth, self.display, Some(ElemMeta::Number));
+            return;
+        }
+
         match value {
             Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
                 MaybeTyped::Typed(num),
@@ -432,6 +450,13 @@ impl RenderCsl for citationberg::Number {
 
             Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
                 MaybeTyped::String(s),
+            ))) if self.variable
+                == NumberOrPageVariable::Number(NumberVariable::Locator) =>
+            {
+                ctx.push_locator_text(&s)
+            }
+            Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
+                MaybeTyped::String(s),
             ))) => ctx.push_str(&s),
 
             Some(NumberOrPageVariableResult::Number(
@@ -443,7 +468,8 @@ impl RenderCsl for citationberg::Number {
             }
 
             Some(NumberOrPageVariableResult::Page(MaybeTyped::String(s))) => {
-                ctx.push_str(&s)
+                let formatted = format_page_string(&s, ctx, true);
+                ctx.push_str(&formatted)
             }
 
             None => {}
@@ -576,6 +602,215 @@ fn superscript_baseline(c: char) -> Option<&'static str> {
     })
 }
 
+/// Common locator abbreviations mapped to their CSL locator. citeproc-js
+/// parses a leading label out of a locator string (`vol. 1, fol. 186`)
+/// when the cite label is absent or `page`.
+const LOCATOR_ABBREVIATIONS: &[(&str, Locator)] = &[
+    ("pp.", Locator::Page),
+    ("p.", Locator::Page),
+    ("vols.", Locator::Volume),
+    ("vol.", Locator::Volume),
+    ("fols.", Locator::Folio),
+    ("fol.", Locator::Folio),
+    ("figs.", Locator::Figure),
+    ("fig.", Locator::Figure),
+    ("chaps.", Locator::Chapter),
+    ("chap.", Locator::Chapter),
+    ("ch.", Locator::Chapter),
+    ("secs.", Locator::Section),
+    ("sec.", Locator::Section),
+    ("arts.", Locator::ArticleLocator),
+    ("art.", Locator::ArticleLocator),
+    ("nos.", Locator::Issue),
+    ("no.", Locator::Issue),
+    ("para.", Locator::Paragraph),
+    ("paras.", Locator::Paragraph),
+    ("n.", Locator::Note),
+    ("nn.", Locator::Note),
+    ("col.", Locator::Column),
+    ("cols.", Locator::Column),
+    ("l.", Locator::Line),
+    ("ll.", Locator::Line),
+    ("v.", Locator::Verse),
+    ("vv.", Locator::Verse),
+    ("bk.", Locator::Book),
+    ("bks.", Locator::Book),
+];
+
+/// Split a locator's leading label abbreviation from its value.
+pub(crate) fn split_embedded_locator_label(s: &str) -> Option<(Locator, &str)> {
+    let trimmed = s.trim_start();
+    for (abbr, locator) in LOCATOR_ABBREVIATIONS {
+        if trimmed.len() > abbr.len()
+            && trimmed[..abbr.len()].eq_ignore_ascii_case(abbr)
+            && trimmed[abbr.len()..].starts_with(' ')
+        {
+            return Some((*locator, trimmed[abbr.len()..].trim_start()));
+        }
+    }
+    None
+}
+
+/// Whether a page-range side is something the page-range formatter accepts:
+/// a number, optionally with a letter prefix, or a roman numeral.
+pub(crate) fn is_page_range_side(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.chars().any(|c| c.is_ascii_digit()) {
+        return s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
+    }
+    s.chars().all(|c| {
+        matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'm' | 'I' | 'V' | 'X' | 'L' | 'C' | 'M')
+    })
+}
+
+/// Format a page string that the engine could not parse into [`PageRanges`]
+/// (a locator like `427-30, fig. 3`, or a page value like `3\-B`). Escaped
+/// hyphens stay literal; numeric and roman ranges take the style's
+/// page-range format and the locale's range delimiter.
+pub(crate) fn format_page_string<T: EntryLike>(
+    s: &str,
+    ctx: &mut Context<T>,
+    apply_page_format: bool,
+) -> String {
+    let format = apply_page_format
+        .then_some(ctx.style.csl.settings.page_range_format)
+        .flatten();
+    let delim = ctx
+        .term(OtherTerm::PageRangeDelimiter.into(), TermForm::default(), false)
+        .unwrap_or("–")
+        .to_string();
+
+    // Protect escaped hyphens so they neither format nor pluralize.
+    let protected = s.replace("\\-", "\u{E000}");
+    let mut out = String::with_capacity(protected.len());
+    let mut rest = protected.as_str();
+    while let Some(pos) = rest.find(['-', '–']) {
+        let dash = rest[pos..].chars().next().unwrap();
+        let before = &rest[..pos];
+        let start = before
+            .trim_end()
+            .rsplit(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        let after = &rest[pos + dash.len_utf8()..];
+        let end = after
+            .trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        if is_page_range_side(start) && is_page_range_side(end) {
+            let start_pos = before.trim_end().len() - start.len();
+            let after_trim = after.len() - after.trim_start().len();
+            out.push_str(&before[..start_pos]);
+            if let Some(format) = format {
+                let _ = format.format(&mut out, start.trim(), end.trim(), Some(&delim));
+            } else {
+                out.push_str(start.trim());
+                out.push_str(&delim);
+                out.push_str(end.trim());
+            }
+            rest = &after[after_trim + end.len()..];
+        } else {
+            out.push_str(&rest[..pos + dash.len_utf8()]);
+            rest = &rest[pos + dash.len_utf8()..];
+        }
+    }
+    out.push_str(rest);
+    out.replace('\u{E000}', "-")
+}
+
+/// Split a locator/page string on the separators citeproc-js understands.
+pub(crate) fn split_locator_chunks<'a>(
+    s: &'a str,
+    localized_and: Option<&str>,
+) -> Vec<&'a str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap();
+        let mut sep_len = 0;
+        if c == ',' || c == ';' {
+            sep_len = c.len_utf8();
+        } else if c == '&' {
+            sep_len = 1;
+        } else if c == ' ' {
+            let rest = &s[i + 1..];
+            if rest.len() >= 3
+                && rest[..3].eq_ignore_ascii_case("and")
+                && rest[3..].starts_with(' ')
+            {
+                sep_len = 1 + 3;
+            } else if let Some(and) = localized_and {
+                if !and.is_empty()
+                    && rest.starts_with(and)
+                    && rest[and.len()..].starts_with(' ')
+                {
+                    sep_len = 1 + and.len();
+                }
+            }
+        }
+        if sep_len > 0 {
+            let chunk = s[start..i].trim();
+            if !chunk.is_empty() {
+                chunks.push(chunk);
+            }
+            i += sep_len;
+            while i < s.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            start = i;
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        chunks.push(tail);
+    }
+    chunks
+}
+
+/// citeproc-js's plural heuristic for page-like strings: more than one
+/// locator, or a range whose ends differ. Escaped hyphens are literal and do
+/// not pluralize.
+pub(crate) fn string_has_numeric_range(s: &str) -> bool {
+    let protected = s.replace("\\-", "\u{E000}");
+    let mut rest = protected.as_str();
+    while let Some(pos) = rest.find(['-', '–']) {
+        let dash = rest[pos..].chars().next().unwrap();
+        let before = &rest[..pos];
+        let start = before
+            .trim_end()
+            .rsplit(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        let after = &rest[pos + dash.len_utf8()..];
+        let end = after
+            .trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("");
+        if is_page_range_side(start) && is_page_range_side(end) && start != end {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+pub(crate) fn page_string_is_plural<T: EntryLike>(s: &str, ctx: &Context<T>) -> bool {
+    let localized_and = ctx
+        .term(Term::Other(OtherTerm::And), TermForm::Long, false)
+        .map(str::to_string);
+    let chunks = split_locator_chunks(s, localized_and.as_deref());
+    chunks.len() > 1 || string_has_numeric_range(s)
+}
+
 fn render_page_range<T: EntryLike>(range: &PageRanges, ctx: &mut Context<T>) {
     let format = ctx.style.csl.settings.page_range_format;
     let delim = ctx
@@ -645,35 +880,12 @@ fn split_page_number(s: &str) -> (&str, &str) {
     (&trimmed[..start], &trimmed[start..])
 }
 
-/// Convert the hyphen of a roman-numeral range (`xxv-xxviii`) in a page value
-/// that could not be parsed as ranges to the page range delimiter. citeproc-js
-/// converts roman-numeral ranges (its numeral set is `ivxlcmIVXLCM`), but keeps
-/// other hyphens in such values verbatim, e.g. the identifier `TR-2020-14`
-/// (F-111).
-fn roman_ranges_to_en_dash(s: &str, delim: &str) -> String {
-    fn is_roman(part: &str) -> bool {
-        !part.is_empty()
-            && part.chars().all(|c| {
-                matches!(
-                    c,
-                    'i' | 'v' | 'x' | 'l' | 'c' | 'm' | 'I' | 'V' | 'X' | 'L' | 'C' | 'M'
-                )
-            })
+fn label_plural_override(label: &citationberg::Label) -> Option<bool> {
+    match label.label.plural {
+        LabelPluralize::Always => Some(true),
+        LabelPluralize::Never => Some(false),
+        LabelPluralize::Contextual => None,
     }
-
-    let parts: Vec<&str> = s.split('-').collect();
-    let mut out = String::with_capacity(s.len());
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            if is_roman(parts[i - 1]) && is_roman(part) {
-                out.push_str(delim);
-            } else {
-                out.push('-');
-            }
-        }
-        out.push_str(part);
-    }
-    out
 }
 
 fn label_pluralization(
@@ -710,7 +922,13 @@ impl RenderCsl for citationberg::Label {
                 };
 
                 let depth = ctx.push_elem(citationberg::Formatting::default());
-                let plural = label_pluralization(self, variable);
+                let plural = label_plural_override(self).unwrap_or_else(|| {
+                    if n == NumberVariable::Locator {
+                        ctx.locator_is_plural()
+                    } else {
+                        label_pluralization(self, variable)
+                    }
+                });
 
                 let content = ctx
                     .term(Term::from(self.variable), self.label.form, plural)
@@ -725,7 +943,10 @@ impl RenderCsl for citationberg::Label {
                 };
 
                 let depth = ctx.push_elem(citationberg::Formatting::default());
-                let plural = p.as_typed().is_some_and(|p| p.is_plural());
+                let plural = label_plural_override(self).unwrap_or(match &p {
+                    MaybeTyped::Typed(p) => p.is_plural(),
+                    MaybeTyped::String(s) => page_string_is_plural(s, ctx),
+                });
 
                 let content =
                     ctx.term(Term::from(pv), self.label.form, plural).unwrap_or_default();
@@ -775,7 +996,13 @@ impl RenderCsl for citationberg::Label {
         match self.variable {
             NumberOrPageVariable::Number(n) => {
                 if let Some(num) = ctx.resolve_number_variable(n) {
-                    let plural = label_pluralization(self, num);
+                    let plural = label_plural_override(self).unwrap_or_else(|| {
+                        if n == NumberVariable::Locator {
+                            ctx.locator_is_plural()
+                        } else {
+                            label_pluralization(self, num)
+                        }
+                    });
                     (
                         ctx.term(Term::from(self.variable), self.label.form, plural)
                             .is_some(),
@@ -787,7 +1014,10 @@ impl RenderCsl for citationberg::Label {
             }
             NumberOrPageVariable::Page(pv) => {
                 if let Some(p) = ctx.resolve_page_variable(pv) {
-                    let plural = p.as_typed().is_some_and(|p| p.is_plural());
+                    let plural = label_plural_override(self).unwrap_or(match &p {
+                        MaybeTyped::Typed(p) => p.is_plural(),
+                        MaybeTyped::String(s) => page_string_is_plural(s, ctx),
+                    });
                     (
                         ctx.term(Term::from(pv), self.label.form, plural).is_some(),
                         UsageInfo::default(),
@@ -817,9 +1047,11 @@ fn render_label_with_var<T: EntryLike>(
     // `(eds.)`, not `(eds..)`. Only the label path does this; layout suffixes
     // keep their own collapse rules.
     let mut affixes = label.affixes.clone();
+    let effective_content =
+        if label.strip_periods { content.replace('.', "") } else { content.to_string() };
     if let Some(suffix) = affixes.suffix.clone()
         && suffix.starts_with('.')
-        && ctx.last_char() == Some('.')
+        && effective_content.ends_with('.')
     {
         affixes.suffix = Some(suffix[1..].to_string());
     }
@@ -925,14 +1157,7 @@ impl RenderCsl for citationberg::Date {
             return;
         }
 
-        let base = if let Some(form) = self.form {
-            // Localized date formats can fail to print anything at all,
-            // especially if no locale is set.
-            let Some(base) = ctx.localized_date(form) else { return };
-            Some(base)
-        } else {
-            None
-        };
+        let base = self.form.and_then(|form| ctx.localized_date(form));
 
         let first = ctx.is_first_date();
         let formatting = base
@@ -964,6 +1189,23 @@ impl RenderCsl for citationberg::Date {
             Some(base) => base.delimiter.as_deref(),
             None => self.delimiter.as_deref(),
         };
+
+        if base.is_none() && self.date_part.is_empty() {
+            // No localized date format is available (and the style did not
+            // spell out date-parts): fall back to the requested year, which
+            // is all `form="text" date-parts="year"` needs.
+            let loc = ctx.push_elem(citationberg::Formatting::default());
+            let ad = ctx
+                .term(Term::Other(OtherTerm::Ad), TermForm::default(), false)
+                .unwrap_or(" AD");
+            let bc = ctx
+                .term(Term::Other(OtherTerm::Bc), TermForm::default(), false)
+                .unwrap_or(" BC");
+            let _ = write_year(date.year, false, ctx, ad, bc);
+            if ctx.commit_elem_with_delimiter(loc, None) {
+                first_part = false;
+            }
+        }
 
         for part in &base.unwrap_or(self).date_part {
             match part.name {
@@ -1179,10 +1421,13 @@ fn render_date_part<T: EntryLike>(
         render_year_suffix_implicitly(ctx);
     }
 
+    // `strip-periods` applies to the term value only: the date-part's own
+    // suffix (`suffix=". "` after a stripped short month) must keep its
+    // period (`Jan. 2004`, not `Jan 2004`).
+    ctx.stop_stripping_periods();
     if let Some(affix_loc) = affix_loc {
         ctx.apply_suffix(affixes, affix_loc, ambient);
     }
-    ctx.stop_stripping_periods();
     ctx.pop_case(cidx);
     ctx.pop_format(idx);
 }
@@ -1290,7 +1535,11 @@ fn render_with_delimiter<T: EntryLike>(
             }
 
             loc = Some(ctx.push_elem(citationberg::Formatting::default()));
-            ctx.push_str(delim);
+            // Delimiters are structural punctuation: citeproc-js appends them
+            // verbatim and does not apply its French narrow-space
+            // normalization to them (`GOST`'s ` : ` group delimiter keeps
+            // plain spaces, while French text values get narrow spaces).
+            ctx.push_str_raw(delim);
         }
         first = false;
 

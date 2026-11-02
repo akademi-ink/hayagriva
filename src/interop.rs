@@ -54,6 +54,8 @@ impl From<&tex::Person> for Person {
                 suffix: optional(&person.suffix),
                 comma_suffix: false,
                 alias: None,
+                literal_family: false,
+                non_dropping_particle: None,
             };
         }
 
@@ -64,6 +66,8 @@ impl From<&tex::Person> for Person {
             suffix: optional(&person.suffix),
             comma_suffix: false,
             alias: None,
+            literal_family: false,
+            non_dropping_particle: None,
         }
     }
 }

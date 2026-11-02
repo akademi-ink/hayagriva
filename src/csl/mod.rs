@@ -26,8 +26,10 @@ use indexmap::IndexSet;
 use crate::csl::elem::{
     NonEmptyStack, coalesce_text_runs, simplify_children, trim_trailing_whitespace,
 };
-use crate::csl::rendering::RenderCsl;
 use crate::csl::rendering::names::{DisambiguatedNameForm, NameDisambiguationProperties};
+use crate::csl::rendering::{
+    RenderCsl, format_page_string, page_string_is_plural, split_embedded_locator_label,
+};
 use crate::csl::taxonomy::NumberOrPageVariableResult;
 use crate::lang::{Case, CaseFolder};
 use crate::types::{ChunkKind, ChunkedString, Date, MaybeTyped, Person};
@@ -404,7 +406,9 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 last_cite = Some(item);
             }
 
-            res.push(SpeculativeCiteRender { items: renders, request: citation });
+            let mut cite = SpeculativeCiteRender { items: renders, request: citation };
+            apply_grouped_sort(&style, &mut cite, citation.locale.as_ref());
+            res.push(cite);
         }
 
         // 2.  Disambiguate the citations.
@@ -514,9 +518,15 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
             let mut group_idx = 0;
             let mut prev_name_elem: Option<String> = None;
+            let fallback_author_key = matches!(
+                cite.request.style.citation.collapse,
+                Some(Collapse::YearSuffix | Collapse::YearSuffixRanged)
+            );
 
             for item in cite.items.iter_mut() {
-                let name_elem = item.rendered.find_names().map(|e| format!("{e:?}"));
+                let name_elem = item.rendered.find_names().map(names_key).or_else(|| {
+                    fallback_author_key.then(|| entry_author_key(item.entry))
+                });
 
                 match name_elem {
                     Some(name_elem) => {
@@ -589,6 +599,9 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 }
             }
         }
+
+        // 4b. Determine final note positions (first/subsequent/ibid/near-note).
+        apply_note_positions(&mut res);
 
         // Rerender.
         let mut final_citations: Vec<RenderedCitation> = Vec::new();
@@ -708,6 +721,21 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         }
                     }
 
+                    let layout_affixes = cite.request.style.citation.layout.to_affixes();
+                    if elem_children.is_empty()
+                        && cite.items.len() == 1
+                        && cite.request.prefix().is_none()
+                        && cite.request.suffix().is_none()
+                        && layout_affixes.prefix.is_none()
+                        && layout_affixes.suffix.is_none()
+                    {
+                        elem_children.push(ElemChild::Text(Formatted {
+                            text: "[CSL STYLE ERROR: reference with no printed form.]"
+                                .to_string(),
+                            formatting,
+                        }));
+                    }
+
                     let mut children = simplify_children(ElemChildren(elem_children));
                     coalesce_text_runs(&mut children, formatting);
                     children
@@ -756,12 +784,50 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 &mut items,
             );
 
+            // citeproc-js drops bibliography entries with no printed form,
+            // except in numeric bibliographies, where the number must stay
+            // and the entry body shows the style-error placeholder.
+            let entry_formatting =
+                Formatting::default().apply(bibliography.layout.to_formatting());
+            let uses_citation_number =
+                format!("{:?}", bibliography.layout).contains("CitationNumber");
+            let second_field = bibliography.second_field_align.is_some();
+            let mut entry_number = self.citation_number_offset;
+            items.retain_mut(|(content, _)| {
+                let number = entry_number + 1;
+                entry_number += 1;
+                if content.has_content() {
+                    return true;
+                }
+                if second_field {
+                    content.0.push(
+                        Formatted {
+                            text: "[CSL STYLE ERROR: reference with no printed form.]"
+                                .to_string(),
+                            formatting: entry_formatting,
+                        }
+                        .into(),
+                    );
+                    true
+                } else if uses_citation_number {
+                    content.0.push(
+                        Formatted {
+                            text: format!(
+                                "{number}. [CSL STYLE ERROR: reference with no printed form.]"
+                            ),
+                            formatting: entry_formatting,
+                        }
+                        .into(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            });
+
             // The bibliography layout's formatting is applied around the whole
             // entry (including the second-field-align field divs) by
             // serializers, mirroring citeproc-js.
-            let entry_formatting =
-                Formatting::default().apply(bibliography.layout.to_formatting());
-
             Some(RenderedBibliography {
                 hanging_indent: bibliography.hanging_indent,
                 second_field_align: bibliography.second_field_align,
@@ -803,6 +869,15 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     }
                 }
             }
+        }
+
+        if let Some(bib) = &mut bib_render {
+            for item in &mut bib.items {
+                strip_empty_displays(&mut item.content);
+            }
+        }
+        for citation in &mut final_citations {
+            strip_empty_displays(&mut citation.citation);
         }
 
         Rendered {
@@ -1099,7 +1174,7 @@ impl NameRegistry {
         if person.name.is_empty() || person.given_name.is_none() {
             return;
         }
-        let family = person.name.replace('.', " ");
+        let family = family_key(person).replace('.', " ");
         let family = family.trim().to_string();
         if family.is_empty() {
             return;
@@ -1126,7 +1201,7 @@ impl NameRegistry {
 
     /// `(distinct initials, distinct full given names)` for the family name.
     fn counts(&self, person: &Person) -> (usize, usize) {
-        let family = person.name.replace('.', " ");
+        let family = family_key(person).replace('.', " ");
         let Some(by_initials) = self.families.get(family.trim()) else {
             return (0, 0);
         };
@@ -1137,6 +1212,16 @@ impl NameRegistry {
         let given_count =
             by_initials.get(&initials_key).map(HashSet::len).unwrap_or_default();
         (by_initials.len(), given_count)
+    }
+}
+
+/// The family name including an explicit non-dropping particle: `dos
+/// Santos` and `Santos` are different families for disambiguation.
+fn family_key(person: &Person) -> String {
+    if let Some(particle) = &person.non_dropping_particle {
+        format!("{particle} {}", person.name)
+    } else {
+        person.name.clone()
     }
 }
 
@@ -1152,7 +1237,7 @@ fn name_disambiguation_key(
     let count = props.visible_count();
     let mut key = format!("{count}\u{1e}");
     for (idx, person) in names.iter().enumerate().take(count) {
-        key.push_str(&person.name);
+        key.push_str(&family_key(person));
         key.push('\u{1f}');
         match props.form_at(idx) {
             Some(DisambiguatedNameForm::LongInitialized) => {
@@ -1633,6 +1718,293 @@ fn find_ambiguous_sets<T: EntryLike + PartialEq>(
         .collect()
 }
 
+/// Render an element's plain text (used for citeproc's `authorstring`).
+fn plain_elem(e: &Elem) -> String {
+    let mut out = String::new();
+    e.write_buf(&mut out, BufWriteFormat::Plain).unwrap();
+    out
+}
+
+/// Move a leading period/comma of a suffix inside a trailing closing quote
+/// when the locale enables punctuation-in-quote.
+fn move_punctuation_inside_quote(
+    children: &mut ElemChildren,
+    suffix: &mut String,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let Some(first) = suffix.chars().next() else { return };
+    if first != '.' && first != ',' {
+        return;
+    }
+    let Some(last) = last_text_mut_child(&mut children.0) else { return };
+    let Some(quote) = last.text.chars().last() else { return };
+    if !matches!(quote, '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}') {
+        return;
+    }
+    let quote_len = quote.len_utf8();
+    let at = last.text.len() - quote_len;
+    last.text.insert(at, first);
+    suffix.drain(..first.len_utf8());
+}
+
+/// Collect the rendered text of all `cs:name` elements below `e`.
+fn collect_name_text(e: &Elem, out: &mut String) {
+    if matches!(e.meta, Some(ElemMeta::Name(_, _))) {
+        out.push_str(&plain_elem(e));
+    } else {
+        for child in &e.children.0 {
+            if let ElemChild::Elem(child) = child {
+                collect_name_text(child, out);
+            }
+        }
+    }
+}
+
+/// A cite-grouping key from a names element: the names without the label, so
+/// that `Doe, John ed.` and `Doe, John` are the same author.
+fn names_key(e: &Elem) -> String {
+    let mut out = String::new();
+    collect_name_text(e, &mut out);
+    out
+}
+
+/// Fallback author string for styles whose citation layout renders no
+/// `<names>` element but still groups/collapses cites.
+fn entry_author_key<T: EntryLike>(entry: &T) -> String {
+    let author = entry.resolve_name_variable(NameVariable::Author);
+    let people = if author.is_empty() {
+        entry.resolve_name_variable(NameVariable::Editor)
+    } else {
+        author
+    };
+    let mut out = String::new();
+    for (i, person) in people.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&person.name);
+        out.push(' ');
+        if let Some(given) = &person.given_name {
+            out.push_str(given);
+        }
+    }
+    out
+}
+
+/// Recursively remove display elements that render nothing: citeproc-js does
+/// not emit an empty `csl-block`/`csl-right-inline` div.
+fn strip_empty_displays(children: &mut ElemChildren) {
+    children.0.retain_mut(|child| match child {
+        ElemChild::Elem(e) => {
+            strip_empty_displays(&mut e.children);
+            !(e.display.is_some() && !e.has_content_visible())
+        }
+        _ => true,
+    });
+}
+
+/// Compute citeproc-js's position state with note awareness.
+///
+/// Citeproc evaluates in-text (`noteIndex == 0`) and note citations as two
+/// independent sequences, considers separate citations in the same note for
+/// ibid, and suppresses cross-note ibid when the previous note held more than
+/// one citation. The initial speculative render cannot know this; the final
+/// render uses the result.
+fn apply_note_positions<T: EntryLike + PartialEq>(
+    cites: &mut [SpeculativeCiteRender<'_, '_, T>],
+) {
+    let note_numbers: Vec<Option<usize>> =
+        cites.iter().map(|c| c.request.note_number).collect();
+    // citeproc-js counts *items* (not citation clusters) per note; a note
+    // with two cites in one cluster still blocks cross-note ibid.
+    let mut note_counts: HashMap<usize, usize> = HashMap::new();
+    for (i, note) in note_numbers.iter().enumerate() {
+        if let Some(note) = note {
+            *note_counts.entry(*note).or_default() += cites[i].items.len();
+        }
+    }
+
+    for text_sequence in [true, false] {
+        let indices: Vec<usize> = (0..cites.len())
+            .filter(|&i| {
+                let note = note_numbers[i].unwrap_or(0);
+                (text_sequence && note == 0) || (!text_sequence && note != 0)
+            })
+            .collect();
+
+        let mut first_ref: HashMap<*const T, usize> = HashMap::new();
+        let mut last_ref: HashMap<*const T, usize> = HashMap::new();
+        let mut prev_citation: Option<usize> = None;
+
+        for &ci in &indices {
+            let note = note_numbers[ci].unwrap_or(0);
+            let near_distance =
+                cites[ci].request.style.citation.near_note_distance as usize;
+            let len = cites[ci].items.len();
+            for k in 0..len {
+                let entry_ptr = cites[ci].items[k].entry as *const T;
+                let locator = cites[ci].items[k].locator.clone();
+                let first = !first_ref.contains_key(&entry_ptr);
+
+                let mut position = if first {
+                    first_ref.insert(entry_ptr, note);
+                    CitePosition::First
+                } else {
+                    CitePosition::Subsequent
+                };
+
+                if !first {
+                    let mut ibidme = false;
+                    let mut prev_locator: Option<SpecificLocator<'_>> = None;
+                    if k > 0 {
+                        let prev = &cites[ci].items[k - 1];
+                        if prev.entry == cites[ci].items[k].entry {
+                            ibidme = true;
+                            prev_locator = prev.locator.clone();
+                        }
+                    } else if let Some(pi) = prev_citation {
+                        let prev_note = note_numbers[pi].unwrap_or(0);
+                        let prev_first = cites[pi].items.first();
+                        let prev_last = cites[pi].items.last();
+                        if prev_note == note {
+                            if let Some(prev) = prev_last
+                                && prev.entry == cites[ci].items[k].entry
+                            {
+                                ibidme = true;
+                                prev_locator = prev.locator.clone();
+                            }
+                        } else if note > 0
+                            && prev_note + 1 >= note
+                            && note_counts.get(&prev_note).copied().unwrap_or(0) == 1
+                            && let Some(prev) = prev_first
+                            && prev.entry == cites[ci].items[k].entry
+                        {
+                            ibidme = true;
+                            prev_locator = prev.locator.clone();
+                        } else if note == 0
+                            && let Some(prev) = prev_first
+                            && prev.entry == cites[ci].items[k].entry
+                        {
+                            // In-text cites are all in "note 0", which
+                            // citeproc treats as a single note.
+                            ibidme = true;
+                            prev_locator = prev.locator.clone();
+                        }
+                    }
+
+                    if ibidme {
+                        position = match (&prev_locator, &locator) {
+                            (None, None) => CitePosition::Ibid,
+                            (None, Some(_)) => CitePosition::IbidWithLocator,
+                            (Some(_), None) => CitePosition::Subsequent,
+                            (Some(a), Some(b)) if a == b => CitePosition::Ibid,
+                            (Some(_), Some(_)) => CitePosition::IbidWithLocator,
+                        };
+                    }
+                }
+
+                let near = if position == CitePosition::First {
+                    false
+                } else if text_sequence {
+                    true
+                } else {
+                    last_ref
+                        .get(&entry_ptr)
+                        .is_some_and(|last| note.saturating_sub(*last) <= near_distance)
+                };
+                last_ref.insert(entry_ptr, note);
+
+                let first_note = first_ref.get(&entry_ptr).copied().unwrap_or(note);
+                let item = &mut cites[ci].items[k];
+                if item.cite_props.certain.position.is_none() {
+                    item.cite_props.certain.position = Some(position);
+                }
+                if item.cite_props.certain.near_note.is_none() {
+                    item.cite_props.certain.near_note = Some(near);
+                }
+                item.cite_props.certain.first_note_number = Some(first_note);
+            }
+            prev_citation = Some(ci);
+        }
+    }
+}
+
+/// Apply citeproc-js's grouped citation sort.
+///
+/// When a citation has a sort and collapses (or declares a cite-group
+/// delimiter), conditions in an in-text style, cites are kept together by
+/// their rendered author string. The group order is the first normal sort
+/// key of the group (the internal name key when the key renders names), not
+/// the author string itself, which is why `Smith 2003; Jones 2005; Smith 2010`
+/// becomes `Smith 2003, 2010; Jones 2005`.
+fn apply_grouped_sort<'a, T: EntryLike>(
+    style: &StyleContext<'a>,
+    cite: &mut SpeculativeCiteRender<'a, '_, T>,
+    term_locale: Option<&LocaleCode>,
+) {
+    let citation = &style.csl.citation;
+    if style.csl.settings.class != StyleClass::InText
+        || (citation.collapse.is_none() && citation.cite_group_delimiter.is_none())
+    {
+        return;
+    }
+    let Some(sort) = citation.sort.as_ref() else { return };
+    let Some(first_key) = sort.keys.first() else { return };
+
+    // (authorstring, group-first-key, original item)
+    let mut entries: Vec<(String, String, bool, SpeculativeItemRender<'a, T>)> = cite
+        .items
+        .drain(..)
+        .map(|item| {
+            let authorstring = item
+                .rendered
+                .find_names()
+                .map(names_key)
+                .unwrap_or_else(|| entry_author_key(item.entry));
+            let authorstring =
+                crate::csl::sort::normalize_name_sort_key_public(&authorstring);
+            let citation_item = CitationItem::with_entry(item.entry);
+            let group_key = style.group_sort_key(
+                &citation_item,
+                item.cite_props.speculative.citation_number,
+                first_key,
+                term_locale,
+            );
+            let (group_key, is_name_key) = group_key;
+            (authorstring, group_key, is_name_key, item)
+        })
+        .collect();
+
+    // First group by author string, preserving the normal-key order within a
+    // group from the sort that already happened.
+    entries.sort_by(|a, b| style.compare_sort_strings(&a.0, &b.0));
+
+    // Replace each authorstring with the first normal key of its group plus
+    // the item's position, so groups are ordered by that key.
+    let mut start = 0;
+    while start < entries.len() {
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].0 == entries[start].0 {
+            end += 1;
+        }
+        let base = if entries[start].2 {
+            entries[start].1.split_whitespace().collect::<String>()
+        } else {
+            entries[start].1.clone()
+        };
+        for idx in start..end {
+            entries[idx].0 = format!("{base}{idx}");
+        }
+        start = end;
+    }
+    entries.sort_by(|a, b| style.compare_sort_strings(&a.0, &b.0));
+
+    cite.items = entries.into_iter().map(|(_, _, _, item)| item).collect();
+}
+
 fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>) {
     let style = &cite.request.style;
 
@@ -1651,7 +2023,17 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
     // declared; without it the layout delimiter joins cites (citeproc-js:
     // `collapse_YearSuffixCollapseNoYearSuffixDelimiter`,
     // `disambiguate_YearCollapseWithInstitution`).
-    let group_delimiter = style.citation.cite_group_delimiter.as_deref();
+    let group_delimiter = style.citation.cite_group_delimiter.as_deref().or(
+        // For in-text collapses citeproc-js joins the cites of one author
+        // group with a comma (its default `splice_delimiter`), not with the
+        // citation layout delimiter.
+        (style.settings.class == StyleClass::InText
+            && matches!(
+                style.citation.collapse,
+                Some(Collapse::Year | Collapse::YearSuffix | Collapse::YearSuffixRanged)
+            ))
+        .then_some(", "),
+    );
     let year_suffix_delimiter = style
         .citation
         .year_suffix_delimiter
@@ -1698,7 +2080,12 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                     // Item must be borrowed in this block only because it
                     // cannot be mutably borrowed below otherwise.
                     let item = &cite.items[i];
+                    // citeproc-js only collapses citation numbers for cites
+                    // without locators: with a locator on every cite, a
+                    // range would swallow the locators (`32–3, 32` instead of
+                    // three separate cites).
                     if item.hidden
+                        || item.locator.is_some()
                         || item.rendered.find_meta(&ElemMeta::CitationNumber).is_none()
                     {
                         end_range(&mut cite.items, &mut range_start, &mut just_collapsed);
@@ -1884,7 +2271,27 @@ fn substitute_subsequent_authors(
                                 names.children.0.push(c);
                             }
                         }
-                        _ => names.children.0.push(child),
+                        // Name-joining text (` and `, `, `) disappears with
+                        // the names; labels stay, which is why `Doe ed.`
+                        // becomes `--- ed.`.
+                        ElemChild::Text(text) => {
+                            let trimmed =
+                                text.text.trim().trim_matches([',', ';']).trim();
+                            if !matches!(
+                                trimmed,
+                                "" | "and"
+                                    | "&"
+                                    | "et"
+                                    | "y"
+                                    | "und"
+                                    | "et al."
+                                    | "et al"
+                                    | "and others"
+                            ) {
+                                names.children.0.push(ElemChild::Text(text));
+                            }
+                        }
+                        other => names.children.0.push(other),
                     }
                 }
             }
@@ -1933,10 +2340,8 @@ fn substitute_subsequent_authors(
         }
 
         fn replace_each(names: &mut Elem, subs: &Formatted) {
-            let old_children = std::mem::replace(
-                &mut names.children,
-                ElemChildren(vec![ElemChild::Text(subs.clone())]),
-            );
+            let old_children =
+                std::mem::replace(&mut names.children, ElemChildren(Vec::new()));
             for child in old_children.0 {
                 match child {
                     ElemChild::Elem(e) => {
@@ -1960,10 +2365,8 @@ fn substitute_subsequent_authors(
         }
 
         fn replace_first_n(mut num: usize, names: &mut Elem, subs: &Formatted) {
-            let old_children = std::mem::replace(
-                &mut names.children,
-                ElemChildren(vec![ElemChild::Text(subs.clone())]),
-            );
+            let old_children =
+                std::mem::replace(&mut names.children, ElemChildren(Vec::new()));
             for child in old_children.0.into_iter() {
                 if num == 0 {
                     break;
@@ -1981,7 +2384,7 @@ fn substitute_subsequent_authors(
             }
         }
 
-        fn num_of_matches(ns1: &[Elem], ns2: &[Elem]) -> usize {
+        fn num_of_matches(ns1: &[String], ns2: &[String]) -> usize {
             ns1.iter().zip(ns2.iter()).take_while(|(a, b)| a == b).count()
         }
 
@@ -1994,11 +2397,15 @@ fn substitute_subsequent_authors(
             };
             let mut xnames = Vec::new();
             get_names(names_elem, &mut xnames);
+            // Compare the names themselves, not their roles or a label:
+            // `editor` and `author` with the same person must match, and a
+            // name label (`ed.`) is not part of the name.
+            let xkeys: Vec<String> = xnames.iter().map(plain_elem).collect();
             let (lnames_elem, lnames) = if let Some(ns) = &last_names {
                 ns
             } else {
                 // No previous name; nothing to replace. Save and skip
-                last_names = Some((names_elem.clone(), xnames));
+                last_names = Some((names_elem.clone(), xkeys));
                 continue;
             };
             if xnames.is_empty() {
@@ -2006,39 +2413,39 @@ fn substitute_subsequent_authors(
             }
             match rule {
                 SubsequentAuthorSubstituteRule::CompleteAll => {
-                    if lnames == &xnames
+                    if lnames == &xkeys
                         && (!xnames.is_empty() || names_elem == lnames_elem)
                     {
                         let names = ec.find_names_mut().unwrap();
                         replace_all(names, xnames.is_empty(), &subs);
                     } else {
-                        last_names = Some((names_elem.clone(), xnames.clone()));
+                        last_names = Some((names_elem.clone(), xkeys.clone()));
                     }
                 }
                 SubsequentAuthorSubstituteRule::CompleteEach => {
-                    if lnames == &xnames {
+                    if lnames == &xkeys {
                         let names = ec.find_names_mut().unwrap();
                         replace_each(names, &subs);
                     } else {
-                        last_names = Some((names_elem.clone(), xnames.clone()));
+                        last_names = Some((names_elem.clone(), xkeys.clone()));
                     }
                 }
                 SubsequentAuthorSubstituteRule::PartialEach => {
-                    let nom = num_of_matches(&xnames, lnames);
+                    let nom = num_of_matches(&xkeys, lnames);
                     if nom > 0 {
                         let names = ec.find_names_mut().unwrap();
                         replace_first_n(nom, names, &subs);
                     } else {
-                        last_names = Some((names_elem.clone(), xnames.clone()));
+                        last_names = Some((names_elem.clone(), xkeys.clone()));
                     }
                 }
                 SubsequentAuthorSubstituteRule::PartialFirst => {
-                    let nom = num_of_matches(&xnames, lnames);
+                    let nom = num_of_matches(&xkeys, lnames);
                     if nom > 0 {
                         let names = ec.find_names_mut().unwrap();
                         replace_first_n(1, names, &subs);
                     } else {
-                        last_names = Some((names_elem.clone(), xnames.clone()));
+                        last_names = Some((names_elem.clone(), xkeys.clone()));
                     }
                 }
             }
@@ -2228,6 +2635,7 @@ impl<'a> StyleContext<'a> {
             writing: WritingContext::new(self.csl.settings.options.clone()),
             bibliography,
             cite_prefix,
+            saw_names: false,
         }
     }
 
@@ -2252,6 +2660,7 @@ impl<'a> StyleContext<'a> {
             writing: WritingContext::new(self.csl.settings.options.clone()),
             bibliography,
             cite_prefix: None,
+            saw_names: false,
         }
     }
 
@@ -2522,7 +2931,7 @@ impl<'a> StyleContext<'a> {
         let ambient = *ctx.writing.formatting();
         let affix_loc = ctx.apply_prefix(&affixes, ambient);
         layout.render(&mut ctx);
-        ctx.apply_suffix(&affixes, affix_loc, ambient);
+        ctx.apply_bibliography_suffix(&affixes, affix_loc, ambient);
 
         Some(ctx)
     }
@@ -3314,6 +3723,9 @@ pub(crate) struct Context<'a, T: EntryLike> {
     /// The literal prefix of the citation item being rendered, if any. Used
     /// to decide whether a leading term starts a new sentence.
     cite_prefix: Option<&'a str>,
+    /// Whether a `cs:names` element rendered in this context. Sort-key
+    /// rendering uses it to build structured name keys.
+    pub(crate) saw_names: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3608,8 +4020,33 @@ impl<'a, T: EntryLike> Context<'a, T> {
     fn should_capitalize_term(&self) -> bool {
         !self.bibliography
             && self.style.csl.settings.class == StyleClass::Note
-            && self.instance.cite_props.certain.initial_idx == 0
-            && self.cite_prefix.is_none_or(prefix_starts_sentence)
+            && (self.cite_prefix.is_some_and(prefix_starts_sentence)
+                || (self.instance.cite_props.certain.initial_idx == 0
+                    && self.cite_prefix.is_none_or(prefix_starts_sentence)))
+    }
+
+    /// Whether the text already written ends a sentence (ignoring trailing
+    /// whitespace and closing quotation marks): a term after an item prefix
+    /// like `. He said “Please work.” ` starts a new sentence.
+    fn last_text_ends_sentence(&self) -> bool {
+        let mut text = self.writing.buf.as_string().to_string();
+        if text.is_empty() {
+            let mut children = self.writing.elem_stack.last().clone();
+            if let Some(last) = last_text_mut_child(&mut children.0) {
+                text = last.text.clone();
+            }
+        }
+        let mut chars = text.chars().rev().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_whitespace() {
+                continue;
+            }
+            if matches!(c, '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}') {
+                continue;
+            }
+            return matches!(c, '.' | '!' | '?');
+        }
+        false
     }
 
     /// Push a format on top of the stack if it is not empty.
@@ -3982,11 +4419,80 @@ impl<'a, T: EntryLike> Context<'a, T> {
     }
 
     /// Get a term from the style.
+    /// The raw locator string, when the cite carries a string locator.
+    fn locator_string(&self) -> Option<&str> {
+        match &self.instance.cite_props.speculative.locator.as_ref()?.1 {
+            LocatorPayload::Str(s) => Some(s),
+            LocatorPayload::Transparent(_) => None,
+        }
+    }
+
+    /// The locator label, taking a label embedded at the start of the
+    /// locator string into account (`vol. 1` with the default `page` label is
+    /// a volume locator).
+    fn effective_locator_label(&self) -> Option<Locator> {
+        let locator = &self.instance.cite_props.speculative.locator.as_ref()?.0;
+        if *locator == Locator::Page
+            && let Some(s) = self.locator_string()
+            && let Some((label, _)) = split_embedded_locator_label(s)
+        {
+            return Some(label);
+        }
+        Some(*locator)
+    }
+
+    /// The locator string without an embedded leading label.
+    fn locator_display_text(&self) -> Option<&str> {
+        let s = self.locator_string()?;
+        let original = &self.instance.cite_props.speculative.locator.as_ref()?.0;
+        if *original == Locator::Page
+            && let Some((_, rest)) = split_embedded_locator_label(s)
+        {
+            return Some(rest);
+        }
+        Some(s)
+    }
+
+    /// Whether the locator label is a page label.
+    fn locator_is_page(&self) -> bool {
+        self.effective_locator_label() == Some(Locator::Page)
+    }
+
+    /// citeproc-js's contextual pluralization for a locator string.
+    fn locator_is_plural(&self) -> bool {
+        let Some(s) = self.locator_string() else { return false };
+        let effective = self.effective_locator_label();
+        let text = self.locator_display_text().unwrap_or(s);
+        if effective == Some(Locator::Page) {
+            return page_string_is_plural(text, self);
+        }
+        crate::csl::rendering::string_has_numeric_range(text)
+    }
+
+    /// Render locator text with embedded-label stripping, page-range
+    /// formatting and citeproc's ampersand localization.
+    fn push_locator_text(&mut self, fallback: &str) {
+        let text = self.locator_display_text().unwrap_or(fallback).trim().to_string();
+        let localized_and = self
+            .term(Term::Other(OtherTerm::And), TermForm::Long, false)
+            .unwrap_or("and")
+            .to_string();
+        let symbol_and = self
+            .term(Term::Other(OtherTerm::And), TermForm::Symbol, false)
+            .unwrap_or("&")
+            .to_string();
+        let amp = if localized_and == symbol_and { "&".to_string() } else { symbol_and };
+        let text = format_page_string(&text, self, self.locator_is_page());
+        let text =
+            if amp != "&" { text.replace(" & ", &format!(" {amp} ")) } else { text };
+        self.push_str(&text);
+    }
+
     fn term(&self, mut term: Term, form: TermForm, plural: bool) -> Option<&'a str> {
         if term == Term::NumberVariable(csl_taxonomy::NumberVariable::Locator)
-            && let Some(locator) = &self.instance.cite_props.speculative.locator
+            && let Some(locator) = self.effective_locator_label()
         {
-            term = locator.0.into();
+            term = locator.into();
         }
 
         let mut form = Some(form);
@@ -4247,6 +4753,47 @@ impl<'a, T: EntryLike> Context<'a, T> {
     ///
     /// `ambient` is the formatting that was in effect before the element's
     /// own formatting was applied.
+    /// Apply the bibliography layout suffix. citeproc-js migrates trailing
+    /// layout punctuation into the last display block (`second-field-align`
+    /// right-inline or `display` block), so the period belongs to that div.
+    fn apply_bibliography_suffix(
+        &mut self,
+        affixes: &Affixes,
+        loc: (DisplayLoc, usize),
+        ambient: Formatting,
+    ) {
+        if let Some(suffix) = &affixes.suffix {
+            self.writing.save_to_block();
+            let last_display =
+                self.writing.elem_stack.last_mut().0.last_mut().and_then(|child| {
+                    match child {
+                        ElemChild::Elem(e) if e.display.is_some() => Some(e),
+                        _ => None,
+                    }
+                });
+            if let Some(elem) = last_display {
+                let mut current = String::new();
+                for child in &elem.children.0 {
+                    if let ElemChild::Text(t) = child {
+                        current.push_str(&t.text);
+                    }
+                }
+                let mut suffix = suffix.clone();
+                move_punctuation_inside_quote(
+                    &mut elem.children,
+                    &mut suffix,
+                    self.style.punctuation_in_quotes(),
+                );
+                if !suffix.is_empty() && !current.ends_with(suffix.as_str()) {
+                    elem.children.0.push(ElemChild::Text(ambient.add_text(suffix)));
+                }
+                self.commit_elem(loc.0, None, None);
+                return;
+            }
+        }
+        self.apply_suffix(affixes, loc, ambient);
+    }
+
     fn apply_suffix(
         &mut self,
         affixes: &Affixes,
@@ -4266,6 +4813,14 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 };
 
                 if do_suffix {
+                    if self.style.punctuation_in_quotes()
+                        && suffix.starts_with(['.', ',', '!', '?'])
+                        && self.last_char().is_some_and(|c| {
+                            matches!(c, '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}')
+                        })
+                    {
+                        self.writing.pull_punctuation = true;
+                    }
                     self.push_affix_str(suffix, ambient);
                 }
             }
@@ -5432,7 +5987,7 @@ mod tests {
 
         assert_eq!(c1, "(Same Org, n.d.-a)");
         assert_eq!(c2, "(Same Org, n.d.-b)");
-        assert_eq!(c3, "(Same Org, n.d.-a; n.d.-b)");
+        assert_eq!(c3, "(Same Org, n.d.-a, n.d.-b)");
     }
 
     #[test]
@@ -5894,6 +6449,8 @@ mod tests {
             suffix: None,
             alias: None,
             comma_suffix: false,
+            literal_family: false,
+            non_dropping_particle: None,
         };
         registry.register(&person("Oblinger", "Dan Gerry"));
         registry.register(&person("Oblinger", "Susan Mary"));
