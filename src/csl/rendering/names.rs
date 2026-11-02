@@ -646,18 +646,20 @@ impl RenderCsl for Names {
 
         let visible = !is_empty || substitute_info.0;
 
-        (
-            visible,
-            if is_empty {
-                substitute_info.1
-            } else {
-                UsageInfo {
-                    has_vars: true,
-                    has_non_empty_vars: !is_empty,
-                    ..UsageInfo::default()
-                }
-            },
-        )
+        // A `cs:names` element always queries name variables. Report that
+        // even when it renders nothing (no names and no substitute): the
+        // enclosing macro/group must see a failed variable so it suppresses
+        // its literal-only output, as citeproc-js does
+        // (`bugreports_DemoPageFullCiteCruftOnSubsequent`).
+        let mut info = if is_empty {
+            substitute_info.1
+        } else {
+            UsageInfo { has_non_empty_vars: true, ..UsageInfo::default() }
+        };
+        info.has_vars = true;
+        info.has_non_empty_vars |= visible;
+
+        (visible, info)
     }
 }
 
