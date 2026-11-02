@@ -1,0 +1,58 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+[Jean] (de La Fontaine III)
+[Gerard] (van der Meer)
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout delimiter="; ">
+      <names variable="author">
+        <name>
+          <name-part name="given" prefix="[" suffix="]"/>
+          <name-part name="family" prefix="(" suffix=")"/>
+        </name>
+      </names>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[[{ "id": "ITEM-1" }], [{ "id": "ITEM-2" }]]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  {
+    "id": "ITEM-1",
+    "type": "book",
+    "author": [{
+      "dropping-particle": "de",
+      "family": "Fontaine",
+      "given": "Jean",
+      "non-dropping-particle": "La",
+      "suffix": "III"
+    }]
+  },
+  {
+    "id": "ITEM-2",
+    "type": "book",
+    "author": [{
+      "dropping-particle": "van",
+      "family": "Meer",
+      "given": "Gerard",
+      "non-dropping-particle": "der"
+    }]
+  }
+]
+<<===== INPUT =====<<

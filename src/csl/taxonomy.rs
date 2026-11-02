@@ -37,6 +37,11 @@ pub trait EntryLike {
     fn resolve_date_variable(&self, variable: DateVariable) -> Option<Cow<'_, Date>>;
     fn matches_entry_type(&self, kind: taxonomy::Kind) -> bool;
     fn is_english(&self) -> Option<bool>;
+    /// The item's IETF language tag, when it has one. Used for locale-aware
+    /// case transforms (Turkish/Azeri dotted i).
+    fn language(&self) -> Option<Cow<'_, str>> {
+        None
+    }
     fn key(&self) -> Cow<'_, str>;
 }
 
@@ -144,6 +149,10 @@ impl<'a> NumberVariableResult<'a> {
 }
 
 impl EntryLike for Entry {
+    fn language(&self) -> Option<Cow<'_, str>> {
+        self.language.as_ref().map(|language| Cow::Owned(language.to_string()))
+    }
+
     fn key(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.key())
     }
@@ -743,6 +752,69 @@ fn resolve_csl_json_standard_variable(
 }
 
 #[cfg(feature = "csl-json")]
+/// Split a citation-processing suffix out of a CSL-JSON `given` field.
+///
+/// citeproc-js's name parsing (`CSL.parseParticles`' `parseSuffix`) treats a
+/// comma in the given name as the start of a suffix: `"John, III"` is given
+/// `"John"` plus suffix `"III"`, and `"John,! Jr."` additionally marks that a
+/// comma should separate the suffix when it is appended.
+/// citeproc-js's `_parseName`: a family name wrapped in double quotes is
+/// literal and must not be particle-parsed; the quotes are removed.
+fn unquote_family(family: &str) -> String {
+    if family.len() >= 2 && family.starts_with('"') && family.ends_with('"') {
+        family[1..family.len() - 1].to_string()
+    } else {
+        family.to_string()
+    }
+}
+
+fn split_given_suffix(
+    given: Option<&str>,
+    suffix: Option<&str>,
+    comma_suffix: bool,
+) -> (Option<String>, Option<String>, bool) {
+    if suffix.is_some() {
+        return (given.map(str::to_string), suffix.map(str::to_string), comma_suffix);
+    }
+    let Some(given) = given else {
+        return (None, None, comma_suffix);
+    };
+
+    // Mirrors `/(\s*,!*\s*)/`: whitespace, a comma, optional `!`, whitespace.
+    let bytes = given.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b',' {
+            let mut start = i;
+            while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+                start -= 1;
+            }
+            let mut end = i + 1;
+            while bytes.get(end) == Some(&b'!') {
+                end += 1;
+            }
+            while bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
+                end += 1;
+            }
+
+            let separator = &given[start..end];
+            let comma = separator.chars().filter(|c| !c.is_whitespace()).count() == 2;
+            let rest = &given[end..];
+            if !rest.is_empty() {
+                return (
+                    Some(given[..start].to_string()),
+                    Some(rest.to_string()),
+                    comma_suffix || comma,
+                );
+            }
+            break;
+        }
+        i += 1;
+    }
+
+    (Some(given.to_string()), None, comma_suffix)
+}
+
 impl EntryLike for citationberg::json::Item {
     fn resolve_standard_variable(
         &self,
@@ -822,14 +894,21 @@ impl EntryLike for citationberg::json::Item {
                             dropping_particle: None,
                             suffix,
                             comma_suffix,
-                        }) => Person {
-                            name: family.clone(),
-                            prefix: None,
-                            suffix: suffix.clone(),
-                            given_name: given.clone(),
-                            alias: None,
-                            comma_suffix: comma_suffix.unwrap_or_default(),
-                        },
+                        }) => {
+                            let (given, suffix, comma_suffix) = split_given_suffix(
+                                given.as_deref(),
+                                suffix.as_deref(),
+                                comma_suffix.unwrap_or_default(),
+                            );
+                            Person {
+                                name: unquote_family(family),
+                                prefix: None,
+                                suffix,
+                                given_name: given,
+                                alias: None,
+                                comma_suffix,
+                            }
+                        }
                         csl_json::NameValue::Item(csl_json::NameItem {
                             family,
                             given,
@@ -837,18 +916,25 @@ impl EntryLike for citationberg::json::Item {
                             dropping_particle,
                             suffix,
                             comma_suffix,
-                        }) => Person {
-                            name: if let Some(non_drop) = non_dropping_particle {
-                                format!("{non_drop} {family}")
-                            } else {
-                                family.clone()
-                            },
-                            prefix: dropping_particle.clone(),
-                            suffix: suffix.clone(),
-                            given_name: given.clone(),
-                            alias: None,
-                            comma_suffix: comma_suffix.unwrap_or_default(),
-                        },
+                        }) => {
+                            let (given, suffix, comma_suffix) = split_given_suffix(
+                                given.as_deref(),
+                                suffix.as_deref(),
+                                comma_suffix.unwrap_or_default(),
+                            );
+                            Person {
+                                name: if let Some(non_drop) = non_dropping_particle {
+                                    format!("{non_drop} {}", unquote_family(family))
+                                } else {
+                                    unquote_family(family)
+                                },
+                                prefix: dropping_particle.clone(),
+                                suffix,
+                                given_name: given,
+                                alias: None,
+                                comma_suffix,
+                            }
+                        }
                     })
                 })
                 .collect(),
@@ -924,6 +1010,13 @@ impl EntryLike for citationberg::json::Item {
             .get("language")
             .and_then(|l| l.to_str())
             .map(|l| l.starts_with("en"))
+    }
+
+    fn language(&self) -> Option<Cow<'_, str>> {
+        self.0
+            .get("language")
+            .and_then(|l| l.to_str())
+            .map(|l| Cow::Owned(l.to_string()))
     }
 
     fn key(&self) -> Cow<'_, str> {

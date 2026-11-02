@@ -375,7 +375,16 @@ impl RenderCsl for Names {
             };
 
             if i > 0 {
-                let delim = self.delimiter(ctx.writing.name_options.last());
+                let opts = ctx.writing.name_options.last();
+                // citationberg resolves the delimiter between name elements
+                // from `name-delimiter`; CSL 1.0.2 inherits `names-delimiter`
+                // for `cs:names` (style/citation/bibliography level).
+                let explicit = self.delimiter(opts);
+                let delim = if explicit.is_empty() {
+                    opts.names_delimiter.as_deref().unwrap_or_default()
+                } else {
+                    explicit
+                };
                 if !delim.is_empty() {
                     let delim = delim.to_string();
                     ctx.push_str(&delim);
@@ -535,6 +544,11 @@ fn add_names<T: EntryLike>(
         .flatten();
     let mut last_inverted = false;
 
+    // Affixes declared on `cs:name` surround the rendered name list (and not
+    // the name label, which is a sibling child of `cs:names`).
+    let ambient = *ctx.writing.formatting();
+    let affix_loc = ctx.apply_prefix(&cs_name.to_affixes(), ambient);
+
     let demote_non_dropping = match ctx.style.csl.settings.demote_non_dropping_particle {
         DemoteNonDroppingParticle::Never => false,
         DemoteNonDroppingParticle::SortOnly => ctx.instance.sorting.is_some(),
@@ -566,14 +580,22 @@ fn add_names<T: EntryLike>(
             match delim {
                 EndDelim::Delim => ctx.push_str(name_opts.delimiter),
                 EndDelim::And(and) => {
-                    ctx.push_str(" ");
-                    ctx.push_str(match and {
+                    let term = match and {
                         NameAnd::Text => ctx
                             .term(Term::Other(OtherTerm::And), TermForm::default(), false)
                             .unwrap_or_default(),
                         NameAnd::Symbol => "&",
-                    });
-                    ctx.ensure_space();
+                    };
+                    // citeproc-js only surrounds the `and` term with spaces
+                    // when it starts with a Romanesque character (e.g. the
+                    // Hebrew `ו` is joined to both names: `תפוחו תפוז`).
+                    if starts_with_romanesque(term) {
+                        ctx.push_str(" ");
+                        ctx.push_str(term);
+                        ctx.ensure_space();
+                    } else {
+                        ctx.push_str(term);
+                    }
                 }
                 EndDelim::DelimAnd(and) => {
                     ctx.push_str(name_opts.delimiter);
@@ -610,7 +632,10 @@ fn add_names<T: EntryLike>(
         );
         ctx.commit_elem(scope, None, None);
 
-        last_inverted = reverse;
+        // Only a name that is actually rendered family-first counts as
+        // inverted for `delimiter-precedes-last="after-inverted-name"`.
+        last_inverted =
+            reverse && !name.is_institutional() && !name.is_cjk() && name.given_name.is_some();
         first = false;
     }
 
@@ -661,6 +686,8 @@ fn add_names<T: EntryLike>(
             ctx.pop_format(idx);
         }
     }
+
+    ctx.apply_suffix(&cs_name.to_affixes(), affix_loc, ambient);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,6 +862,21 @@ fn write_name<T: EntryLike>(
 
     let elem_idx = ctx.push_elem(citationberg::Formatting::default());
     match (form.is_long(), reverse, demote_non_dropping) {
+        // A name with only a given name is printed verbatim (no
+        // initialization): citeproc-js keeps `Banksy` as `Banksy`.
+        (_, _, _) if name.name.is_empty() && name.given_name.is_some() => {
+            let idx = ctx.push_format(first_format);
+            let cidx = ctx.push_case(first_case);
+            if let Some(prefix) = first_affixes[0] {
+                ctx.push_str(prefix);
+            }
+            ctx.push_str(name.given_name.as_deref().unwrap_or_default());
+            ctx.pop_case(cidx);
+            ctx.pop_format(idx);
+            if let Some(suffix) = first_affixes[1] {
+                ctx.push_str(suffix);
+            }
+        }
         _ if name.is_institutional() && ctx.instance.sorting.is_some() => {
             let idx = ctx.push_format(family_format);
             let cidx = ctx.push_case(family_case);
@@ -883,10 +925,6 @@ fn write_name<T: EntryLike>(
             }
 
             first_name(ctx);
-            if let Some(prefix) = &name.prefix {
-                ctx.ensure_space();
-                ctx.push_str(prefix);
-            }
 
             ctx.pop_format(idx);
             ctx.pop_case(cidx);
@@ -897,12 +935,21 @@ fn write_name<T: EntryLike>(
 
             ctx.ensure_space();
             let idx = ctx.push_format(family_format);
-            let cidx = ctx.push_case(family_case);
 
             if let Some(prefix) = family_affixes[0] {
                 ctx.push_str(prefix);
             }
 
+            // The dropping particle is part of the family name part (citeproc-js
+            // name-part affixes wrap it: `[Jean] (de La Fontaine III)`), but
+            // `name-part` text-case only applies to the family name itself, so
+            // the particle keeps its case (`van DER MEER`).
+            if let Some(prefix) = &name.prefix {
+                ctx.push_str(prefix);
+                ctx.ensure_space();
+            }
+
+            let cidx = ctx.push_case(family_case);
             ctx.push_str(&name.name);
 
             ctx.pop_case(cidx);
