@@ -554,7 +554,6 @@ impl RenderCsl for citationberg::Number {
     }
 }
 
-
 /// One component of a non-pure numeric field (`"7, p. 3-8"`).
 struct NumberFieldPart {
     /// Whether the component is preceded by an embedded `p.`/`pp.` label.
@@ -601,10 +600,7 @@ fn render_number_field_string<T: EntryLike>(
     // A plain comma-separated page list inherits the label it follows
     // (`p. 3, 5`); citeproc-js keeps the current label until a new one starts.
     for i in 1..parts.len() {
-        if !parts[i].page_label
-            && parts[i - 1].page_label
-            && !parts[i].value.is_empty()
-        {
+        if !parts[i].page_label && parts[i - 1].page_label && !parts[i].value.is_empty() {
             parts[i].page_label = true;
         }
     }
@@ -625,7 +621,9 @@ fn render_number_field_string<T: EntryLike>(
             let previous = &parts[i - 1];
             let previous_is_page = previous.page_label;
             let is_page = part.page_label;
-            if is_page && previous_is_page && (previous.join == "–" || previous.join == "-")
+            if is_page
+                && previous_is_page
+                && (previous.join == "–" || previous.join == "-")
             {
                 ctx.push_str(&range_delim);
             } else {
@@ -636,12 +634,7 @@ fn render_number_field_string<T: EntryLike>(
         // The label is printed once per run, in the short form
         // (`p.`/`pp.`), pluralized when the run holds several values.
         if part.page_label && previous_page != Some(true) {
-            let plural = parts
-                .iter()
-                .skip(i)
-                .take_while(|p| p.page_label)
-                .count()
-                > 1;
+            let plural = parts.iter().skip(i).take_while(|p| p.page_label).count() > 1;
             if let Some(label) = ctx.term(
                 Term::from(NumberOrPageVariable::Page(PageVariable::Page)),
                 TermForm::Short,
@@ -707,7 +700,9 @@ fn is_numeric_range_at(s: &str, i: usize) -> bool {
     let after = match s.as_bytes()[i] {
         b'-' => s[i + 1..].trim_start().chars().next(),
         // U+2013 is three UTF-8 bytes; the byte check only screens candidates.
-        0xe2 if s[i..].starts_with('–') => s[i + '–'.len_utf8()..].trim_start().chars().next(),
+        0xe2 if s[i..].starts_with('–') => {
+            s[i + '–'.len_utf8()..].trim_start().chars().next()
+        }
         _ => None,
     };
     before.is_some_and(|c| c.is_ascii_digit())

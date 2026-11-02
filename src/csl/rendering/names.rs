@@ -305,17 +305,6 @@ fn apply_name_registry(
     }
 }
 
-/// Print the family name with an explicit non-dropping particle in front.
-fn push_family_name<T: EntryLike>(ctx: &mut Context<T>, person: &Person) {
-    if let Some(particle) = &person.non_dropping_particle {
-        ctx.push_str(particle);
-        if !particle.ends_with('\'') && !particle.ends_with('\u{2019}') {
-            ctx.ensure_space();
-        }
-    }
-    ctx.push_str(&person.name);
-}
-
 impl RenderCsl for Names {
     fn render<T: EntryLike>(&self, ctx: &mut Context<T>) {
         ctx.saw_names = true;
@@ -443,7 +432,12 @@ impl RenderCsl for Names {
                             if options.is_suppressed(
                                 i,
                                 p.len(),
-                                !ctx.instance.cite_props.certain.is_first_position(),
+                                ctx.instance.sorting.is_none()
+                                    && !ctx
+                                        .instance
+                                        .cite_props
+                                        .certain
+                                        .is_first_position(),
                             ) {
                                 0
                             } else {
@@ -486,7 +480,12 @@ impl RenderCsl for Names {
                             if options.is_suppressed(
                                 i,
                                 p.len(),
-                                !ctx.instance.cite_props.certain.is_first_position(),
+                                ctx.instance.sorting.is_none()
+                                    && !ctx
+                                        .instance
+                                        .cite_props
+                                        .certain
+                                        .is_first_position(),
                             ) {
                                 None
                             } else {
@@ -864,6 +863,38 @@ fn add_names<T: EntryLike>(
     ctx.apply_suffix(&cs_name.to_affixes(), affix_loc, ambient);
 }
 
+/// Write one name part inside its own formatting/case scope.
+///
+/// citeproc-js gives every name token (given, family, dropping particle,
+/// non-dropping particle) its own formatting blob; the spaces that join them
+/// are written outside the scopes, which is why a small-caps family name
+/// renders as separate `<span>`s with plain spaces between them.
+fn push_scoped_part<T: EntryLike, F: FnOnce(&mut Context<T>)>(
+    ctx: &mut Context<T>,
+    format: citationberg::Formatting,
+    case: Option<citationberg::TextCase>,
+    write: F,
+) {
+    let loc = ctx.push_scoped_elem(format);
+    let cidx = ctx.push_case(case);
+    write(ctx);
+    ctx.pop_case(cidx);
+    ctx.commit_elem(loc, None, None);
+}
+
+/// Separator between a non-dropping particle and the family name.
+///
+/// citeproc-js's `hasJoiningPunctuation`: an apostrophe, hyphen or kept
+/// trailing space joins without an extra space (`d’Aubignac`, `van-der-Berg`,
+/// `boven d' `); everything else gets one (`van der Berg`).
+fn particle_family_separator(particle: Option<&str>) -> &'static str {
+    match particle {
+        Some(p) if p.ends_with(['\'', '\u{2019}', '-', ' ']) => "",
+        Some(_) => " ",
+        None => "",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_name<T: EntryLike>(
     name: &Person,
@@ -879,159 +910,96 @@ fn write_name<T: EntryLike>(
     let hyphen_init = ctx.style.csl.settings.initialize_with_hyphen;
     let sort_sep = name_opts.sort_separator;
 
-    let first_part = cs_name.name_part_given();
+    let given_part = cs_name.name_part_given();
     let family_part = cs_name.name_part_family();
-    let first_format = first_part.map(|p| p.formatting).unwrap_or_default();
-    let first_case = first_part.map(|p| p.text_case).unwrap_or_default();
-    let first_affixes = [
-        first_part.map(|p| &p.affixes).and_then(|f| f.prefix.as_ref()),
-        first_part.map(|p| &p.affixes).and_then(|f| f.suffix.as_ref()),
-    ];
+    let given_format = given_part.map(|p| p.formatting).unwrap_or_default();
+    let given_case = given_part.map(|p| p.text_case).unwrap_or_default();
+    let given_affixes = citationberg::Affixes {
+        prefix: given_part.and_then(|p| p.affixes.prefix.clone()),
+        suffix: given_part.and_then(|p| p.affixes.suffix.clone()),
+    };
     let family_format = family_part.map(|p| p.formatting).unwrap_or_default();
     let family_case = family_part.map(|p| p.text_case).unwrap_or_default();
-    let family_affixes = [
-        family_part.map(|p| &p.affixes).and_then(|f| f.prefix.as_ref()),
-        family_part.map(|p| &p.affixes).and_then(|f| f.suffix.as_ref()),
-    ];
+    let family_affixes = citationberg::Affixes {
+        prefix: family_part.and_then(|p| p.affixes.prefix.clone()),
+        suffix: family_part.and_then(|p| p.affixes.suffix.clone()),
+    };
     let comma_suffix = name.comma_suffix;
+    let suffix_sep = if comma_suffix { ", " } else { " " };
+    let particle_sep = particle_family_separator(name.non_dropping_particle.as_deref());
+    let has_given = name.given_name.is_some();
 
-    let first_name = |ctx: &mut Context<T>| {
-        if let Some(first) = &name.given_name {
-            if let Some(initialize_with) = name_opts.initialize_with {
-                if form == DisambiguatedNameForm::LongInitialized {
-                    name.initials(ctx, Some(initialize_with), hyphen_init).unwrap();
-                } else if !name_opts.initialize {
-                    // `initialize="false"` still normalizes existing initials
-                    // and abbreviations (citeproc-js `doNormalize`).
-                    name.normalize_initials(ctx, Some(initialize_with), hyphen_init)
-                        .unwrap();
-                } else {
-                    // Escalated by given-name disambiguation to the full name.
-                    ctx.push_str(first);
-                }
+    // Write the given name (with initialization when the form asks for it).
+    let write_given = |ctx: &mut Context<T>| {
+        let Some(first) = &name.given_name else { return };
+        if let Some(initialize_with) = name_opts.initialize_with {
+            if form == DisambiguatedNameForm::LongInitialized {
+                name.initials(ctx, Some(initialize_with), hyphen_init).unwrap();
+            } else if !name_opts.initialize {
+                name.normalize_initials(ctx, Some(initialize_with), hyphen_init)
+                    .unwrap();
             } else {
                 ctx.push_str(first);
             }
-
-            true
         } else {
-            false
+            ctx.push_str(first);
         }
     };
 
+    let write_given_group = |ctx: &mut Context<T>, include_dropping: bool| {
+        let ambient = *ctx.writing.formatting();
+        let loc = ctx.apply_prefix(&given_affixes, ambient);
+        push_scoped_part(ctx, given_format, given_case, |ctx| write_given(ctx));
+        if include_dropping && let Some(particle) = &name.prefix {
+            ctx.push_str(" ");
+            push_scoped_part(ctx, given_format, given_case, |ctx| ctx.push_str(particle));
+        }
+        ctx.apply_suffix(&given_affixes, loc, ambient);
+    };
+
+    // In plain order citeproc-js merges an explicit dropping particle that
+    // ends in an apostrophe or hyphen into the family name (`d'` + `Jones` ->
+    // `d'Jones`) unless the particle is exactly `de'`.
+    let merge_dropping_into_family = name.non_dropping_particle.is_none()
+        && name.prefix.as_deref().is_some_and(|particle| {
+            particle.ends_with(['\'', '\u{2019}', '-'])
+                && particle.trim_end_matches(['\'', '\u{2019}', '-']) != "de"
+        });
+
+    let write_family_group = |ctx: &mut Context<T>, include_dropping: bool| {
+        let ambient = *ctx.writing.formatting();
+        let loc = ctx.apply_prefix(&family_affixes, ambient);
+        if include_dropping
+            && !merge_dropping_into_family
+            && let Some(particle) = &name.prefix
+        {
+            push_scoped_part(ctx, given_format, given_case, |ctx| ctx.push_str(particle));
+            ctx.push_str(" ");
+        }
+        if let Some(particle) = &name.non_dropping_particle {
+            push_scoped_part(ctx, family_format, family_case, |ctx| {
+                ctx.push_str(particle)
+            });
+            ctx.push_str(particle_sep);
+        }
+        if include_dropping && merge_dropping_into_family {
+            if let Some(particle) = &name.prefix {
+                push_scoped_part(ctx, family_format, family_case, |ctx| {
+                    ctx.push_str(particle)
+                });
+            }
+        }
+        push_scoped_part(ctx, family_format, family_case, |ctx| ctx.push_str(&name.name));
+        if include_dropping && let Some(suffix) = &name.suffix {
+            ctx.push_str(suffix_sep);
+            ctx.push_str(suffix);
+        }
+        ctx.apply_suffix(&family_affixes, loc, ambient);
+    };
+
+    // Short form, institutions and family-only names have no given part.
     let simple = |ctx: &mut Context<T>| {
-        let idx = ctx.push_format(family_format);
-        let cidx = ctx.push_case(family_case);
-        if let Some(prefix) = family_affixes[0] {
-            ctx.push_str(prefix);
-        }
-        push_family_name(ctx, &name);
-        ctx.pop_case(cidx);
-        ctx.pop_format(idx);
-        if let Some(suffix) = family_affixes[1] {
-            ctx.push_str(suffix);
-        }
-    };
-
-    let reverse_keep_particle = |ctx: &mut Context<T>| {
-        let idx = ctx.push_format(family_format);
-        let cidx = ctx.push_case(family_case);
-
-        if let Some(prefix) = family_affixes[0] {
-            ctx.push_str(prefix);
-        }
-
-        push_family_name(ctx, &name);
-
-        ctx.pop_case(cidx);
-        ctx.pop_format(idx);
-
-        if let Some(suffix) = family_affixes[1] {
-            ctx.push_str(suffix);
-        }
-
-        if name.given_name.is_some() {
-            ctx.push_str(sort_sep);
-
-            let idx = ctx.push_format(first_format);
-            let cidx = ctx.push_case(first_case);
-
-            if let Some(prefix) = first_affixes[0] {
-                ctx.push_str(prefix);
-            }
-
-            first_name(ctx);
-
-            if let Some(prefix) = &name.prefix {
-                ctx.ensure_space();
-                ctx.push_str(prefix);
-            }
-
-            ctx.pop_case(cidx);
-            ctx.pop_format(idx);
-
-            if let Some(suffix) = first_affixes[1] {
-                ctx.push_str(suffix);
-            }
-        }
-
-        if let Some(suffix) = &name.suffix {
-            ctx.push_str(sort_sep);
-            ctx.push_str(suffix);
-        }
-    };
-
-    let reverse_demote_particle = |ctx: &mut Context<T>| {
-        let idx = ctx.push_format(family_format);
-        let cidx = ctx.push_case(family_case);
-
-        if let Some(prefix) = family_affixes[0] {
-            ctx.push_str(prefix);
-        }
-
-        ctx.push_str(name.name_without_particle());
-
-        ctx.pop_case(cidx);
-        ctx.pop_format(idx);
-
-        if let Some(suffix) = family_affixes[1] {
-            ctx.push_str(suffix);
-        }
-
-        if name.given_name.is_some() {
-            ctx.push_str(sort_sep);
-
-            let idx = ctx.push_format(first_format);
-            let cidx = ctx.push_case(first_case);
-
-            if let Some(prefix) = first_affixes[0] {
-                ctx.push_str(prefix);
-            }
-
-            first_name(ctx);
-
-            if let Some(prefix) = &name.prefix {
-                ctx.ensure_space();
-                ctx.push_str(prefix);
-            }
-
-            ctx.pop_case(cidx);
-            ctx.pop_format(idx);
-
-            if let Some(particle) = &name.name_particle() {
-                ctx.ensure_space();
-                ctx.push_str(particle);
-            }
-
-            if let Some(suffix) = first_affixes[1] {
-                ctx.push_str(suffix);
-            }
-        }
-
-        if let Some(suffix) = &name.suffix {
-            ctx.push_str(sort_sep);
-            ctx.push_str(suffix);
-        }
+        write_family_group(ctx, false);
     };
 
     let elem_idx = ctx.push_elem(citationberg::Formatting::default());
@@ -1039,118 +1007,145 @@ fn write_name<T: EntryLike>(
         // A name with only a given name is printed verbatim (no
         // initialization): citeproc-js keeps `Banksy` as `Banksy`.
         (_, _, _) if name.name.is_empty() && name.given_name.is_some() => {
-            let idx = ctx.push_format(first_format);
-            let cidx = ctx.push_case(first_case);
-            if let Some(prefix) = first_affixes[0] {
-                ctx.push_str(prefix);
-            }
-            ctx.push_str(name.given_name.as_deref().unwrap_or_default());
-            ctx.pop_case(cidx);
-            ctx.pop_format(idx);
-            if let Some(suffix) = first_affixes[1] {
-                ctx.push_str(suffix);
-            }
+            let ambient = *ctx.writing.formatting();
+            let loc = ctx.apply_prefix(&given_affixes, ambient);
+            push_scoped_part(ctx, given_format, given_case, |ctx| {
+                ctx.push_str(name.given_name.as_deref().unwrap_or_default())
+            });
+            ctx.apply_suffix(&given_affixes, loc, ambient);
         }
         _ if name.is_institutional() && ctx.instance.sorting.is_some() => {
             let idx = ctx.push_format(family_format);
             let cidx = ctx.push_case(family_case);
-            // Institutional names sort by their full family string: a
-            // leading `A` in `A kasernes fællesvirke` is part of the name,
-            // not an article to strip.
-            push_family_name(ctx, &name);
+            ctx.push_str(&name.name);
             ctx.pop_case(cidx);
             ctx.pop_format(idx);
         }
         _ if name.is_institutional() => simple(ctx),
         (true, _, _) if name.is_cjk() => {
             let idx = ctx.push_format(family_format);
-            if let Some(prefix) = family_affixes[0] {
+            let cidx = ctx.push_case(family_case);
+            if let Some(prefix) = &family_affixes.prefix {
                 ctx.push_str(prefix);
             }
             ctx.push_str(&name.name);
+            ctx.pop_case(cidx);
             ctx.pop_format(idx);
-            if let Some(suffix) = family_affixes[1] {
+            if let Some(suffix) = &family_affixes.suffix {
                 ctx.push_str(suffix);
             }
 
             if let Some(given) = &name.given_name {
-                let idx = ctx.push_format(first_format);
-                if let Some(prefix) = first_affixes[0] {
+                let idx = ctx.push_format(given_format);
+                let cidx = ctx.push_case(given_case);
+                if let Some(prefix) = &given_affixes.prefix {
                     ctx.push_str(prefix);
                 }
-
                 ctx.push_str(given);
+                ctx.pop_case(cidx);
                 ctx.pop_format(idx);
-
-                if let Some(suffix) = first_affixes[1] {
+                if let Some(suffix) = &given_affixes.suffix {
                     ctx.push_str(suffix);
                 }
             }
         }
         // Always reverse when sorting.
-        (true, _, false) if ctx.instance.sorting.is_some() => reverse_keep_particle(ctx),
-        (true, _, true) if ctx.instance.sorting.is_some() => reverse_demote_particle(ctx),
-        (true, true, false) => reverse_keep_particle(ctx),
-        (true, true, true) => reverse_demote_particle(ctx),
-        (true, false, _) => {
-            let idx = ctx.push_format(first_format);
-            let cidx = ctx.push_case(first_case);
-
-            if let Some(prefix) = first_affixes[0] {
-                ctx.push_str(prefix);
-            }
-
-            first_name(ctx);
-
-            ctx.pop_format(idx);
-            ctx.pop_case(cidx);
-
-            if let Some(suffix) = first_affixes[1] {
-                ctx.push_str(suffix);
-            }
-
-            ctx.ensure_space();
-            let idx = ctx.push_format(family_format);
-
-            if let Some(prefix) = family_affixes[0] {
-                ctx.push_str(prefix);
-            }
-
-            // The dropping particle is part of the family name part (citeproc-js
-            // name-part affixes wrap it: `[Jean] (de La Fontaine III)`), but
-            // `name-part` text-case only applies to the family name itself, so
-            // the particle keeps its case (`van DER MEER`).
-            if let Some(prefix) = &name.prefix {
-                ctx.push_str(prefix);
-                if !prefix.ends_with('\'')
-                    && !prefix.ends_with('\u{2019}')
-                    && !prefix.ends_with('-')
-                {
-                    ctx.ensure_space();
-                }
-            }
-
-            let cidx = ctx.push_case(family_case);
-            push_family_name(ctx, &name);
-
-            ctx.pop_case(cidx);
-            ctx.pop_format(idx);
-
-            if let Some(suffix) = &name.suffix {
-                if comma_suffix {
+        (true, _, false) if ctx.instance.sorting.is_some() => {
+            write_family_group(ctx, false);
+            if has_given {
+                ctx.push_str(sort_sep);
+                write_given_group(ctx, true);
+                if let Some(suffix) = &name.suffix {
                     ctx.push_str(sort_sep);
+                    ctx.push_str(suffix);
                 }
-                ctx.ensure_space();
-                ctx.push_str(suffix);
             }
+        }
+        (true, _, true) if ctx.instance.sorting.is_some() => {
+            let ambient = *ctx.writing.formatting();
+            let loc = ctx.apply_prefix(&family_affixes, ambient);
+            push_scoped_part(ctx, family_format, family_case, |ctx| {
+                ctx.push_str(&name.name)
+            });
+            ctx.apply_suffix(&family_affixes, loc, ambient);
 
-            if let Some(suffix) = family_affixes[1] {
-                ctx.push_str(suffix);
+            if has_given {
+                ctx.push_str(sort_sep);
+                let ambient = *ctx.writing.formatting();
+                let loc = ctx.apply_prefix(&given_affixes, ambient);
+                push_scoped_part(ctx, given_format, given_case, |ctx| write_given(ctx));
+                if let Some(particle) = &name.prefix {
+                    ctx.push_str(" ");
+                    push_scoped_part(ctx, given_format, given_case, |ctx| {
+                        ctx.push_str(particle)
+                    });
+                }
+                if let Some(particle) = &name.non_dropping_particle {
+                    ctx.push_str(" ");
+                    push_scoped_part(ctx, family_format, family_case, |ctx| {
+                        ctx.push_str(particle)
+                    });
+                }
+                ctx.apply_suffix(&given_affixes, loc, ambient);
+                if let Some(suffix) = &name.suffix {
+                    ctx.push_str(sort_sep);
+                    ctx.push_str(suffix);
+                }
             }
         }
-        (false, _, _) => {
-            simple(ctx);
+        (true, true, false) => {
+            write_family_group(ctx, false);
+            if has_given {
+                ctx.push_str(sort_sep);
+                write_given_group(ctx, true);
+                if let Some(suffix) = &name.suffix {
+                    ctx.push_str(sort_sep);
+                    ctx.push_str(suffix);
+                }
+            }
         }
+        (true, true, true) => {
+            let ambient = *ctx.writing.formatting();
+            let loc = ctx.apply_prefix(&family_affixes, ambient);
+            push_scoped_part(ctx, family_format, family_case, |ctx| {
+                ctx.push_str(&name.name)
+            });
+            ctx.apply_suffix(&family_affixes, loc, ambient);
+
+            if has_given {
+                ctx.push_str(sort_sep);
+                let ambient = *ctx.writing.formatting();
+                let loc = ctx.apply_prefix(&given_affixes, ambient);
+                push_scoped_part(ctx, given_format, given_case, |ctx| write_given(ctx));
+                if let Some(particle) = &name.prefix {
+                    ctx.push_str(" ");
+                    push_scoped_part(ctx, given_format, given_case, |ctx| {
+                        ctx.push_str(particle)
+                    });
+                }
+                if let Some(particle) = &name.non_dropping_particle {
+                    ctx.push_str(" ");
+                    push_scoped_part(ctx, family_format, family_case, |ctx| {
+                        ctx.push_str(particle)
+                    });
+                }
+                ctx.apply_suffix(&given_affixes, loc, ambient);
+                if let Some(suffix) = &name.suffix {
+                    ctx.push_str(sort_sep);
+                    ctx.push_str(suffix);
+                }
+            }
+        }
+        (true, false, _) => {
+            if has_given {
+                write_given_group(ctx, false);
+                if !ctx.last_char().is_some_and(|c| c == ' ' || c == '\u{a0}') {
+                    ctx.push_str(" ");
+                }
+            }
+            write_family_group(ctx, has_given);
+        }
+        (false, _, _) => simple(ctx),
     }
     ctx.commit_elem(elem_idx, None, Some(ElemMeta::Name(variable, name_idx)))
 }

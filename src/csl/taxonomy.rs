@@ -973,23 +973,170 @@ fn unquote_family(family: &str) -> String {
     }
 }
 
-/// Move a trailing lower-case particle in the given name (`François Hédelin
-/// d'`) into the dropping-particle slot, matching citeproc-js's name parser.
-fn split_given_particle(given: Option<String>) -> (Option<String>, Option<String>) {
-    let Some(given) = given else { return (None, None) };
-    let Some(idx) = given.rfind(' ') else { return (Some(given), None) };
-    let particle = &given[idx + 1..];
-    let base = &given[..idx];
-    if particle.starts_with(|c: char| c.is_lowercase())
-        && (particle.ends_with('\'') || particle.ends_with('\u{2019}'))
-        && crate::lang::name::NAME_PARTICLES
-            .binary_search(&particle.to_lowercase().as_str())
-            .is_ok()
-    {
-        (Some(base.to_string()), Some(particle.to_string()))
-    } else {
-        (Some(given), None)
+/// Split a citeproc-js name particle prefix from a family name.
+///
+/// Mirrors `CSL.parseParticles`: a particle is a run of words whose first
+/// character is lowercase, joined to the rest by a space, hyphen or
+/// apostrophe (`van der Berg`, `d'Aubignac`, `L'` is *not* a particle because
+/// its first letter is uppercase). Multi-word particles stay together and
+/// apostrophe particles keep their trailing space when the source had one.
+fn split_family_particles(family: &str) -> (&str, Option<String>) {
+    let mut rest = family;
+    let mut particles: Vec<&str> = Vec::new();
+    loop {
+        let Some((prefix, next)) = particle_prefix(rest) else { break };
+        if !prefix_starts_lowercase(prefix) {
+            break;
+        }
+        particles.push(prefix);
+        rest = next;
     }
+    let joined = particles.concat();
+    (rest, trim_particle(&joined))
+}
+
+/// The longest leading chunk of `value` that ends in a name-particle joiner
+/// (space, hyphen or apostrophe) and is followed by more text.
+///
+/// This mirrors the regular expression `^([^ ]+(?:-|ʼ|’| |') *)(.+)$`: the
+/// joiner is the rightmost one inside the first space-free word (or the first
+/// space itself), and the rest must be non-empty.
+fn particle_prefix(value: &str) -> Option<(&str, &str)> {
+    let bytes = value.as_bytes();
+    let first_space = value.find(' ');
+    let search_end = first_space.unwrap_or(value.len());
+
+    let mut joiner = None;
+    let mut i = 0;
+    while i < search_end {
+        let c = value[i..].chars().next().unwrap();
+        if matches!(c, '-' | '\'' | '\u{2019}' | '\u{02bb}') {
+            joiner = Some(i + c.len_utf8());
+        }
+        i += c.len_utf8();
+    }
+    if first_space.is_some() {
+        joiner = Some(first_space.unwrap());
+    }
+
+    let end = joiner?;
+    let mut prefix_end = end;
+    if first_space == Some(end) {
+        prefix_end += 1;
+        while prefix_end < bytes.len() && bytes[prefix_end].is_ascii_whitespace() {
+            prefix_end += 1;
+        }
+    } else {
+        while prefix_end < bytes.len() && bytes[prefix_end].is_ascii_whitespace() {
+            prefix_end += 1;
+        }
+    }
+    if prefix_end >= value.len() {
+        return None;
+    }
+    Some((&value[..prefix_end], &value[prefix_end..]))
+}
+
+/// Whether a particle candidate begins with a lowercase letter, after
+/// skipping the joining punctuation citeproc-js ignores.
+fn prefix_starts_lowercase(prefix: &str) -> bool {
+    prefix
+        .trim_start_matches(|c: char| {
+            matches!(c, '-' | '\'' | '\u{2019}' | '\u{02bb}') || c.is_whitespace()
+        })
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_uppercase())
+}
+
+/// Trim a joined particle list like citeproc-js's `trimLast`: keep a single
+/// trailing space when the particle itself ends in an apostrophe and the
+/// source had a following space (`boven d'`).
+fn trim_particle(particles: &str) -> Option<String> {
+    if particles.is_empty() {
+        return None;
+    }
+    let had_trailing_space = particles.ends_with(' ');
+    let trimmed = particles.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if had_trailing_space && (trimmed.ends_with('\'') || trimmed.ends_with('\u{2019}')) {
+        Some(format!("{trimmed} "))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Peel citeproc-js particles out of a CSL-JSON family/given pair.
+///
+/// Returns `(family, non_dropping_particle, given, dropping_particle)`.
+fn parse_csl_name_particles(
+    family: &str,
+    given: Option<String>,
+    suffix: Option<String>,
+    comma_suffix: bool,
+) -> (String, Option<String>, Option<String>, Option<String>, Option<String>, bool) {
+    let (family, non_dropping) = split_family_particles(family);
+    let (given, suffix, comma_suffix) =
+        split_given_suffix(given.as_deref(), suffix.as_deref(), comma_suffix);
+
+    let mut given = given;
+    let mut dropping = None;
+    if let Some(value) = given.take() {
+        let reversed: String = value.chars().rev().collect();
+        let mut rest = reversed.as_str();
+        let mut reversed_particles: Vec<&str> = Vec::new();
+        loop {
+            // citeproc-js's given-name regex only joins at whitespace (the
+            // quote alternatives all require a following space), so an
+            // apostrophe or hyphen inside a name is not a particle boundary
+            // (`Shun'ichi`, `Guo-ping`).
+            let Some((prefix, next)) = rest.split_once(' ') else { break };
+            let prefix_with_space = &rest[..prefix.len() + 1];
+            // The prefix is still reversed here; its forward first character
+            // is its last one.
+            let forward_prefix: String = prefix.chars().rev().collect();
+            let first = forward_prefix
+                .trim_start_matches(|c: char| {
+                    matches!(c, '-' | '\'' | '\u{2019}' | '\u{02bb}') || c.is_whitespace()
+                })
+                .chars()
+                .next();
+            if !first.is_some_and(|c| !c.is_uppercase()) {
+                break;
+            }
+            reversed_particles.push(prefix_with_space);
+            rest = next;
+        }
+        if reversed_particles.is_empty() {
+            given = Some(value);
+        } else {
+            let kept: String = rest.chars().rev().collect();
+            let mut parts: Vec<String> = reversed_particles
+                .into_iter()
+                .map(|part| part.chars().rev().collect())
+                .collect();
+            parts.reverse();
+            for i in 1..parts.len() {
+                if parts[i].starts_with(' ') {
+                    parts[i - 1].push(' ');
+                }
+            }
+            for part in &mut parts {
+                if part.starts_with(' ') {
+                    part.remove(0);
+                }
+            }
+            let particle = parts.join("").trim().to_string();
+            if !particle.is_empty() {
+                dropping = Some(particle);
+            }
+            given = Some(kept);
+        }
+    }
+
+    (family.to_string(), non_dropping, given, dropping, suffix, comma_suffix)
 }
 
 fn split_given_suffix(
@@ -1201,18 +1348,43 @@ impl EntryLike for citationberg::json::Item {
                                 comma_suffix.unwrap_or_default(),
                             );
                             let given = given.filter(|given| !given.is_empty());
-                            let (given, given_particle) = split_given_particle(given);
                             let literal_family =
                                 family.starts_with('"') && family.ends_with('"');
-                            Person {
-                                name: unquote_family(family),
-                                prefix: given_particle,
-                                suffix,
-                                given_name: given,
-                                alias: None,
-                                comma_suffix,
-                                literal_family,
-                                non_dropping_particle: None,
+                            if literal_family || given.is_none() {
+                                Person {
+                                    name: unquote_family(family),
+                                    prefix: None,
+                                    suffix,
+                                    given_name: given,
+                                    alias: None,
+                                    comma_suffix,
+                                    literal_family,
+                                    non_dropping_particle: None,
+                                }
+                            } else {
+                                let (
+                                    family,
+                                    non_dropping_particle,
+                                    given,
+                                    prefix,
+                                    suffix,
+                                    comma_suffix,
+                                ) = parse_csl_name_particles(
+                                    family,
+                                    given,
+                                    suffix,
+                                    comma_suffix,
+                                );
+                                Person {
+                                    name: family,
+                                    prefix,
+                                    suffix,
+                                    given_name: given,
+                                    alias: None,
+                                    comma_suffix,
+                                    literal_family: false,
+                                    non_dropping_particle,
+                                }
                             }
                         }
                         csl_json::NameValue::Item(csl_json::NameItem {
@@ -1229,10 +1401,9 @@ impl EntryLike for citationberg::json::Item {
                                 comma_suffix.unwrap_or_default(),
                             );
                             let given = given.filter(|given| !given.is_empty());
-                            let (given, given_particle) = split_given_particle(given);
                             Person {
                                 name: unquote_family(family),
-                                prefix: dropping_particle.clone().or(given_particle),
+                                prefix: dropping_particle.clone(),
                                 suffix,
                                 given_name: given,
                                 alias: None,
