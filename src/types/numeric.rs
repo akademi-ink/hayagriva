@@ -201,6 +201,52 @@ impl Numeric {
         Ok(())
     }
 
+    /// Format the value with an ordinal suffix supplied per number,
+    /// preserving the value's prefix and suffix.
+    ///
+    /// A CSL-JSON number variable may carry text around its number
+    /// (`"7, p. 3-8"`); citeproc-js still applies the ordinal form to the
+    /// number itself.
+    pub fn with_ordinal_suffixes<T, F>(
+        &self,
+        buf: &mut T,
+        mut suffix: F,
+    ) -> std::fmt::Result
+    where
+        T: Write,
+        F: FnMut(i32) -> Option<String>,
+    {
+        if let Some(prefix) = &self.prefix {
+            buf.write_str(prefix)?;
+        }
+
+        let mut write_number = |n: i32, buf: &mut T| -> std::fmt::Result {
+            write!(buf, "{n}")?;
+            if let Some(suffix) = suffix(n) {
+                buf.write_str(&suffix)?;
+            }
+            Ok(())
+        };
+
+        match &self.value {
+            &NumericValue::Number(n) => write_number(n, buf)?,
+            NumericValue::Set(s) => {
+                for &(n, sep) in s {
+                    write_number(n, buf)?;
+                    if let Some(sep) = sep {
+                        write!(buf, "{sep}")?;
+                    }
+                }
+            }
+        }
+
+        if let Some(suffix) = &self.suffix {
+            buf.write_str(suffix)?;
+        }
+
+        Ok(())
+    }
+
     /// Whether the numeric value is plural.
     pub fn is_plural(&self, is_number_of: bool) -> bool {
         match &self.value {

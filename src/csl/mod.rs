@@ -4486,6 +4486,7 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// `nocase` content bypasses case folding; the tags themselves never reach
     /// the output.
     fn push_str(&mut self, s: &str) {
+        self.writing.buf.clear_continuation();
         if !s.contains('<') {
             self.push_str_plain(s);
             return;
@@ -4534,8 +4535,22 @@ impl<'a, T: EntryLike> Context<'a, T> {
         for token in tokens {
             match token {
                 Token::Text(idx) => {
-                    let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
+                    // citeproc-js applies text-case only outside formatting
+                    // markup: small caps, superscript and subscript content is
+                    // implicitly nocase (`textcase_ImplicitNocase`). Italic and
+                    // bold content is still case-transformed.
+                    let nocase = stack.iter().any(|o| match o {
+                        MarkupOpen::NoCase => true,
+                        MarkupOpen::Format(kind, _, _)
+                        | MarkupOpen::FormatOnly(kind, _, _) => matches!(
+                            kind,
+                            MarkupKind::SmallCaps | MarkupKind::Sup | MarkupKind::Sub
+                        ),
+                    });
                     let mid = any_pushed;
+                    if mid {
+                        self.writing.buf.mark_continuation();
+                    }
                     any_pushed |= !texts[idx].is_empty();
                     self.push_markup_text(&texts[idx], nocase, mid, true);
                 }
@@ -4715,6 +4730,7 @@ impl<'a, T: EntryLike> Context<'a, T> {
 
     /// Add a string to the buffer without rich-text parsing.
     fn push_str_plain(&mut self, s: &str) {
+        self.writing.buf.clear_continuation();
         self.push_str_plain_seam(s, false)
     }
 
@@ -4989,6 +5005,96 @@ impl<'a, T: EntryLike> Context<'a, T> {
     fn localized_date(&self, form: DateForm) -> Option<&'a citationberg::Date> {
         self.style
             .lookup_locale(|l| l.date.iter().find(|d| d.form == Some(form)))
+    }
+
+    /// Resolve the ordinal suffix for a number and grammatical gender.
+    ///
+    /// citationberg's `OrdinalLookup` compares the requested gender with a
+    /// term's `gender` attribute, but CSL ordinal terms declare their gender
+    /// with `gender-form`; gendered forms therefore never win the lookup. This
+    /// mirrors citeproc-js's CSL 1.0.1 ordinal resolution instead: try the
+    /// requested gender, then the neutral form, in whole-number,
+    /// last-two-digits and last-digit order, and fall back to the generic
+    /// `ordinal` term.
+    fn ordinal_suffix(&self, n: i32, gender: Option<GrammarGender>) -> Option<String> {
+        use citationberg::OrdinalMatch;
+
+        self.style.lookup_locale(|locale| {
+            let terms = &locale.terms.as_ref()?.terms;
+            let generic = terms.iter().find(|t| {
+                t.name == Term::Other(OtherTerm::Ordinal) && t.form == TermForm::default()
+            });
+
+            let legacy = generic.is_none()
+                && (1..=4).all(|n| {
+                    terms.iter().any(|t| {
+                        t.name == Term::Other(OtherTerm::OrdinalN(n))
+                            && t.form == TermForm::default()
+                    })
+                });
+
+            let mut find = |category: u8, gender: Option<GrammarGender>| {
+                terms.iter().find_map(|t| {
+                    if t.form != TermForm::default() || t.gender_form != gender {
+                        return None;
+                    }
+                    let Term::Other(OtherTerm::OrdinalN(o)) = t.name else {
+                        return None;
+                    };
+                    let hit = match category {
+                        0 => t.match_ == Some(OrdinalMatch::WholeNumber) && n == o as i32,
+                        1 => {
+                            (t.match_ == Some(OrdinalMatch::LastTwoDigits)
+                                || (t.match_.is_none() && o >= 10))
+                                && n % 100 == o as i32
+                        }
+                        _ => {
+                            (t.match_ == Some(OrdinalMatch::LastDigit)
+                                || (t.match_.is_none() && o < 10))
+                                && n % 10 == o as i32
+                        }
+                    };
+                    hit.then(|| t.single().or_else(|| t.multiple()))
+                        .flatten()
+                        .map(str::to_string)
+                })
+            };
+
+            for g in [gender, None] {
+                for category in 0..3 {
+                    if let Some(suffix) = find(category, g) {
+                        return Some(suffix);
+                    }
+                }
+            }
+
+            if legacy {
+                // CSL 1.0.0 locales define only ordinal-01 through ordinal-04
+                // and use the English 11–13 class rule.
+                let class: u8 = match (n, n % 10) {
+                    (11..=13, _) => 4,
+                    (_, v @ 1..=3) => v as u8,
+                    _ => 4,
+                };
+                for g in [gender, None] {
+                    let suffix = terms.iter().find_map(|t| {
+                        (t.form == TermForm::default()
+                            && t.gender_form == g
+                            && t.name == Term::Other(OtherTerm::OrdinalN(class)))
+                        .then(|| t.single().or_else(|| t.multiple()))
+                        .flatten()
+                        .map(str::to_string)
+                    });
+                    if suffix.is_some() {
+                        return suffix;
+                    }
+                }
+            }
+
+            generic
+                .and_then(|t| t.single().or_else(|| t.multiple()))
+                .map(str::to_string)
+        })
     }
 
     /// Get the ordinal lookup object.
