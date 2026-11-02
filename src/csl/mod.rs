@@ -309,6 +309,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
             &mut entries,
             bib_style.csl.bibliography.as_ref().and_then(|b| b.sort.as_ref()),
             request.locale.as_ref(),
+            true,
             |_| 0,
         );
         let citation_number = |item: &T| {
@@ -366,6 +367,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 &mut citation.items,
                 style.csl.citation.sort.as_ref(),
                 citation.locale.as_ref(),
+                false,
                 number_for,
             );
 
@@ -499,8 +501,9 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
             for group in ambiguous.iter() {
                 let len_rerender = rerender.len() + suffixes.len();
-                // 2a. Name Disambiguation loop
-                disambiguate_names(&res, group, |entry, state| {
+                // 2a. Name Disambiguation loop. It returns the classes that
+                // still clash once names are expanded to their best step.
+                let remaining = disambiguate_names(&res, group, |entry, state| {
                     mark(&mut rerender, entry, state)
                 });
 
@@ -509,22 +512,25 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     continue;
                 }
 
-                // 2b. Disambiguate by allowing `cs:choose` disambiguation.
-                disambiguate_with_choose(
-                    &res,
-                    group,
-                    |entry, state| mark(&mut rerender, entry, state),
-                    &mut choose_resolved,
-                );
+                for class in &remaining {
+                    let len_rerender = rerender.len() + suffixes.len();
+                    // 2b. Disambiguate by allowing `cs:choose` disambiguation.
+                    disambiguate_with_choose(
+                        &res,
+                        class,
+                        |entry, state| mark(&mut rerender, entry, state),
+                        &mut choose_resolved,
+                    );
 
-                if rerender.len() + suffixes.len() > len_rerender {
-                    continue;
+                    if rerender.len() + suffixes.len() > len_rerender {
+                        continue;
+                    }
+
+                    // 2c. Disambiguate by year-suffix.
+                    disambiguate_year_suffix(&res, class, &bib_rank, |entry, suffix| {
+                        suffixes.insert(entry as *const T, suffix);
+                    });
                 }
-
-                // 2c. Disambiguate by year-suffix.
-                disambiguate_year_suffix(&res, group, &bib_rank, |entry, suffix| {
-                    suffixes.insert(entry as *const T, suffix);
-                });
             }
 
             if rerender.is_empty() && suffixes.is_empty() {
@@ -980,6 +986,7 @@ pub fn standalone_citation<T: EntryLike>(
         &mut req.items,
         style.csl.citation.sort.as_ref(),
         req.locale.as_ref(),
+        false,
         |_| 0,
     );
     let mut res = vec![];
@@ -1536,7 +1543,8 @@ fn disambiguate_names<F, T>(
     renders: &[SpeculativeCiteRender<'_, '_, T>],
     group: &AmbiguousGroup,
     mut mark: F,
-) where
+) -> Vec<AmbiguousGroup>
+where
     T: EntryLike + Eq + Hash + Debug,
     F: FnMut(&T, DisambiguateState),
 {
@@ -1574,7 +1582,7 @@ fn disambiguate_names<F, T>(
     let original = props.clone();
 
     if rule.is_none() && !add_names {
-        return;
+        return vec![group.clone()];
     }
 
     let mut active: Vec<usize> = (0..data.len())
@@ -1666,6 +1674,42 @@ fn disambiguate_names<F, T>(
         }
         mark(data[idx].item.entry, DisambiguateState::NameDisambiguation(props.clone()));
     }
+
+    // The best name-expansion step partitions the ambiguous set. Entries in a
+    // singleton class are already distinguishable from every partner, so the
+    // remaining methods must only consider the classes that still clash
+    // (`disambiguate_DisambiguationHang`: the 5-name pair keeps clashing while
+    // the 3-name entry drops out before year-suffix assignment).
+    //
+    // Without a names element (or when expansion never separates anything)
+    // the name step cannot refine the group; the other methods keep their
+    // original scope.
+    if best_partitions <= 1 || best.iter().any(Option::is_none) {
+        return vec![group.clone()];
+    }
+    let keys: Vec<String> = best
+        .iter()
+        .enumerate()
+        .map(|(idx, props)| {
+            props.as_ref().map_or_else(
+                || format!("no-names-{idx}"),
+                |props| name_disambiguation_key(props, &data[idx].names),
+            )
+        })
+        .collect();
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    for (idx, key) in keys.iter().enumerate() {
+        if let Some(class) = classes.iter_mut().find(|c| keys[c[0]] == *key) {
+            class.push(idx);
+        } else {
+            classes.push(vec![idx]);
+        }
+    }
+    classes
+        .into_iter()
+        .filter(|class| class.len() > 1)
+        .map(|class| class.into_iter().map(|idx| group[idx]).collect())
+        .collect()
 }
 
 /// Count the `disambiguate="true"` conditions in the citation layout.
@@ -2890,6 +2934,21 @@ impl<'a> StyleContext<'a> {
         term_locale: Option<&'b LocaleCode>,
         bibliography: bool,
     ) -> Context<'b, T> {
+        // Sort macro keys inherit the bibliography's or citation's name
+        // options (et-al settings in particular), like citeproc-js's
+        // `inheritOpt`. Without them a `<key macro>` that renders names uses
+        // every author, so items that citeproc-js considers tied on the first
+        // key are ordered by the wrong second key
+        // (`bugreports_CitationSortsWithEtAl`).
+        let default_names = if bibliography {
+            self.csl
+                .bibliography
+                .as_ref()
+                .map(|b| b.name_options.clone())
+                .unwrap_or_default()
+        } else {
+            self.csl.citation.name_options.clone()
+        };
         Context {
             instance: InstanceContext::new(
                 item.entry,
@@ -2900,7 +2959,7 @@ impl<'a> StyleContext<'a> {
                 None,
             ),
             style: self,
-            writing: WritingContext::new(self.csl.settings.options.clone()),
+            writing: WritingContext::new(self.csl.settings.options.apply(&default_names)),
             bibliography,
             cite_prefix: None,
             saw_names: false,

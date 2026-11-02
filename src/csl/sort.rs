@@ -126,6 +126,7 @@ impl StyleContext<'_> {
         b_idx: usize,
         key: &SortKey,
         term_locale: Option<&LocaleCode>,
+        bibliography: bool,
     ) -> Ordering {
         let (ordering, empty_value) = match key {
             SortKey::Variable { variable: Variable::Standard(s), .. } => {
@@ -215,9 +216,9 @@ impl StyleContext<'_> {
                         idx,
                         entry.locale.as_ref(),
                         term_locale,
-                        false,
+                        bibliography,
                     );
-                    ctx.writing.name_options.push(InheritableNameOptions {
+                    ctx.writing.push_name_options(&InheritableNameOptions {
                         et_al_min: *names_min,
                         et_al_subsequent_min: *names_min,
                         et_al_use_first: *names_use_first,
@@ -247,7 +248,6 @@ impl StyleContext<'_> {
 
                 let a_rendered = render(a, a_idx);
                 let b_rendered = render(b, b_idx);
-
                 (a_rendered.collation_cmp(&b_rendered, self.locale()), false)
             }
         };
@@ -361,7 +361,7 @@ impl StyleContext<'_> {
                     term_locale,
                     false,
                 );
-                ctx.writing.name_options.push(InheritableNameOptions {
+                ctx.writing.push_name_options(&InheritableNameOptions {
                     et_al_min: *names_min,
                     et_al_subsequent_min: *names_min,
                     et_al_use_first: *names_use_first,
@@ -397,6 +397,7 @@ impl StyleContext<'_> {
         cites: &mut [CitationItem<T>],
         sort: Option<&Sort>,
         term_locale: Option<&LocaleCode>,
+        bibliography: bool,
         citation_number: impl Fn(&T) -> usize,
     ) {
         if let Some(sort) = sort {
@@ -410,6 +411,7 @@ impl StyleContext<'_> {
                         citation_number(b.entry),
                         key,
                         term_locale,
+                        bibliography,
                     );
                     if ordering != Ordering::Equal {
                         break;
