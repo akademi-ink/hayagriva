@@ -128,6 +128,20 @@ impl RenderCsl for citationberg::Text {
                     ctx.push_link(&val, val.to_string());
                 } else {
                     ctx.push_chunked(&val);
+                    // citeproc-js appends the disambiguation year suffix
+                    // directly to the citation label (`Item["citation-label"]`
+                    // path in the `text` renderer). A style that renders
+                    // `year-suffix` explicitly already gets it from that text
+                    // element (and citeproc-js would duplicate it).
+                    if var == StandardVariable::CitationLabel
+                        && !ctx.renders_explicit_year_suffix()
+                        && let Some(suffix) = ctx.resolve_standard_variable(
+                            LongShortForm::default(),
+                            StandardVariable::YearSuffix,
+                        )
+                    {
+                        ctx.push_chunked(&suffix);
+                    }
                 }
             }
             ResolvedTextTarget::NumberVariable(_, n) => match n {
@@ -829,7 +843,21 @@ impl RenderCsl for citationberg::Date {
             return;
         }
 
-        let Some(date) = ctx.resolve_date_variable(variable) else { return };
+        let date = ctx.resolve_date_variable(variable);
+        let literal = ctx.resolve_date_literal(variable);
+        if date.is_none() && literal.is_none() {
+            return;
+        }
+        // A literal date has no machine-readable parts; render it at the year
+        // position like citeproc-js (`date_OtherAlone`, `date_InPress`).
+        let empty;
+        let date = match date.as_deref() {
+            Some(date) => date,
+            None => {
+                empty = Date::from_year(0);
+                &empty
+            }
+        };
 
         if let Some(sorting) = ctx.instance.sorting {
             let year;
@@ -957,7 +985,7 @@ impl RenderCsl for citationberg::Date {
             // value), and pushing the delimiter unconditionally would leave a
             // trailing delimiter behind (`2021 ;14(2)`, F-114).
             let loc = ctx.push_elem(citationberg::Formatting::default());
-            render_date_part(part, &date, ctx, over_ride, first);
+            render_date_part(part, date, ctx, over_ride, first, literal.as_deref());
             let delimiter = if first_part { None } else { chosen_delim };
             if ctx.commit_elem_with_delimiter(loc, delimiter) {
                 first_part = false;
@@ -966,7 +994,12 @@ impl RenderCsl for citationberg::Date {
 
         ctx.pop_case(cidx);
         ctx.apply_suffix(&self.affixes, affix_loc, ambient);
-        ctx.commit_elem(depth, self.display, Some(ElemMeta::Date));
+        let meta = if variable == citationberg::taxonomy::DateVariable::Accessed {
+            ElemMeta::AccessedDate
+        } else {
+            ElemMeta::Date
+        };
+        ctx.commit_elem(depth, self.display, Some(meta));
     }
 
     fn will_render<T: EntryLike>(&self, ctx: &mut Context<T>, var: Variable) -> bool {
@@ -1001,8 +1034,8 @@ impl RenderCsl for citationberg::Date {
             let base = self.form.and_then(|form| ctx.localized_date(form));
             let parts = self.parts.or(base.and_then(|b| b.parts)).unwrap_or_default();
 
-            let has_non_empty_vars =
-                ctx.resolve_date_variable(variable).is_some_and(|date| {
+            let has_non_empty_vars = ctx.resolve_date_literal(variable).is_some()
+                || ctx.resolve_date_variable(variable).is_some_and(|date| {
                     base.unwrap_or(self).date_part.iter().any(|part| match part.name {
                         DatePartName::Year => true,
                         DatePartName::Month => {
@@ -1030,6 +1063,7 @@ fn render_date_part<T: EntryLike>(
     ctx: &mut Context<T>,
     over_ride: Option<&citationberg::DatePart>,
     first: bool,
+    literal: Option<&str>,
 ) {
     let Some(val) = (match date_part.name {
         DatePartName::Day => date.day.map(|i| i as i32 + 1),
@@ -1122,13 +1156,19 @@ fn render_date_part<T: EntryLike>(
                 }
             }
             DateStrongAnyForm::Year(brevity) => {
-                let ad = ctx
-                    .term(Term::Other(OtherTerm::Ad), TermForm::default(), false)
-                    .unwrap_or(" AD");
-                let bc = ctx
-                    .term(Term::Other(OtherTerm::Bc), TermForm::default(), false)
-                    .unwrap_or(" BC");
-                write_year(val, brevity == LongShortForm::Short, ctx, ad, bc).unwrap();
+                if let Some(literal) = literal {
+                    // citeproc-js renders a literal date in the year slot.
+                    ctx.push_str(literal);
+                } else {
+                    let ad = ctx
+                        .term(Term::Other(OtherTerm::Ad), TermForm::default(), false)
+                        .unwrap_or(" AD");
+                    let bc = ctx
+                        .term(Term::Other(OtherTerm::Bc), TermForm::default(), false)
+                        .unwrap_or(" BC");
+                    write_year(val, brevity == LongShortForm::Short, ctx, ad, bc)
+                        .unwrap();
+                }
             }
         }
     }
@@ -1191,14 +1231,21 @@ impl RenderCsl for citationberg::Choose {
     }
 
     fn will_render<T: EntryLike>(&self, ctx: &mut Context<T>, var: Variable) -> bool {
-        choose_children(self, ctx, |children, ctx| {
+        // Queries must not consume `disambiguate` levels: only the actual
+        // render advances the counter, otherwise `will_have_info` followed by
+        // `render` would evaluate the condition twice.
+        let saved = ctx.writing.disambiguate_count;
+        let res = choose_children(self, ctx, |children, ctx| {
             children.iter().any(|c| c.will_render(ctx, var))
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+        ctx.writing.disambiguate_count = saved;
+        res
     }
 
     fn will_have_info<T: EntryLike>(&self, ctx: &mut Context<T>) -> (bool, UsageInfo) {
-        choose_children(self, ctx, |children, ctx| {
+        let saved = ctx.writing.disambiguate_count;
+        let res = choose_children(self, ctx, |children, ctx| {
             let mut info = UsageInfo::default();
             let mut will_print = false;
 
@@ -1210,7 +1257,9 @@ impl RenderCsl for citationberg::Choose {
 
             (will_print, info)
         })
-        .unwrap_or_else(|| (false, UsageInfo::default()))
+        .unwrap_or_else(|| (false, UsageInfo::default()));
+        ctx.writing.disambiguate_count = saved;
+        res
     }
 }
 

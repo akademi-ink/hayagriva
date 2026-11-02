@@ -445,6 +445,11 @@ pub enum ElemMeta {
     Names(Vec<(Vec<Person>, NameVariable)>),
     /// The element is the output of `cs:date`.
     Date,
+    /// The element is the output of `cs:date` for the `accessed` variable.
+    ///
+    /// citeproc-js excludes accessed dates from the ambiguity key used by
+    /// disambiguation, so they must be identifiable after rendering.
+    AccessedDate,
     /// The element is the output of `cs:text`.
     Text,
     /// The element is the output of `cs:number`.

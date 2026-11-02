@@ -5,13 +5,15 @@ use std::fmt::Write;
 use citationberg::TermForm;
 use citationberg::taxonomy::{NameVariable, OtherTerm, Term, Variable};
 use citationberg::{
-    DelimiterBehavior, DemoteNonDroppingParticle, LayoutRenderingElement, NameAnd,
-    NameAsSortOrder, NameForm, NameLabelPosition, NameOptions, Names, ToAffixes,
-    ToFormatting,
+    DelimiterBehavior, DemoteNonDroppingParticle, DisambiguationRule,
+    LayoutRenderingElement, NameAnd, NameAsSortOrder, NameForm, NameLabelPosition,
+    NameOptions, Names, ToAffixes, ToFormatting,
 };
 
 use crate::csl::taxonomy::EntryLike;
-use crate::csl::{Context, DisambiguateState, ElemMeta, SpecialForm, UsageInfo};
+use crate::csl::{
+    Context, DisambiguateState, ElemMeta, NameRegistry, SpecialForm, UsageInfo,
+};
 use crate::types::Person;
 
 use super::{RenderCsl, render_label_with_var};
@@ -143,6 +145,63 @@ impl NameDisambiguationProperties {
             .and_then(|d| d.as_mut())
             .or(Some(&mut self.default_name_form))
     }
+
+    /// Number of names in the first rendered names list.
+    pub(crate) fn name_count(&self) -> usize {
+        self.name_forms.first().map(Vec::len).unwrap_or_default()
+    }
+
+    /// Number of names currently visible (not hidden by et al.) in the first
+    /// rendered names list.
+    pub(crate) fn visible_count(&self) -> usize {
+        self.name_forms
+            .first()
+            .map(|l| l.iter().take_while(|f| f.is_some()).count())
+            .unwrap_or_default()
+    }
+
+    /// The form of the `idx`-th visible name in the first names list.
+    pub(crate) fn form_at(&self, idx: usize) -> Option<DisambiguatedNameForm> {
+        self.name_forms.first()?.get(idx).copied().flatten()
+    }
+
+    /// Escalate the `idx`-th name to `target` in every rendered names list.
+    ///
+    /// Returns whether anything changed. Hidden names are left alone: making a
+    /// hidden slot visible is [`Self::add_name`]'s job.
+    pub(crate) fn set_form_at(
+        &mut self,
+        idx: usize,
+        target: DisambiguatedNameForm,
+    ) -> bool {
+        let mut changed = false;
+        for list in 0..self.name_forms.len() {
+            changed |= self.set_form_in_list(list, idx, target);
+        }
+        changed
+    }
+
+    /// Escalate the `idx`-th name of one rendered names list to `target`.
+    ///
+    /// Hidden names are left alone; returns whether anything changed.
+    pub(crate) fn set_form_in_list(
+        &mut self,
+        list: usize,
+        idx: usize,
+        target: DisambiguatedNameForm,
+    ) -> bool {
+        let Some(forms) = self.name_forms.get_mut(list) else {
+            return false;
+        };
+        if let Some(Some(form)) = forms.get_mut(idx)
+            && *form != target
+            && *form < target
+        {
+            *form = target;
+            return true;
+        }
+        false
+    }
 }
 
 fn renders_given_special_form<T: EntryLike>(
@@ -184,6 +243,66 @@ fn renders_given_special_form<T: EntryLike>(
     }
 
     true
+}
+
+/// Expand given names according to citeproc-js's document-wide name register.
+///
+/// The register counts distinct initials and distinct full given names per
+/// family name. A family shared by different initials renders initials; a
+/// family whose initials are in turn shared by different given names renders
+/// full given names. `primary-name*` rules only touch the first name.
+fn apply_name_registry(
+    registry: &NameRegistry,
+    rule: DisambiguationRule,
+    options: &NameOptions,
+    people: &[(Vec<Cow<'_, Person>>, NameVariable)],
+    props: &mut NameDisambiguationProperties,
+) {
+    let initialize_with = options.initialize_with.is_some();
+    let short = options.form == NameForm::Short;
+    let base = if short {
+        0
+    } else if initialize_with {
+        1
+    } else {
+        2
+    };
+    let primary = matches!(
+        rule,
+        DisambiguationRule::PrimaryName | DisambiguationRule::PrimaryNameWithInitials
+    );
+    let with_initials_only = matches!(
+        rule,
+        DisambiguationRule::AllNamesWithInitials
+            | DisambiguationRule::PrimaryNameWithInitials
+    );
+
+    for (list_idx, (persons, _)) in people.iter().enumerate() {
+        for (person_idx, person) in persons.iter().enumerate() {
+            if primary && (list_idx > 0 || person_idx > 0) {
+                continue;
+            }
+            let (family_count, given_count) = registry.counts(person);
+            let param = if with_initials_only {
+                if family_count > 1 { 1 } else { 0 }
+            } else {
+                let mut param = base;
+                if family_count > 1 {
+                    param = 1;
+                }
+                if given_count > 1 || (family_count > 1 && !initialize_with) {
+                    param = 2;
+                }
+                param
+            };
+            let target = match param {
+                0 => continue,
+                1 => DisambiguatedNameForm::LongInitialized,
+                _ => DisambiguatedNameForm::LongFull,
+            };
+            props.set_form_in_list(list_idx, person_idx, target);
+        }
+    }
 }
 
 impl RenderCsl for Names {
@@ -317,7 +436,7 @@ impl RenderCsl for Names {
 
         // If we disambiguate, we need to copy the name forms and otherwise
         // compute them using the options.
-        let props = if let DisambiguateState::NameDisambiguation(props) =
+        let mut props = if let DisambiguateState::NameDisambiguation(props) =
             &ctx.instance.cite_props.speculative.disambiguation
         {
             if props.variables.iter().eq(people.iter().map(|(_, v)| v)) {
@@ -351,6 +470,26 @@ impl RenderCsl for Names {
                 })
                 .collect(),
         });
+
+        // citeproc-js counts names document-wide for every
+        // `givenname-disambiguation-rule` except `by-cite`; the latter is
+        // handled per ambiguity group by `disambiguate_names`.
+        if ctx.instance.sorting.is_none()
+            && let Some(registry) = ctx.style.name_registry
+        {
+            let citation = &ctx.style.csl.citation;
+            if citation.disambiguate_add_givenname
+                && citation.givenname_disambiguation_rule != DisambiguationRule::ByCite
+            {
+                apply_name_registry(
+                    registry,
+                    citation.givenname_disambiguation_rule,
+                    &options,
+                    &people,
+                    &mut props,
+                );
+            }
+        }
 
         for (i, ((persons, variable), forms)) in people
             .into_iter()
@@ -634,8 +773,10 @@ fn add_names<T: EntryLike>(
 
         // Only a name that is actually rendered family-first counts as
         // inverted for `delimiter-precedes-last="after-inverted-name"`.
-        last_inverted =
-            reverse && !name.is_institutional() && !name.is_cjk() && name.given_name.is_some();
+        last_inverted = reverse
+            && !name.is_institutional()
+            && !name.is_cjk()
+            && name.given_name.is_some();
         first = false;
     }
 

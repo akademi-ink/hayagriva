@@ -35,6 +35,12 @@ pub trait EntryLike {
     ) -> Option<Cow<'_, ChunkedString>>;
     fn resolve_name_variable(&self, variable: NameVariable) -> Vec<Cow<'_, Person>>;
     fn resolve_date_variable(&self, variable: DateVariable) -> Option<Cow<'_, Date>>;
+    /// A literal date value (`"in press"`, `"(in press)"`, …) for a date
+    /// variable that has no machine-readable parts.
+    fn resolve_date_literal(&self, variable: DateVariable) -> Option<Cow<'_, str>> {
+        let _ = variable;
+        None
+    }
     fn matches_entry_type(&self, kind: taxonomy::Kind) -> bool;
     fn is_english(&self) -> Option<bool>;
     /// The item's IETF language tag, when it has one. Used for locale-aware
@@ -106,15 +112,11 @@ impl<'a, T: EntryLike> InstanceContext<'a, T> {
         variable: StandardVariable,
     ) -> Option<Cow<'a, ChunkedString>> {
         match variable {
-            StandardVariable::YearSuffix => {
-                if let DisambiguateState::YearSuffix(s) =
-                    self.cite_props.speculative.disambiguation
-                {
-                    Some(Cow::Owned(StringChunk::normal(letter(s)).into()))
-                } else {
-                    None
-                }
-            }
+            StandardVariable::YearSuffix => self
+                .cite_props
+                .speculative
+                .year_suffix
+                .map(|s| Cow::Owned(StringChunk::normal(letter(s)).into())),
             _ => self.entry.resolve_standard_variable(form, variable),
         }
     }
@@ -150,7 +152,9 @@ impl<'a> NumberVariableResult<'a> {
 
 impl EntryLike for Entry {
     fn language(&self) -> Option<Cow<'_, str>> {
-        self.language.as_ref().map(|language| Cow::Owned(language.to_string()))
+        self.language
+            .as_ref()
+            .map(|language| Cow::Owned(language.to_string()))
     }
 
     fn key(&self) -> Cow<'_, str> {
@@ -751,6 +755,198 @@ fn resolve_csl_json_standard_variable(
     }
 }
 
+/// Resolve a CSL-JSON field with its Zotero short-form aliases.
+///
+/// citeproc-js maps `shortTitle` to `title-short` and `journalAbbreviation` to
+/// `container-title-short` when the canonical field is absent, and a
+/// `form="short"` request for `title`/`container-title` falls back to the
+/// `-short` field, then to the long field
+/// (`CSL.Engine.prototype.getTextSubField`, `VARIABLES_WITH_SHORT_FORM`).
+#[cfg(feature = "csl-json")]
+fn resolve_csl_json_short_or_long<'a>(
+    item: &'a citationberg::json::Item,
+    short: &str,
+    long: &str,
+    alias: &str,
+) -> Option<Cow<'a, ChunkedString>> {
+    resolve_csl_json_field(item, short)
+        .or_else(|| resolve_csl_json_field(item, alias))
+        .or_else(|| resolve_csl_json_field(item, long))
+}
+
+#[cfg(feature = "csl-json")]
+fn resolve_csl_json_field<'a>(
+    item: &'a citationberg::json::Item,
+    key: &str,
+) -> Option<Cow<'a, ChunkedString>> {
+    match item.0.get(key)? {
+        csl_json::Value::String(s) => {
+            Some(Cow::Owned(StringChunk::normal(s.clone()).into()))
+        }
+        csl_json::Value::Number(n) => {
+            Some(Cow::Owned(StringChunk::normal(n.to_string()).into()))
+        }
+        _ => None,
+    }
+}
+
+/// CSL-JSON name variables in the order citeproc-js tries them when it needs a
+/// representative creator (`CSL.NAME_VARIABLES`).
+#[cfg(feature = "csl-json")]
+const CSL_JSON_NAME_VARIABLE_ORDER: &[&str] = &[
+    "author",
+    "chair",
+    "collection-editor",
+    "compiler",
+    "composer",
+    "container-author",
+    "contributor",
+    "curator",
+    "director",
+    "editor",
+    "editor-translator",
+    "editorial-director",
+    "executive-producer",
+    "guest",
+    "host",
+    "illustrator",
+    "interviewer",
+    "narrator",
+    "organizer",
+    "original-author",
+    "performer",
+    "producer",
+    "recipient",
+    "reviewed-author",
+    "script-writer",
+    "series-creator",
+    "translator",
+    "commenter",
+];
+
+/// Whether a character survives citeproc-js's `ROMANESQUE_NOT_REGEXP` filter
+/// used when building citation labels.
+#[cfg(feature = "csl-json")]
+fn is_romanesque_label_char(c: char) -> bool {
+    c.is_ascii_alphabetic()
+        || matches!(
+            c,
+            '\u{00c0}'..='\u{017f}' // Latin-1 Supplement/Latin Extended-A
+                | '\u{0218}'..='\u{021b}'
+                | '\u{0370}'..='\u{03ff}' // Greek
+                | '\u{0400}'..='\u{052f}' // Cyrillic
+                | '\u{0590}'..='\u{05d4}' // Hebrew
+                | '\u{05d6}'..='\u{05ff}'
+                | '\u{0600}'..='\u{06ff}' // Arabic
+                | '\u{0e01}'..='\u{0e5b}' // Thai
+                | '\u{1f00}'..='\u{1fff}' // Greek Extended
+                | '\u{200c}'..='\u{200e}' // ZWNJ, ZWJ, LRM
+                | '\u{202a}'..='\u{202e}' // Bidi controls
+        )
+}
+
+/// Build the alphanumeric citation label that citeproc-js generates from the
+/// first present name variable and the issued year (`getCitationLabel`).
+///
+/// The default trigraph is `Aaaa00:AaAa00:AaAA00:AAAA00`: one author keeps up
+/// to four family-name letters, two authors two each, three authors 2+1+1, and
+/// four or more one letter each. The last two digits of the year follow.
+#[cfg(feature = "csl-json")]
+fn csl_json_citation_label(item: &citationberg::json::Item) -> String {
+    // A label supplied by the data wins over the computed one.
+    if let Some(csl_json::Value::String(label)) = item.0.get("citation-label") {
+        return label.clone();
+    }
+
+    let mut label = String::new();
+    'outer: for key in CSL_JSON_NAME_VARIABLE_ORDER {
+        let Some(csl_json::Value::Names(names)) = item.0.get(*key) else {
+            continue;
+        };
+        if names.is_empty() {
+            continue;
+        }
+        let widths: &[usize] = match names.len() {
+            1 => &[4],
+            2 => &[2, 2],
+            3 => &[2, 1, 1],
+            _ => &[1, 1, 1, 1],
+        };
+        for (name, width) in names.iter().zip(widths) {
+            let family = match name {
+                csl_json::NameValue::Item(item) => item.family.as_str(),
+                csl_json::NameValue::Literal(literal) => literal.literal.as_str(),
+            };
+            let mut family = family;
+            // Strip a leading lowercase particle ("van ", "de la ").
+            if let Some(space) = family.find(' ') {
+                let prefix = &family[..space];
+                if !prefix.is_empty()
+                    && prefix
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '\'' || c == '\u{2019}')
+                {
+                    family = family[space..].trim_start();
+                }
+            }
+            // Strip a leading article.
+            let lower = family.to_lowercase();
+            for article in ["a ", "an ", "the "] {
+                if lower.starts_with(article) && family.is_char_boundary(article.len()) {
+                    family = &family[article.len()..];
+                    break;
+                }
+            }
+            let cleaned: String =
+                family.chars().filter(|c| is_romanesque_label_char(*c)).collect();
+            if cleaned.is_empty() {
+                break 'outer;
+            }
+            let mut part: String = cleaned.chars().take(*width).collect();
+            if part.chars().count() > 1 {
+                let mut chars = part.chars();
+                let first = chars.next().unwrap().to_uppercase().to_string();
+                part = first + &chars.as_str().to_lowercase();
+            } else {
+                part = part.to_uppercase();
+            }
+            label.push_str(&part);
+        }
+        break;
+    }
+
+    if label.is_empty()
+        && let Some(csl_json::Value::String(title)) = item.0.get("title")
+    {
+        let joined: String = title.split_whitespace().collect();
+        let mut part: String = joined.chars().take(4).collect();
+        if part.chars().count() > 1 {
+            let mut chars = part.chars();
+            let first = chars.next().unwrap().to_uppercase().to_string();
+            part = first + &chars.as_str().to_lowercase();
+        } else {
+            part = part.to_uppercase();
+        }
+        label = part;
+    }
+
+    let year = match item.0.get("issued") {
+        Some(csl_json::Value::Date(csl_json::DateValue::DateParts {
+            date_parts,
+            ..
+        })) => date_parts.0.first().and_then(|d| d.0.first()).copied().unwrap_or(0),
+        Some(csl_json::Value::Date(csl_json::DateValue::Raw { raw, .. })) => {
+            raw.start.year
+        }
+        _ => 0,
+    };
+    let year = year.to_string();
+    let digits = if year.len() >= 2 { &year[year.len() - 2..] } else { "00" };
+    label.push_str(digits);
+
+    label
+}
+
 #[cfg(feature = "csl-json")]
 /// Split a citation-processing suffix out of a CSL-JSON `given` field.
 ///
@@ -822,23 +1018,40 @@ impl EntryLike for citationberg::json::Item {
         variable: StandardVariable,
     ) -> Option<Cow<'_, ChunkedString>> {
         match variable {
+            // Per citeproc tests, a 'title-short' without 'title' is valid
+            // and should be used when the short form is selected; the long
+            // title is the fallback.
             StandardVariable::Title => match form {
-                LongShortForm::Short => {
-                    // Per citeproc tests, a 'title-short' without 'title' is
-                    // valid and should be used when the short form is
-                    // selected.
-                    resolve_csl_json_standard_variable(self, StandardVariable::TitleShort)
-                        .or_else(|| {
-                            resolve_csl_json_standard_variable(
-                                self,
-                                StandardVariable::Title,
-                            )
-                        })
-                }
-                LongShortForm::Long => {
-                    resolve_csl_json_standard_variable(self, StandardVariable::Title)
-                }
+                LongShortForm::Short => resolve_csl_json_short_or_long(
+                    self,
+                    "title-short",
+                    "title",
+                    "shortTitle",
+                ),
+                LongShortForm::Long => resolve_csl_json_field(self, "title"),
             },
+            // An explicit `*-short` variable is strict: citeproc-js returns
+            // nothing when the short field is absent (only the `form="short"`
+            // request on the long variable falls back).
+            StandardVariable::TitleShort => resolve_csl_json_field(self, "title-short")
+                .or_else(|| resolve_csl_json_field(self, "shortTitle")),
+            StandardVariable::ContainerTitle => match form {
+                LongShortForm::Short => resolve_csl_json_short_or_long(
+                    self,
+                    "container-title-short",
+                    "container-title",
+                    "journalAbbreviation",
+                ),
+                LongShortForm::Long => resolve_csl_json_field(self, "container-title"),
+            },
+            StandardVariable::ContainerTitleShort => {
+                resolve_csl_json_field(self, "container-title-short")
+                    .or_else(|| resolve_csl_json_field(self, "journalAbbreviation"))
+            }
+            StandardVariable::CitationLabel => {
+                let label = csl_json_citation_label(self);
+                (!label.is_empty()).then(|| Cow::Owned(StringChunk::normal(label).into()))
+            }
             _ => resolve_csl_json_standard_variable(self, variable),
         }
     }
@@ -853,14 +1066,56 @@ impl EntryLike for citationberg::json::Item {
                     panic!("ranges are not supported")
                 }
                 let d = d.start;
+
+                // CSL-JSON numbers years historically (year -250 is 250 BCE)
+                // while the internal representation uses 0 for 1 BCE
+                // (cf. `Date` and `write_year`).
+                let year = if d.year <= 0 { d.year as i32 + 1 } else { d.year as i32 };
+
+                // citeproc-js normalizes out-of-range month values at render
+                // time (`CSL.Util.Dates.normalizeMonth`): values outside
+                // 1-24 are invalid, 17-24 wrap back into the 13-16 season
+                // range, and 13-16 name a season rather than a month.
+                let mut month = None;
+                let mut season = d.season;
+                if let Some(raw) = d.month {
+                    let mut num = raw as i32 + 1;
+                    if (1..=24).contains(&num) {
+                        while num > 16 {
+                            num -= 4;
+                        }
+                        if num > 12 {
+                            season = citationberg::taxonomy::Season::try_from_csl_number(
+                                (num - 12) as u8,
+                            )
+                            .ok();
+                        } else {
+                            month = Some((num - 1) as u8);
+                        }
+                    }
+                }
+
                 Some(Cow::Owned(Date {
-                    year: d.year as i32,
-                    month: d.month,
+                    year,
+                    month,
                     day: d.day,
                     approximate: d.circa,
-                    season: d.season,
+                    season,
                 }))
             }
+            _ => None,
+        }
+    }
+
+    fn resolve_date_literal(&self, variable: DateVariable) -> Option<Cow<'_, str>> {
+        match self.0.get(&variable.to_string())? {
+            csl_json::Value::Date(csl_json::DateValue::Raw {
+                literal: Some(l), ..
+            })
+            | csl_json::Value::Date(csl_json::DateValue::DateParts {
+                literal: Some(l),
+                ..
+            }) => Some(Cow::Borrowed(l.as_str())),
             _ => None,
         }
     }

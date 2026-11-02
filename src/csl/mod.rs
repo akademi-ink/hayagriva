@@ -232,6 +232,33 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
             }
         }
 
+        // Names for given-name disambiguation rules other than `by-cite` are
+        // counted document-wide (citeproc-js's name register).
+        let name_variables = style_name_variables(bib_style.csl);
+        let mut name_registry = NameRegistry::default();
+        if !name_variables.is_empty() {
+            // `primary-name*` rules only ever compare the first name of each
+            // nameset (citeproc-js passes the person index to `addname` and
+            // skips it for the rest).
+            let primary_only = matches!(
+                bib_style.csl.citation.givenname_disambiguation_rule,
+                DisambiguationRule::PrimaryName
+                    | DisambiguationRule::PrimaryNameWithInitials
+            ) && bib_style.csl.citation.disambiguate_add_givenname;
+            for entry in entry_set.iter() {
+                for variable in &name_variables {
+                    for (idx, person) in
+                        entry.resolve_name_variable(*variable).into_iter().enumerate()
+                    {
+                        if primary_only && idx > 0 {
+                            continue;
+                        }
+                        name_registry.register(person.as_ref());
+                    }
+                }
+            }
+        }
+
         let mut entries: Vec<_> =
             entry_set.into_iter().map(CitationItem::with_entry).collect();
         bib_style.sort(
@@ -266,7 +293,8 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         let mut last_cite: Option<&CitationItem<T>> = None;
 
         for citation in &mut self.citations {
-            let style = citation.style();
+            let mut style = citation.style();
+            style.name_registry = Some(&name_registry);
 
             let numbering: HashMap<*const T, usize> = if bibliography_sorts {
                 cited.extend(citation.items.iter().map(|item| item.entry as *const T));
@@ -383,13 +411,24 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         //
         // If we have set the disambiguation state for an item, we need to set
         // the same state for all entries referencing that item.
-        for _ in 0..3 {
+        //
+        // citeproc-js assigns year suffix letters in bibliography order
+        // ("the assignment of year-suffixes follows the order of the
+        // bibliographies entries"), so capture that rank once.
+        let bib_rank: HashMap<*const T, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| (item.entry as *const T, idx))
+            .collect();
+        let disambiguate_levels = style_disambiguate_levels(bib_style.csl);
+        for _ in 0..(4 + disambiguate_levels as usize) {
             let ambiguous = find_ambiguous_sets(&res);
             if ambiguous.is_empty() {
                 break;
             }
 
             let mut rerender: HashMap<*const T, DisambiguateState> = HashMap::new();
+            let mut suffixes: HashMap<*const T, u8> = HashMap::new();
             let mark = |map: &mut HashMap<*const T, DisambiguateState>,
                         entry: &T,
                         state: DisambiguateState| {
@@ -399,14 +438,14 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
             };
 
             for group in ambiguous.iter() {
-                let len_rerender = rerender.len();
+                let len_rerender = rerender.len() + suffixes.len();
                 // 2a. Name Disambiguation loop
                 disambiguate_names(&res, group, |entry, state| {
                     mark(&mut rerender, entry, state)
                 });
 
                 // Do not try other methods for this group if the previous method succeeded.
-                if rerender.len() > len_rerender {
+                if rerender.len() + suffixes.len() > len_rerender {
                     continue;
                 }
 
@@ -415,25 +454,34 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     mark(&mut rerender, entry, state)
                 });
 
-                if rerender.len() > len_rerender {
+                if rerender.len() + suffixes.len() > len_rerender {
                     continue;
                 }
 
                 // 2c. Disambiguate by year-suffix.
-                disambiguate_year_suffix(&res, group, |entry, state| {
-                    mark(&mut rerender, entry, state)
+                disambiguate_year_suffix(&res, group, &bib_rank, |entry, suffix| {
+                    suffixes.insert(entry as *const T, suffix);
                 });
             }
 
-            if rerender.is_empty() {
+            if rerender.is_empty() && suffixes.is_empty() {
                 break;
             }
 
             for cite in res.iter_mut() {
-                let style_ctx = cite.request.style();
+                let mut style_ctx = cite.request.style();
+                style_ctx.name_registry = Some(&name_registry);
                 for item in cite.items.iter_mut() {
+                    let mut rerender_item = false;
                     if let Some(state) = rerender.get(&(item.entry as _)) {
                         item.cite_props.speculative.disambiguation = state.clone();
+                        rerender_item = true;
+                    }
+                    if let Some(suffix) = suffixes.get(&(item.entry as _)) {
+                        item.cite_props.speculative.year_suffix = Some(*suffix);
+                        rerender_item = true;
+                    }
+                    if rerender_item {
                         item.rendered = do_rerender(&style_ctx, item, cite.request);
                     }
                 }
@@ -545,7 +593,8 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         // Rerender.
         let mut final_citations: Vec<RenderedCitation> = Vec::new();
         for cite in res.iter_mut() {
-            let style_ctx = cite.request.style();
+            let mut style_ctx = cite.request.style();
+            style_ctx.name_registry = Some(&name_registry);
             // 5. Collapse grouped citations.
             if cite.request.items.iter().all(|c| c.purpose.is_none()) {
                 collapse_items(cite);
@@ -685,22 +734,20 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     speculative.citation_number = self.citation_number_offset + entry_idx;
                 }
 
-                items.push((
-                    simplify_children(
-                        bib_style
-                            .bibliography(
-                                entry.entry,
-                                CiteProperties {
-                                    certain: cited_item.cite_props.certain,
-                                    speculative,
-                                },
-                                cited_item.locale.as_ref(),
-                                request.locale.as_ref(),
-                            )
-                            .unwrap(),
-                    ),
-                    entry.entry.key().to_string(),
-                ))
+                let rendered_entry = simplify_children(
+                    bib_style
+                        .bibliography(
+                            entry.entry,
+                            CiteProperties {
+                                certain: cited_item.cite_props.certain,
+                                speculative,
+                            },
+                            cited_item.locale.as_ref(),
+                            request.locale.as_ref(),
+                        )
+                        .unwrap(),
+                );
+                items.push((rendered_entry, entry.entry.key().to_string()));
             }
 
             substitute_subsequent_authors(
@@ -964,6 +1011,35 @@ fn last_purpose_render<T: EntryLike + Debug>(
     }
 }
 
+/// The text of a rendered item as used for ambiguity detection.
+///
+/// citeproc-js compares the plain (undecorated) cite text but suppresses the
+/// `accessed` date while looking for ambiguity, because two cites that differ
+/// only in their access date are still ambiguous for disambiguation purposes
+/// (`date_YearSuffixWithNoDate`).
+fn ambiguity_key(children: &ElemChildren) -> String {
+    fn helper(children: &ElemChildren, out: &mut String) {
+        for child in &children.0 {
+            match child {
+                ElemChild::Text(text) => out.push_str(&text.text),
+                ElemChild::Link { text, .. } => out.push_str(&text.text),
+                ElemChild::Elem(elem) => {
+                    if elem.meta == Some(ElemMeta::AccessedDate) {
+                        continue;
+                    }
+                    helper(&elem.children, out);
+                }
+                ElemChild::Markup(markup) => out.push_str(markup),
+                ElemChild::Transparent { .. } => {}
+            }
+        }
+    }
+
+    let mut out = String::new();
+    helper(children, &mut out);
+    out
+}
+
 type AmbiguousGroup = Vec<(usize, usize)>;
 
 /// Get all names in `children`.
@@ -1006,97 +1082,233 @@ impl<'a, T: EntryLike + Debug> PartialEq for DisambData<'a, T> {
 
 impl<'a, T: EntryLike + Debug> Eq for DisambData<'a, T> {}
 
-/// Returns true iff the item `x` is fully disambiguated w.r.t. `xs` where the first `et_al_min` are added and the `rule` is applied.
-fn is_disambiguated<T: EntryLike + Debug>(
-    et_al_min: usize,
-    xs: &[DisambData<T>],
-    x: &DisambData<T>,
-    rule: Option<DisambiguationRule>,
-) -> bool {
-    fn name_parts<'a>(
-        names: impl Iterator<Item = &'a Person>,
-        rule: Option<DisambiguationRule>,
-    ) -> Vec<Person> {
-        match rule {
-            Some(DisambiguationRule::AllNames | DisambiguationRule::ByCite) => {
-                names.cloned().collect()
-            }
-            Some(DisambiguationRule::AllNamesWithInitials) => names
-                .cloned()
-                .map(|n| {
-                    let mut given = String::new();
-                    n.initials(&mut given, None, false).unwrap();
-                    Person { given_name: Some(given), ..n }
-                })
-                .collect(),
-            Some(DisambiguationRule::PrimaryName) => names
-                .cloned()
-                .enumerate()
-                .map(|(i, n)| if i == 0 { n } else { Person { given_name: None, ..n } })
-                .collect(),
-            Some(DisambiguationRule::PrimaryNameWithInitials) => names
-                .cloned()
-                .enumerate()
-                .map(|(i, n)| {
-                    if i == 0 {
-                        let mut given = String::new();
-                        n.initials(&mut given, None, false).unwrap();
-                        Person { given_name: Some(given), ..n }
-                    } else {
-                        Person { given_name: None, ..n }
-                    }
-                })
-                .collect(),
-            None => names.map(|n| Person { given_name: None, ..n.clone() }).collect(),
-        }
-    }
-
-    let disamb_name =
-        |x: &DisambData<T>| name_parts(x.names.iter().take(et_al_min), rule);
-
-    let disamb_x = disamb_name(x);
-    xs.iter().all(|y| x == y || disamb_name(y) != disamb_x)
+/// Document-wide registry of rendered names, mirroring citeproc-js's
+/// `CSL.NameRegister`.
+///
+/// Given-name disambiguation for the non-`by-cite` rules is not scoped to an
+/// ambiguity group: citeproc-js counts distinct initials and full given names
+/// per family name across the whole document and expands every matching name.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct NameRegistry {
+    /// Family name → initials → full given names.
+    families: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
-/// Adds a given name (potentially only the initial) to the name `x` if it disambiguates w.r.t. `xs`.
+impl NameRegistry {
+    fn register(&mut self, person: &Person) {
+        if person.name.is_empty() || person.given_name.is_none() {
+            return;
+        }
+        let family = person.name.replace('.', " ");
+        let family = family.trim().to_string();
+        if family.is_empty() {
+            return;
+        }
+        let mut initials = String::new();
+        person.initials(&mut initials, None, false).ok();
+        let initials: String =
+            initials.chars().filter(|c| !c.is_whitespace() && *c != '.').collect();
+        let given = person
+            .given_name
+            .as_deref()
+            .unwrap_or_default()
+            .replace('.', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.families
+            .entry(family)
+            .or_default()
+            .entry(initials)
+            .or_default()
+            .insert(given);
+    }
+
+    /// `(distinct initials, distinct full given names)` for the family name.
+    fn counts(&self, person: &Person) -> (usize, usize) {
+        let family = person.name.replace('.', " ");
+        let Some(by_initials) = self.families.get(family.trim()) else {
+            return (0, 0);
+        };
+        let mut buf = String::new();
+        person.initials(&mut buf, None, false).ok();
+        let initials_key: String =
+            buf.chars().filter(|c| !c.is_whitespace() && *c != '.').collect();
+        let given_count =
+            by_initials.get(&initials_key).map(HashSet::len).unwrap_or_default();
+        (by_initials.len(), given_count)
+    }
+}
+
+/// The rendered name list of an item as it participates in disambiguation.
 ///
-/// **Note**: This is only used to disambiguate a citation. Disambiguation of names needs to be handled differently.
-fn disamb_cite_add_given_name(
-    x: &Person,
-    xs: &[&Person],
-    form: &mut DisambiguatedNameForm,
-) -> bool {
-    if form == &DisambiguatedNameForm::Count {
-        // Cannot disambiguate
-        return false;
+/// Two items can only be disambiguated by their names when this key differs;
+/// it mirrors what `add_names` would print (visible count, family names, and
+/// the given-name form for each visible name).
+fn name_disambiguation_key(
+    props: &NameDisambiguationProperties,
+    names: &[Person],
+) -> String {
+    let count = props.visible_count();
+    let mut key = format!("{count}\u{1e}");
+    for (idx, person) in names.iter().enumerate().take(count) {
+        key.push_str(&person.name);
+        key.push('\u{1f}');
+        match props.form_at(idx) {
+            Some(DisambiguatedNameForm::LongInitialized) => {
+                let mut initials = String::new();
+                person.initials(&mut initials, None, false).ok();
+                key.push_str(&initials);
+            }
+            Some(DisambiguatedNameForm::LongFull) => {
+                key.push_str(person.given_name.as_deref().unwrap_or_default());
+            }
+            _ => {}
+        }
+        key.push('\u{1e}');
     }
-    if form == &DisambiguatedNameForm::LongFull {
-        // Cannot expand full name
-        return false;
+    // A truncated list renders an et-al marker, which distinguishes it from a
+    // list that happens to end at the same number of names
+    // (`disambiguate_YearSuffixAtTwoLevels`).
+    if props.name_count() > count {
+        key.push_str("et-al");
     }
-    let mut changed = false;
-    for p in xs {
-        if &x == p || x.name != p.name {
+    key
+}
+
+/// Compute the target given-name form for a name that has to be disambiguated.
+fn disambiguated_form_target(
+    base: DisambiguatedNameForm,
+    needs_full: bool,
+    with_initials_only: bool,
+) -> DisambiguatedNameForm {
+    if base == DisambiguatedNameForm::Count || base == DisambiguatedNameForm::LongFull {
+        return base;
+    }
+    if with_initials_only {
+        // The rule cannot render full given names, so a collision of initials
+        // is not disambiguated at all (`disambiguate_ToInitialOnly`).
+        if needs_full {
+            return base;
+        }
+        return match base {
+            DisambiguatedNameForm::ShortInitialized => {
+                DisambiguatedNameForm::LongInitialized
+            }
+            other => other,
+        };
+    }
+    if needs_full {
+        return DisambiguatedNameForm::LongFull;
+    }
+    match base {
+        DisambiguatedNameForm::ShortInitialized
+        | DisambiguatedNameForm::LongInitialized => {
+            DisambiguatedNameForm::LongInitialized
+        }
+        // No `initialize-with` is set, so initials cannot be rendered: expand
+        // to the full given name (`disambiguate_AllNamesSimpleSequence`).
+        DisambiguatedNameForm::ShortFull => DisambiguatedNameForm::LongFull,
+        other => other,
+    }
+}
+
+/// Expand given names of the group members in `active` where their family
+/// names clash but their given names differ.
+///
+/// `rule` selects which names may be expanded (`primary-name*` rules only
+/// touch the first name) and whether only initials may be added
+/// (`*-with-initials`). Matching citeproc-js, an initial is used when it is
+/// unique among the clashing names and the full given name otherwise.
+fn expand_given_names<T: EntryLike + Debug>(
+    data: &[DisambData<'_, T>],
+    props: &mut [Option<NameDisambiguationProperties>],
+    active: &[usize],
+    rule: DisambiguationRule,
+) {
+    let with_initials_only = matches!(
+        rule,
+        DisambiguationRule::AllNamesWithInitials
+            | DisambiguationRule::PrimaryNameWithInitials
+    );
+    let primary_only = matches!(
+        rule,
+        DisambiguationRule::PrimaryName | DisambiguationRule::PrimaryNameWithInitials
+    );
+
+    let max_names = active
+        .iter()
+        .filter_map(|idx| {
+            props[*idx].as_ref().map(NameDisambiguationProperties::visible_count)
+        })
+        .max()
+        .unwrap_or_default();
+
+    for pos in 0..max_names {
+        if primary_only && pos > 0 {
+            break;
+        }
+
+        let visible: Vec<usize> = active
+            .iter()
+            .copied()
+            .filter(|idx| {
+                props[*idx].as_ref().is_some_and(|p| p.form_at(pos).is_some())
+                    && data[*idx].names.get(pos).is_some()
+            })
+            .collect();
+        if visible.len() < 2 {
             continue;
         }
-        let mut xi = String::new();
-        x.initials(&mut xi, None, false).unwrap();
-        let mut pi = String::new();
-        p.initials(&mut pi, None, false).unwrap();
 
-        if xi == pi {
-            *form = DisambiguatedNameForm::LongFull;
-            return true;
+        let mut needs_initial = HashSet::new();
+        let mut needs_full = HashSet::new();
+        for (i, a) in visible.iter().enumerate() {
+            for b in &visible[i + 1..] {
+                let pa = &data[*a].names[pos];
+                let pb = &data[*b].names[pos];
+                if pa.name != pb.name {
+                    continue;
+                }
+                let (Some(given_a), Some(given_b)) = (&pa.given_name, &pb.given_name)
+                else {
+                    continue;
+                };
+                if given_a == given_b {
+                    continue;
+                }
+                let mut initials_a = String::new();
+                pa.initials(&mut initials_a, None, false).ok();
+                let mut initials_b = String::new();
+                pb.initials(&mut initials_b, None, false).ok();
+                needs_initial.insert(*a);
+                needs_initial.insert(*b);
+                if initials_a == initials_b {
+                    needs_full.insert(*a);
+                    needs_full.insert(*b);
+                }
+            }
         }
-        if form != &DisambiguatedNameForm::LongInitialized {
-            *form = DisambiguatedNameForm::LongInitialized;
-            changed = true;
+
+        for idx in needs_initial {
+            let Some(props) = props[idx].as_mut() else { continue };
+            let Some(base) = props.form_at(pos) else { continue };
+            let target = disambiguated_form_target(
+                base,
+                needs_full.contains(&idx),
+                with_initials_only,
+            );
+            props.set_form_at(pos, target);
         }
     }
-    changed
 }
 
 /// Progressively transform names to disambiguate them.
+///
+/// This mirrors citeproc-js's sweep-based `disNames`: all still-ambiguous
+/// entries grow one visible name per round, entries that become unique are
+/// frozen at that count, and given-name expansion is recomputed after every
+/// round so newly visible names can be expanded too.
 fn disambiguate_names<F, T>(
     renders: &[SpeculativeCiteRender<'_, '_, T>],
     group: &AmbiguousGroup,
@@ -1105,7 +1317,7 @@ fn disambiguate_names<F, T>(
     T: EntryLike + Eq + Hash + Debug,
     F: FnMut(&T, DisambiguateState),
 {
-    let group = group
+    let data = group
         .iter()
         .map(|(cite_id, item_id)| {
             let cite_id = *cite_id;
@@ -1120,135 +1332,156 @@ fn disambiguate_names<F, T>(
         })
         .collect::<Vec<_>>();
 
-    // How many names can we add at most? If we are not allowed to add names, it is only one.
-    let max_names = if renders[0].request.style.citation.disambiguate_add_names {
-        group.iter().map(|d| d.names.len()).max().unwrap_or_default()
-    } else {
-        1
-    };
+    let style = renders[data[0].cite_id].request.style;
+    let add_names = style.citation.disambiguate_add_names;
+    let rule = style
+        .citation
+        .disambiguate_add_givenname
+        .then_some(style.citation.givenname_disambiguation_rule);
 
-    // Tracks changes to the disambiguation state
-    let mut changed_states = HashMap::new();
-    // Tracks already disambiguated items
-    let mut disambiguated = HashSet::new();
+    // The disambiguation state in force for each group member, if it renders
+    // a names element at all.
+    let mut props: Vec<Option<NameDisambiguationProperties>> = data
+        .iter()
+        .map(|d| match &d.item.cite_props.speculative.disambiguation {
+            DisambiguateState::NameDisambiguation(p) => Some(p.clone()),
+            _ => d.item.first_name.clone(),
+        })
+        .collect();
+    let original = props.clone();
 
-    // Successively add names
-    for i in 1..=max_names {
-        let disamb_len = disambiguated.len();
-        if disamb_len == group.len() {
-            // Already fully disambiguated
-            break;
-        }
-        for d in &group {
-            if disambiguated.contains(&(d.cite_id, d.item_id)) {
-                // Already done
-                continue;
-            }
-            let style = renders[d.cite_id].request.style;
-            // We only apply the rule if we are allowed to.
-            let rule = match (
-                style.citation.disambiguate_add_givenname,
-                style.citation.givenname_disambiguation_rule,
-            ) {
-                (true, r) => Some(r),
-                _ => None,
-            };
-
-            if !d.item.cite_props.speculative.disambiguation.may_disambiguate_names() {
-                continue;
-            }
-
-            if is_disambiguated(i, &group, d, rule) {
-                // Adding a name would disambiguate, so lets add it
-                disambiguated.insert((d.cite_id, d.item_id));
-
-                // By-cite may expand any name, the primary-name rules only
-                // the first. All-names rules need document-wide comparison.
-                let expand_idx = match rule {
-                    Some(DisambiguationRule::ByCite) => Some(i - 1),
-                    Some(
-                        DisambiguationRule::PrimaryName
-                        | DisambiguationRule::PrimaryNameWithInitials,
-                    ) if i == 1 => Some(0),
-                    _ => None,
-                };
-
-                if let Some(idx) = expand_idx {
-                    let name_props_slot =
-                        if let Some(DisambiguateState::NameDisambiguation(ndp)) =
-                            changed_states.get(&(d.cite_id, d.item_id))
-                        {
-                            Some(ndp)
-                        } else if let DisambiguateState::NameDisambiguation(n) =
-                            &d.item.cite_props.speculative.disambiguation
-                        {
-                            Some(n)
-                        } else {
-                            d.item.first_name.as_ref()
-                        };
-                    if let Some(props) = name_props_slot {
-                        let mut props = props.clone();
-                        if let Some(form) = props.get_form_mut(idx)
-                            && disamb_cite_add_given_name(
-                                &d.names[idx],
-                                &group
-                                    .iter()
-                                    .filter(|i| {
-                                        i.cite_id != d.cite_id || i.item_id != d.item_id
-                                    })
-                                    .flat_map(|i| &i.names)
-                                    .collect::<Vec<_>>(),
-                                form,
-                            )
-                        {
-                            changed_states.insert(
-                                (d.cite_id, d.item_id),
-                                DisambiguateState::NameDisambiguation(props),
-                            );
-                            disambiguated.insert((d.cite_id, d.item_id));
-                        }
-                    }
-                }
-            }
-        }
-        if disambiguated.len() > disamb_len {
-            for d in &group {
-                let name_props_slot =
-                    if let Some(DisambiguateState::NameDisambiguation(ndp)) =
-                        changed_states.get(&(d.cite_id, d.item_id))
-                    {
-                        Some(ndp)
-                    } else if let DisambiguateState::NameDisambiguation(n) =
-                        &d.item.cite_props.speculative.disambiguation
-                    {
-                        Some(n)
-                    } else {
-                        d.item.first_name.as_ref()
-                    };
-                if let Some(state) = name_props_slot {
-                    let mut state = state.clone();
-                    let before = state.clone();
-                    state.add_name(i);
-                    // Skip no-ops so other disambiguation methods still run.
-                    if state != before {
-                        changed_states.insert(
-                            (d.cite_id, d.item_id),
-                            DisambiguateState::NameDisambiguation(state),
-                        );
-                    }
-                }
-            }
-        }
+    if rule.is_none() && !add_names {
+        return;
     }
 
-    // Mark all changed states
-    for ((cite_id, item_id), s) in changed_states.into_iter() {
-        let entry = renders[cite_id].items[item_id].entry;
-        mark(entry, s)
+    let mut active: Vec<usize> = (0..data.len())
+        .filter(|idx| props[*idx].is_some())
+        .filter(|idx| {
+            data[*idx]
+                .item
+                .cite_props
+                .speculative
+                .disambiguation
+                .may_disambiguate_names()
+        })
+        .collect();
+
+    // citeproc-js only keeps a disambiguation step when it reduces the number
+    // of clashes; otherwise it falls back to the last improving render.
+    let mut best = props.clone();
+    let mut best_clashes = usize::MAX;
+    while !active.is_empty() {
+        if let Some(rule) = rule {
+            expand_given_names(&data, &mut props, &active, rule);
+        }
+
+        let keys: Vec<String> = active
+            .iter()
+            .map(|idx| {
+                name_disambiguation_key(props[*idx].as_ref().unwrap(), &data[*idx].names)
+            })
+            .collect();
+
+        let mut still = Vec::new();
+        for (pos, idx) in active.iter().enumerate() {
+            let unique = !keys
+                .iter()
+                .enumerate()
+                .any(|(other_pos, key)| other_pos != pos && *key == keys[pos]);
+            if !unique {
+                still.push(*idx);
+            }
+        }
+
+        if still.len() < best_clashes {
+            best_clashes = still.len();
+            best = props.clone();
+        }
+
+        if still.is_empty() || !add_names {
+            break;
+        }
+
+        let mut grew = false;
+        for idx in &still {
+            let Some(props) = props[*idx].as_mut() else { continue };
+            let visible = props.visible_count();
+            if visible < props.name_count() {
+                props.add_name(visible + 1);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+        active = still;
+    }
+
+    for (idx, props) in best.iter().enumerate() {
+        let Some(props) = props else { continue };
+        if original[idx].as_ref() == Some(props) {
+            continue;
+        }
+        mark(data[idx].item.entry, DisambiguateState::NameDisambiguation(props.clone()));
     }
 }
 
+/// Count the `disambiguate="true"` conditions in the citation layout.
+fn style_disambiguate_levels(csl: &IndependentStyle) -> u8 {
+    fn helper(e: &LayoutRenderingElement, style: &StyleContext, count: &mut u8) {
+        use citationberg::TextTarget;
+        if let LayoutRenderingElement::Choose(choose) = e {
+            for branch in choose.branches() {
+                if branch.disambiguate == Some(true) {
+                    *count = count.saturating_add(1);
+                }
+            }
+            for branch in choose.branches() {
+                for child in &branch.children {
+                    helper(child, style, count);
+                }
+            }
+            if let Some(otherwise) = &choose.otherwise {
+                for child in &otherwise.children {
+                    helper(child, style, count);
+                }
+            }
+            return;
+        }
+        match e {
+            LayoutRenderingElement::Text(Text {
+                target: TextTarget::Macro { name },
+                ..
+            }) => {
+                if let Some(mac) = style.get_macro(name) {
+                    for child in &mac.children {
+                        helper(child, style, count);
+                    }
+                }
+            }
+            LayoutRenderingElement::Group(Group { children, .. }) => {
+                for child in children {
+                    helper(child, style, count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let style = StyleContext::new(csl, None, &[]);
+    let mut count = 0;
+    for element in &csl.citation.layout.elements {
+        helper(element, &style, &mut count);
+    }
+    count
+}
+
 /// Mark qualifying entries for disambiguation with `cs:choose`.
+///
+/// Every member of an ambiguous group activates the next `disambiguate`
+/// level, matching citeproc-js: the first level is enabled for all clashing
+/// entries (including the first), and entries that remain ambiguous after a
+/// re-render activate the following level on the next sweep.
 fn disambiguate_with_choose<F, T>(
     renders: &[SpeculativeCiteRender<'_, '_, T>],
     group: &AmbiguousGroup,
@@ -1257,27 +1490,30 @@ fn disambiguate_with_choose<F, T>(
     T: EntryLike,
     F: FnMut(&T, DisambiguateState),
 {
-    if group.iter().any(|&(cite_idx, item_idx)| {
-        renders[cite_idx].items[item_idx].checked_disambiguate
-            && renders[cite_idx].items[item_idx]
+    let max_level = style_disambiguate_levels(renders[group[0].0].request.style);
+    if max_level == 0 {
+        return;
+    }
+
+    for &(cite_idx, item_idx) in group.iter() {
+        let item = &renders[cite_idx].items[item_idx];
+        if !item.checked_disambiguate
+            || !item
                 .cite_props
                 .speculative
                 .disambiguation
                 .may_disambiguate_with_choose()
-    }) {
-        // Do not set this for the first qualifying entry.
-        let mut armed = false;
-
-        for &(cite_idx, item_idx) in group.iter() {
-            let item = &renders[cite_idx].items[item_idx];
-            if item.checked_disambiguate {
-                if armed {
-                    mark(item.entry, DisambiguateState::Choose);
-                } else {
-                    armed = true;
-                }
-            }
+        {
+            continue;
         }
+        let current = match item.cite_props.speculative.disambiguation {
+            DisambiguateState::Choose(level) => level,
+            _ => 0,
+        };
+        if current >= max_level {
+            continue;
+        }
+        mark(item.entry, DisambiguateState::Choose(current + 1));
     }
 }
 
@@ -1285,10 +1521,11 @@ fn disambiguate_with_choose<F, T>(
 fn disambiguate_year_suffix<F, T>(
     renders: &[SpeculativeCiteRender<'_, '_, T>],
     group: &AmbiguousGroup,
+    bib_rank: &HashMap<*const T, usize>,
     mut mark: F,
 ) where
     T: EntryLike + PartialEq,
-    F: FnMut(&T, DisambiguateState),
+    F: FnMut(&T, u8),
 {
     if renders.iter().flat_map(|r| r.items.iter()).any(|i| {
         if i.style_uses_year_suffix_var {
@@ -1317,26 +1554,25 @@ fn disambiguate_year_suffix<F, T>(
             && renders[cite_idx].items[item_idx]
                 .cite_props
                 .speculative
-                .disambiguation
-                .may_disambiguate_with_year_suffix()
+                .year_suffix
+                .is_none()
     }) {
         let mut entries = Vec::new();
         for &(cite_idx, item_idx) in group.iter() {
             let item = &renders[cite_idx].items[item_idx];
-            if item
-                .cite_props
-                .speculative
-                .disambiguation
-                .may_disambiguate_with_year_suffix()
+            if item.cite_props.speculative.year_suffix.is_none()
                 && !entries.contains(&item.entry)
             {
                 entries.push(item.entry);
             }
         }
 
-        // Assign year suffixes.
+        // Assign year suffixes in bibliography order.
+        entries.sort_by_key(|entry| {
+            bib_rank.get(&(*entry as *const T)).copied().unwrap_or(usize::MAX)
+        });
         for (i, entry) in entries.into_iter().enumerate() {
-            mark(entry, DisambiguateState::YearSuffix(i as u8));
+            mark(entry, i as u8);
         }
     }
 }
@@ -1359,17 +1595,12 @@ fn find_ambiguous_sets<T: EntryLike + PartialEq>(
 
     for (i, cite) in cites.iter().enumerate() {
         for (j, item) in cite.items.iter().enumerate() {
-            if !item
-                .cite_props
-                .speculative
-                .disambiguation
-                .may_disambiguate_with_year_suffix()
-            {
-                // There is nothing we can do.
+            if item.cite_props.speculative.year_suffix.is_some() {
+                // This item already carries a suffix.
                 continue;
             }
 
-            let buf = format!("{}", item.rendered);
+            let buf = ambiguity_key(&item.rendered);
             match map.entry(buf) {
                 HmEntry::Occupied(entry) => match *entry.get() {
                     PotentialDisambiguation::Single(pos) => {
@@ -1518,8 +1749,8 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                             && i > 0
                             && cite.items[i - 1].locator.is_some();
                         if matches!(c, Collapse::YearSuffix | Collapse::YearSuffixRanged)
-                            && let DisambiguateState::YearSuffix(s) =
-                                cite.items[i].cite_props.speculative.disambiguation
+                            && let Some(s) =
+                                cite.items[i].cite_props.speculative.year_suffix
                             && s > 0
                         {
                             // We want to collapse the years up to the suffix
@@ -1571,10 +1802,7 @@ fn collapse_items<'a, T: EntryLike>(cite: &mut SpeculativeCiteRender<'a, '_, T>)
                 fn year_suffix<T: EntryLike>(
                     item: &SpeculativeItemRender<'_, T>,
                 ) -> Option<u32> {
-                    match item.cite_props.speculative.disambiguation {
-                        DisambiguateState::YearSuffix(s) => Some(u32::from(s)),
-                        _ => None,
-                    }
+                    item.cite_props.speculative.year_suffix.map(u32::from)
                 }
 
                 let mut group_start = 0;
@@ -1959,6 +2187,9 @@ pub(crate) struct StyleContext<'a> {
     locale_files: &'a [Locale],
     /// Which locale we're using.
     locale_override: Option<LocaleCode>,
+    /// Document-wide name counts for given-name disambiguation rules other
+    /// than `by-cite` (empty while sorting).
+    pub(crate) name_registry: Option<&'a NameRegistry>,
 }
 
 impl<'a> StyleContext<'a> {
@@ -1967,7 +2198,12 @@ impl<'a> StyleContext<'a> {
         locale: Option<LocaleCode>,
         locale_files: &'a [Locale],
     ) -> Self {
-        Self { csl: style, locale_files, locale_override: locale }
+        Self {
+            csl: style,
+            locale_files,
+            locale_override: locale,
+            name_registry: None,
+        }
     }
 
     fn ctx<'b, T: EntryLike>(
@@ -2662,6 +2898,8 @@ pub(crate) struct WritingContext {
     suppressed_variables: RefCell<Vec<Variable>>,
     /// Whether this render has checked for `disambiguate` in `cs:choose`.
     checked_disambiguate: bool,
+    /// How many `disambiguate="true"` conditions were active in this render.
+    disambiguate_count: u8,
     /// Check whether this is the first date.
     first_date: bool,
     /// The disambiguation-relevant properties of the first `cs:name` element.
@@ -2700,6 +2938,7 @@ impl Default for WritingContext {
             suppress_queried_variables: false,
             suppressed_variables: RefCell::new(Vec::new()),
             checked_disambiguate: false,
+            disambiguate_count: 0,
             first_date: true,
             first_name: None,
             format_stack: NonEmptyStack::default(),
@@ -3161,6 +3400,8 @@ struct SpeculativeCiteProperties<'a> {
     /// Is always false for the first set of renders. Only the rendered entries
     /// allow us to determine if we need to disambiguate.
     pub disambiguation: DisambiguateState,
+    /// The disambiguation year suffix assigned to this item (`a`, `b`, …).
+    pub year_suffix: Option<u8>,
     /// Whether this citation includes an identifier.
     pub identifier_usage: IdentifierUsage,
 }
@@ -3178,6 +3419,7 @@ impl<'a> SpeculativeCiteProperties<'a> {
             citation_number,
             ibid,
             disambiguation: DisambiguateState::default(),
+            year_suffix: None,
             identifier_usage: IdentifierUsage::default(),
         }
     }
@@ -3193,6 +3435,7 @@ impl<'a> SpeculativeCiteProperties<'a> {
                 DisambiguateState::NameDisambiguation(_) => DisambiguateState::None,
                 other => other,
             },
+            year_suffix: self.year_suffix,
             identifier_usage: self.identifier_usage,
         }
     }
@@ -3235,8 +3478,8 @@ pub enum DisambiguateState {
     #[default]
     None,
     NameDisambiguation(NameDisambiguationProperties),
-    Choose,
-    YearSuffix(u8),
+    /// `cs:choose disambiguate="true"` is active up to the given level.
+    Choose(u8),
 }
 
 impl DisambiguateState {
@@ -3245,14 +3488,9 @@ impl DisambiguateState {
         matches!(self, Self::None | Self::NameDisambiguation(_))
     }
 
-    /// We can only disambiguate with choose once.
+    /// Whether another disambiguation level may be activated.
     fn may_disambiguate_with_choose(&self) -> bool {
-        matches!(self, Self::None | Self::NameDisambiguation(_))
-    }
-
-    /// We can only disambiguate with year suffix once.
-    fn may_disambiguate_with_year_suffix(&self) -> bool {
-        matches!(self, Self::None | Self::NameDisambiguation(_) | Self::Choose)
+        matches!(self, Self::None | Self::NameDisambiguation(_) | Self::Choose(_))
     }
 
     /// Return the more advanced disambiguation state between the two.
@@ -3265,9 +3503,9 @@ impl DisambiguateState {
             }
             (Self::NameDisambiguation(_), other) => other,
             (self_, Self::NameDisambiguation(_)) => self_,
-            (Self::Choose, other) => other,
-            (self_, Self::Choose) => self_,
-            (Self::YearSuffix(a), Self::YearSuffix(b)) => Self::YearSuffix(a.max(b)),
+            (Self::Choose(a), Self::Choose(b)) => Self::Choose(a.max(b)),
+            (Self::Choose(_), other) => other,
+            (self_, Self::Choose(_)) => self_,
         }
     }
 }
@@ -3599,7 +3837,9 @@ impl<'a, T: EntryLike> Context<'a, T> {
         while stack.len() > pos {
             match stack.pop().unwrap() {
                 MarkupOpen::NoCase => {}
-                MarkupOpen::Format(_, idx) | MarkupOpen::Span(idx) => self.pop_format(idx),
+                MarkupOpen::Format(_, idx) | MarkupOpen::Span(idx) => {
+                    self.pop_format(idx)
+                }
             }
         }
     }
@@ -3648,14 +3888,15 @@ impl<'a, T: EntryLike> Context<'a, T> {
         // Only literal spaces collapse at a seam; newlines and tabs are
         // significant delimiters in some styles (e.g. the punctuation tests'
         // blank lines).
-        let ends_with_space = last_buffer(&mut self.writing)
-            .is_some_and(|s| s.chars().next_back().is_some_and(|c| matches!(c, ' ' | '\u{a0}')));
+        let ends_with_space = last_buffer(&mut self.writing).is_some_and(|s| {
+            s.chars().next_back().is_some_and(|c| matches!(c, ' ' | '\u{a0}'))
+        });
 
         // Punctuation eats spaces. Whitespace should be trimmed.
         if ends_with_space
-            && s.chars().next().is_some_and(|c| {
-                matches!(c, ' ' | '\u{a0}' | '.' | ',' | ']' | ')')
-            })
+            && s.chars()
+                .next()
+                .is_some_and(|c| matches!(c, ' ' | '\u{a0}' | '.' | ',' | ']' | ')'))
             && let Some(buf) = last_buffer(&mut self.writing)
         {
             buf.truncate(buf.trim_end_matches([' ', '\u{a0}']).len());
@@ -3826,13 +4067,9 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 .map(|locale| locale.0.clone())
                 .or_else(|| self.instance.entry.language().map(Cow::into_owned))
                 .is_some_and(|locale| {
-                    locale
-                        .split(['-', '_'])
-                        .next()
-                        .is_some_and(|lang| {
-                            lang.eq_ignore_ascii_case("tr")
-                                || lang.eq_ignore_ascii_case("az")
-                        })
+                    locale.split(['-', '_']).next().is_some_and(|lang| {
+                        lang.eq_ignore_ascii_case("tr") || lang.eq_ignore_ascii_case("az")
+                    })
                 });
             let case = case.map(|case| match (case, turkic) {
                 (TextCase::Uppercase, true) => Case::UppercaseTurkic,
@@ -3959,6 +4196,18 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.instance.entry.resolve_date_variable(variable)
     }
 
+    /// Resolve a literal date value (`"in press"`) for a date variable.
+    ///
+    /// Honors suppressions like [`Self::resolve_date_variable`].
+    fn resolve_date_literal(
+        &self,
+        variable: csl_taxonomy::DateVariable,
+    ) -> Option<Cow<'a, str>> {
+        self.writing.prepare_variable_query(variable)?;
+
+        self.instance.entry.resolve_date_literal(variable)
+    }
+
     /// Resolve a name variable.
     ///
     /// Honors suppressions.
@@ -4044,7 +4293,19 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// Test whether this entry should disambiguate via `cs:choose`.
     fn should_disambiguate(&mut self) -> bool {
         self.writing.checked_disambiguate = true;
-        self.instance.cite_props.speculative.disambiguation == DisambiguateState::Choose
+        let level = match self.instance.cite_props.speculative.disambiguation {
+            DisambiguateState::Choose(level) => level,
+            _ => 0,
+        };
+        // citeproc-js counts the `disambiguate="true"` conditions as they are
+        // evaluated: the Nth condition is true when the item's disambiguation
+        // level is at least N, which makes `cs:choose` levels incremental.
+        if self.writing.disambiguate_count < level {
+            self.writing.disambiguate_count += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Check whether this is the first date and set the first date flag.
@@ -4059,18 +4320,22 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.writing.first_date
     }
 
-    /// Checks that neither the bibliography nor the citation layout render the
-    /// year suffix.
-    fn renders_year_suffix_implicitly(&mut self) -> bool {
-        !self
-            .style
+    /// Whether the style renders the `year-suffix` variable explicitly.
+    fn renders_explicit_year_suffix(&mut self) -> bool {
+        self.style
             .csl
             .citation
             .layout
             .will_render(self, StandardVariable::YearSuffix.into())
-            && !self.style.csl.bibliography.as_ref().is_some_and(|b| {
+            || self.style.csl.bibliography.as_ref().is_some_and(|b| {
                 b.layout.will_render(self, StandardVariable::YearSuffix.into())
             })
+    }
+
+    /// Checks that neither the bibliography nor the citation layout render the
+    /// year suffix (and that no citation label carries it instead).
+    fn renders_year_suffix_implicitly(&mut self) -> bool {
+        !uses_citation_label(&self.style) && !self.renders_explicit_year_suffix()
     }
 
     /// Set the [`SpecialForm`]
@@ -4147,7 +4412,9 @@ fn markup_formatting(kind: MarkupKind) -> citationberg::Formatting {
         MarkupKind::Italic => formatting.font_style = Some(FontStyle::Italic),
         MarkupKind::Bold => formatting.font_weight = Some(FontWeight::Bold),
         MarkupKind::SmallCaps => formatting.font_variant = Some(FontVariant::SmallCaps),
-        MarkupKind::Underline => formatting.text_decoration = Some(TextDecoration::Underline),
+        MarkupKind::Underline => {
+            formatting.text_decoration = Some(TextDecoration::Underline)
+        }
         MarkupKind::Sup => formatting.vertical_align = Some(VerticalAlign::Sup),
         MarkupKind::Sub => formatting.vertical_align = Some(VerticalAlign::Sub),
         MarkupKind::NoDecor => return nodecor_formatting(),
@@ -4417,6 +4684,115 @@ fn uses_year_suffix_var(style: &StyleContext) -> bool {
         .elements
         .iter()
         .any(|e| has_year_suffix_var(e, style))
+}
+
+/// Collect the name variables rendered by the style's citations.
+fn style_name_variables(csl: &IndependentStyle) -> Vec<NameVariable> {
+    fn helper(
+        e: &LayoutRenderingElement,
+        style: &StyleContext,
+        out: &mut Vec<NameVariable>,
+    ) {
+        use citationberg::TextTarget;
+        match e {
+            LayoutRenderingElement::Names(names) => {
+                for variable in &names.variable {
+                    if !out.contains(variable) {
+                        out.push(*variable);
+                    }
+                }
+            }
+            LayoutRenderingElement::Text(Text {
+                target: TextTarget::Macro { name },
+                ..
+            }) => {
+                if let Some(mac) = style.get_macro(name) {
+                    for child in &mac.children {
+                        helper(child, style, out);
+                    }
+                }
+            }
+            LayoutRenderingElement::Group(Group { children, .. }) => {
+                for child in children {
+                    helper(child, style, out);
+                }
+            }
+            LayoutRenderingElement::Choose(Choose { if_, else_if, otherwise }) => {
+                for child in &if_.children {
+                    helper(child, style, out);
+                }
+                for branch in else_if {
+                    for child in &branch.children {
+                        helper(child, style, out);
+                    }
+                }
+                if let Some(otherwise) = otherwise {
+                    for child in &otherwise.children {
+                        helper(child, style, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let style = StyleContext::new(csl, None, &[]);
+    let mut out = Vec::new();
+    for element in &csl.citation.layout.elements {
+        helper(element, &style, &mut out);
+    }
+    out
+}
+
+/// True iff the style renders the `citation-label` variable anywhere.
+///
+/// citeproc-js sets `has_year_suffix` when rendering a citation label, which
+/// suppresses the implicit year suffix on `cs:date` (the label carries it).
+fn uses_citation_label(style: &StyleContext) -> bool {
+    style
+        .csl
+        .citation
+        .layout
+        .elements
+        .iter()
+        .any(|e| has_citation_label_var(e, style))
+        || style.csl.bibliography.as_ref().is_some_and(|b| {
+            b.layout.elements.iter().any(|e| has_citation_label_var(e, style))
+        })
+}
+
+/// True iff the element `e` uses the `citation-label` variable.
+fn has_citation_label_var(e: &LayoutRenderingElement, style: &StyleContext) -> bool {
+    use citationberg::TextTarget;
+    match e {
+        LayoutRenderingElement::Text(Text {
+            target:
+                TextTarget::Variable {
+                    var: Variable::Standard(StandardVariable::CitationLabel),
+                    ..
+                },
+            ..
+        }) => true,
+        LayoutRenderingElement::Text(Text {
+            target: TextTarget::Macro { name }, ..
+        }) => style
+            .get_macro(name)
+            .map(|m| m.children.iter().any(|e| has_citation_label_var(e, style)))
+            .unwrap_or(false),
+        LayoutRenderingElement::Group(Group { children, .. }) => {
+            children.iter().any(|e| has_citation_label_var(e, style))
+        }
+        LayoutRenderingElement::Choose(Choose { if_, else_if, otherwise }) => {
+            if_.children.iter().any(|e| has_citation_label_var(e, style))
+                || else_if.iter().any(|ei| {
+                    ei.children.iter().any(|e| has_citation_label_var(e, style))
+                })
+                || otherwise.as_ref().is_some_and(|o| {
+                    o.children.iter().any(|e| has_citation_label_var(e, style))
+                })
+        }
+        _ => false,
+    }
 }
 
 /// True iff the element `e` uses the `year-suffix` variable.
@@ -5460,5 +5836,72 @@ mod tests {
         );
 
         assert_eq!(citation, "Book A, cited in Book B");
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_date_conversion() {
+        // CSL-JSON numbers years historically (-250 is 250 BCE) while the
+        // internal representation uses 0 for 1 BCE.
+        let item: citationberg::json::Item =
+            serde_json::from_str(r#"{"id":"a","issued":{"date-parts":[[-250,13,1]]}}"#)
+                .unwrap();
+        let date = item.resolve_date_variable(DateVariable::Issued).expect("date");
+        assert_eq!(date.year, -249);
+        let mut year = String::new();
+        write_year(date.year, false, &mut year, " AD", " BC").unwrap();
+        assert_eq!(year, "250 BC");
+        // Month 13 is the CSL spring season, not a month.
+        assert_eq!(date.month, None);
+        assert_eq!(date.season, Some(citationberg::taxonomy::Season::Spring));
+
+        // Literal dates are exposed separately from machine-readable parts.
+        let item: citationberg::json::Item = serde_json::from_str(
+            r#"{"id":"b","issued":{"date-parts":[],"literal":"(in press)"}}"#,
+        )
+        .unwrap();
+        assert!(item.resolve_date_variable(DateVariable::Issued).is_none());
+        assert_eq!(
+            item.resolve_date_literal(DateVariable::Issued).as_deref(),
+            Some("(in press)")
+        );
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_citation_label_trigraph() {
+        let item: citationberg::json::Item = serde_json::from_str(
+            r#"{"id":"a","author":[{"family":"Aalto","given":"Alan"}],"issued":{"date-parts":[[2002]]}}"#,
+        )
+        .unwrap();
+        let label = item
+            .resolve_standard_variable(
+                LongShortForm::Long,
+                StandardVariable::CitationLabel,
+            )
+            .expect("label")
+            .to_string();
+        assert_eq!(label, "Aalt02");
+    }
+
+    #[test]
+    fn name_registry_counts() {
+        let mut registry = NameRegistry::default();
+        let person = |family: &str, given: &str| Person {
+            name: family.to_string(),
+            given_name: Some(given.to_string()),
+            prefix: None,
+            suffix: None,
+            alias: None,
+            comma_suffix: false,
+        };
+        registry.register(&person("Oblinger", "Dan Gerry"));
+        registry.register(&person("Oblinger", "Susan Mary"));
+        assert_eq!(registry.counts(&person("Oblinger", "Dan Gerry")), (2, 1));
+        // Initials are compared without periods or spacing
+        // (`disambiguate_DifferentSpacingInInitials`).
+        registry.register(&person("Doe", "J. J."));
+        registry.register(&person("Doe", "J.J."));
+        assert_eq!(registry.counts(&person("Doe", "J. J.")), (1, 1));
     }
 }
