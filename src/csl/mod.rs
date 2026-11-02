@@ -1921,6 +1921,7 @@ fn move_punctuation_inside_quote(
     children: &mut ElemChildren,
     suffix: &mut String,
     enabled: bool,
+    marks: &QuoteMarks,
 ) {
     if !enabled {
         return;
@@ -1930,14 +1931,12 @@ fn move_punctuation_inside_quote(
         return;
     }
     let Some(last) = last_text_mut_child(&mut children.0) else { return };
-    let Some(quote) = last.text.chars().last() else { return };
-    if !matches!(quote, '"' | '\'' | '\u{201d}' | '\u{2019}' | '\u{00bb}') {
-        return;
+    // Insert before the whole trailing run of closing marks: a title that
+    // ends in nested quotes keeps the punctuation inside all of them
+    // (`2015.’”`, `bugreports_NoCaseEscape`).
+    if quotes::move_punctuation_inside(&mut last.text, first, marks) {
+        suffix.drain(..first.len_utf8());
     }
-    let quote_len = quote.len_utf8();
-    let at = last.text.len() - quote_len;
-    last.text.insert(at, first);
-    suffix.drain(..first.len_utf8());
 }
 
 /// Collect the rendered text of all `cs:name` elements below `e`.
@@ -3859,6 +3858,19 @@ impl WritingContext {
     }
 
     /// Push a new suppressed variable if we are suppressing queried variables.
+    /// The string in which the last rendered output lives: the raw buffer if
+    /// it has content, otherwise the deepest trailing text of the element
+    /// stack (rich-text runs commit their text into nested elements).
+    fn last_mut_text(&mut self) -> Option<&mut String> {
+        if !self.buf.is_empty() {
+            return Some(self.buf.as_string_mut());
+        }
+        self.elem_stack
+            .last_mut_predicate(|p| !p.is_empty())
+            .and_then(|p| p.last_text_mut())
+            .map(|f| &mut f.text)
+    }
+
     fn maybe_suppress(&self, variable: Variable) {
         if self.suppress_queried_variables {
             self.suppressed_variables.borrow_mut().push(variable);
@@ -4329,6 +4341,20 @@ impl<'a, T: EntryLike> Context<'a, T> {
 
     /// Pull punctuation into a quote if applicable
     fn do_pull_punctuation<'s>(&mut self, mut s: &'s str) -> &'s str {
+        // Merge the punctuation that follows a closing quotation with the
+        // punctuation that ends the quotation (citeproc-js's LtoR_MAP). The
+        // merged characters are split at the quote mark: `swap-in`
+        // punctuation (`.`, `,`, `!`, `?`) stays inside, `swap-out`
+        // punctuation (`:`, `;`) stays outside
+        // (`punctuation_FullMontyQuotesIn`).
+        if self.style.punctuation_in_quotes()
+            && let Some(first) = s.chars().next()
+            && matches!(first, '.' | ',' | '!' | '?' | ':' | ';')
+            && self.merge_quote_punctuation(first)
+        {
+            return &s[first.len_utf8()..];
+        }
+
         // citeproc-js's punctuation-in-quote only swaps terminal punctuation
         // dot, comma, exclamation and question marks inside the quote;
         // semicolons and colons stay outside (FullMontyQuotesIn).
@@ -4363,6 +4389,69 @@ impl<'a, T: EntryLike> Context<'a, T> {
         }
 
         s
+    }
+
+    /// Merge `following` with the punctuation that ends the current
+    /// quotation, if the output currently ends with a closing quotation mark.
+    ///
+    /// Returns whether the merge consumed `following`.
+    fn merge_quote_punctuation(&mut self, following: char) -> bool {
+        let marks = QuoteMarks::get(self.style);
+        let Some(text) = self.writing.last_mut_text() else { return false };
+
+        // A colon or semicolon suffix was rendered outside the closing
+        // quotation; it trails the marks.
+        let body = text.trim_end_matches([':', ';']);
+        let outside = text[body.len()..].chars().next();
+        let Some(close_start) = marks.trailing_close_quote_start(body) else {
+            return false;
+        };
+        let inside = body[..close_start]
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '.' | ',' | '!' | '?' | ':' | ';'));
+
+        let (left, inside_len) = match outside {
+            Some(c) => (c, 0),
+            None => match inside {
+                Some(c) => (c, c.len_utf8()),
+                None => return false,
+            },
+        };
+        // Duplicate punctuation collapses to one mark: the one that already
+        // ends the quotation.
+        if left == following {
+            return true;
+        }
+        let Some(merged) = quotes::merge_ltr(left, following) else {
+            return false;
+        };
+
+        // citeproc-js merges to the left and only lets the merged result
+        // migrate into the quotation when it starts with `swap-in`
+        // punctuation; a result that starts with `:` or `;` stays outside as
+        // a whole (`,:` and `;,` in `punctuation_FullMontyQuotesIn`).
+        let (inside, outside): (String, String) = if merged
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '.' | ',' | '!' | '?'))
+        {
+            (
+                merged.chars().filter(|c| matches!(c, '.' | ',' | '!' | '?')).collect(),
+                merged.chars().filter(|c| matches!(c, ':' | ';')).collect(),
+            )
+        } else {
+            (String::new(), merged.to_string())
+        };
+
+        let close_run = &body[close_start..];
+        let mut new = String::with_capacity(text.len() + merged.len());
+        new.push_str(&body[..close_start - inside_len]);
+        new.push_str(&inside);
+        new.push_str(close_run);
+        new.push_str(&outside);
+        *text = new;
+        true
     }
 
     /// Convert the quotation marks in `s` using the current quote state.
@@ -4931,8 +5020,9 @@ impl<'a, T: EntryLike> Context<'a, T> {
         // preceding quotation before it is written.
         let mut affixes = affixes.clone();
         if let Some(prefix) = affixes.prefix.take() {
-            let quoted = self.smart_quote(&prefix);
-            affixes.prefix = Some(self.do_pull_punctuation(&quoted).to_string());
+            // citeproc-js appends affixes verbatim: quote marks in an affix
+            // are never flip-flopped (`quotes_QuotesUnderQuotesFalse`).
+            affixes.prefix = Some(self.do_pull_punctuation(&prefix).to_string());
         }
         self.writing.apply_prefix(&affixes, ambient)
     }
@@ -4968,10 +5058,12 @@ impl<'a, T: EntryLike> Context<'a, T> {
                     }
                 }
                 let mut suffix = suffix.clone();
+                let marks = QuoteMarks::get(self.style);
                 move_punctuation_inside_quote(
                     &mut elem.children,
                     &mut suffix,
                     self.style.punctuation_in_quotes(),
+                    &marks,
                 );
                 if !suffix.is_empty() && !current.ends_with(suffix.as_str()) {
                     elem.children.0.push(ElemChild::Text(ambient.add_text(suffix)));
@@ -5023,15 +5115,23 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// ancestor formatting.
     fn push_affix_str(&mut self, s: &str, ambient: Formatting) {
         if ambient == *self.writing.formatting() {
-            self.push_str(s);
+            self.push_str_affix(s);
             return;
         }
 
         self.writing.save_to_block();
         let prev = mem::replace(self.writing.format_stack.last_mut(), ambient);
-        self.push_str(s);
+        self.push_str_affix(s);
         self.writing.save_to_block();
         *self.writing.format_stack.last_mut() = prev;
+    }
+
+    /// Push literal affix text: no smart-quote conversion (citeproc-js leaves
+    /// affix quotes straight), but punctuation-in-quote and seam merging
+    /// still apply.
+    fn push_str_affix(&mut self, s: &str) {
+        let normalized = normalize_punctuation_spacing(s);
+        self.push_str_raw_seam(&normalized, false);
     }
 
     /// Test whether this entry should disambiguate via `cs:choose`.

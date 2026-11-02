@@ -77,8 +77,19 @@ impl QuoteMarks {
 struct Scope {
     /// Whether the scope was opened by a double quotation mark.
     family: bool,
-    /// Whether the scope was opened by a straight (rather than typed) mark.
-    straight: bool,
+    /// Whether the mark was already typographic (curly) rather than straight.
+    ///
+    /// At the outermost level a straight mark opens the locale's outer
+    /// quotation and a typed mark opens its own family (`‘` stays single).
+    /// Every nested quotation flips the form of its parent, which citeproc-js
+    /// expresses with the `flipflop` table of its quote decorators.
+    typed: bool,
+    /// The rendered form of this scope: `true` for the locale's outer marks,
+    /// `false` for the inner marks.
+    outer: bool,
+    /// Whether this scope has a straight opener that must be restored when it
+    /// is left unclosed.
+    restorable: bool,
 }
 
 /// Stateful converter that turns straight and typed quotation marks into the
@@ -92,60 +103,41 @@ struct Scope {
 pub(crate) struct SmartQuoter {
     /// The currently open quote scopes, outermost first.
     scopes: Vec<Scope>,
-    /// The family (double or single) of the first straight quote that opened a
-    /// scope. Like citeproc-js, the first straight quote form encountered
-    /// becomes the outer form; the other family becomes the inner form.
-    outer_family: Option<bool>,
 }
 
 impl SmartQuoter {
+    /// The rendered form of a quotation opened inside the current scope.
+    fn next_form(&self, family: bool, typed: bool) -> bool {
+        match self.scopes.last() {
+            // Every nested quotation flips the form of its parent.
+            Some(parent) => !parent.outer,
+            // At the outermost level straight marks open the outer form and
+            // typed marks keep their own family.
+            None => {
+                if typed {
+                    family
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
     /// Open a quotation created by a `quotes="true"` element and return its
     /// opening mark.
     pub fn open_quotes<'a>(&mut self, marks: &'a QuoteMarks) -> &'a str {
-        let outer = self.open_form(true, false);
-        self.scopes.push(Scope { family: true, straight: false });
+        let outer = self.next_form(true, false);
+        self.scopes.push(Scope { family: true, typed: false, outer, restorable: false });
         if outer { &marks.open_quote } else { &marks.open_inner_quote }
     }
 
     /// Close the innermost quotation created by a `quotes="true"` element and
     /// return its closing mark.
     pub fn close_quotes<'a>(&mut self, marks: &'a QuoteMarks) -> &'a str {
-        if self.scopes.is_empty() {
+        let Some(scope) = self.scopes.pop() else {
             return &marks.close_quote;
-        }
-        let outer = self.close_form();
-        self.scopes.pop();
-        if outer { &marks.close_quote } else { &marks.close_inner_quote }
-    }
-
-    /// The form (outer vs. inner) of the quotation currently being opened.
-    fn open_form(&mut self, family: bool, straight: bool) -> bool {
-        if straight && self.outer_family.is_none() {
-            self.outer_family = Some(family);
-        }
-
-        if self.scopes.is_empty() {
-            if straight { self.outer_family.unwrap_or(family) == family } else { family }
-        } else {
-            self.form_outer_at(self.scopes.len())
-        }
-    }
-
-    /// The form (outer vs. inner) of the innermost open quotation.
-    fn close_form(&self) -> bool {
-        self.form_outer_at(self.scopes.len() - 1)
-    }
-
-    /// The form (outer vs. inner) of the quotation at `depth`.
-    fn form_outer_at(&self, depth: usize) -> bool {
-        let base_outer = match self.scopes.first() {
-            Some(first) if first.straight => {
-                self.outer_family.unwrap_or(first.family) == first.family
-            }
-            Some(first) => first.family,
-            None => true,
         };
-        base_outer != (depth % 2 == 1)
+        if scope.outer { &marks.close_quote } else { &marks.close_inner_quote }
     }
 
     /// Convert the quotation marks in `s`.
@@ -157,21 +149,30 @@ impl SmartQuoter {
         let start_depth = self.scopes.len();
         let mut out = String::with_capacity(s.len() + 8);
 
-        // Opening marks that have not been closed yet, as (byte position in
-        // `out`, emitted length, character to restore). They are restored at
-        // the end of the string.
+        // Straight opening marks that have not been closed yet, as (byte
+        // position in `out`, emitted length, character to restore). They are
+        // restored at the end of the string.
         let mut openers: Vec<(usize, usize, char)> = Vec::new();
 
         let mut chars = s.chars().peekable();
         let mut prev: Option<char> = None;
+        // Whether `prev` opened a quotation scope: adjacent openers nest
+        // (`'"abc"'`), while a closing mark is never an opener.
+        let mut prev_opened = false;
         while let Some(c) = chars.next() {
             let next = chars.peek().copied();
+            let opens_context = is_open_context(prev) || prev_opened;
+            let mut did_open = false;
             match c {
                 '"' | '“' => {
-                    if c == '“' || is_open_context(prev) {
-                        self.open(&mut out, &mut openers, marks, c, true, c == '"');
+                    if c == '“' {
+                        self.open(&mut out, &mut openers, marks, c, true, true);
+                        did_open = true;
+                    } else if opens_context {
+                        self.open(&mut out, &mut openers, marks, c, true, false);
+                        did_open = true;
                     } else if self.scopes.last().is_some_and(|s| s.family) {
-                        self.close(&mut out, marks);
+                        self.close(&mut out, marks, &mut openers);
                     } else {
                         out.push(c);
                     }
@@ -181,33 +182,36 @@ impl SmartQuoter {
                         && prev.is_some_and(char::is_alphanumeric)
                         && next.is_some_and(char::is_alphanumeric);
                     if c == '‘' {
-                        self.open(&mut out, &mut openers, marks, c, false, false);
+                        self.open(&mut out, &mut openers, marks, c, false, true);
+                        did_open = true;
                     } else if apostrophe {
                         // An apostrophe never opens or closes a scope.
                         out.push('’');
-                    } else if is_open_context(prev) {
-                        self.open(&mut out, &mut openers, marks, c, false, c == '\'');
+                    } else if opens_context {
+                        self.open(&mut out, &mut openers, marks, c, false, false);
+                        did_open = true;
                     } else if self.scopes.last().is_some_and(|s| !s.family) {
-                        self.close(&mut out, marks);
+                        self.close(&mut out, marks, &mut openers);
                     } else {
                         out.push(if c == '\'' { '’' } else { c });
                     }
                 }
                 '”' => {
                     if self.scopes.last().is_some_and(|s| s.family) {
-                        self.close(&mut out, marks);
+                        self.close(&mut out, marks, &mut openers);
                     } else {
                         out.push(c);
                     }
                 }
                 _ => out.push(c),
             }
+            prev_opened = did_open;
             prev = Some(c);
         }
 
-        // Restore unclosed opening marks and drop their scopes.
-        let unclosed = self.scopes.len() - start_depth;
-        for (pos, len, restore) in openers.into_iter().rev().take(unclosed) {
+        // Restore the straight opening marks that were never closed and drop
+        // their scopes.
+        for (pos, len, restore) in openers.into_iter().rev() {
             out.replace_range(pos..pos + len, &restore.to_string());
         }
         self.scopes.truncate(start_depth);
@@ -223,23 +227,33 @@ impl SmartQuoter {
         marks: &QuoteMarks,
         orig: char,
         family: bool,
-        straight: bool,
+        typed: bool,
     ) {
-        let outer = self.open_form(family, straight);
+        let outer = self.next_form(family, typed);
         let mark = if outer { &marks.open_quote } else { &marks.open_inner_quote };
-        // Unmatched straight single quotes become apostrophes when restored;
-        // unmatched double quotes stay straight (citeproc-js behavior).
-        let restore = if orig == '\'' { '’' } else { orig };
-        openers.push((out.len(), mark.len(), restore));
+        if !typed {
+            // Unmatched straight single quotes become apostrophes when
+            // restored; unmatched double quotes stay straight (citeproc-js
+            // behavior).
+            let restore = if orig == '\'' { '’' } else { orig };
+            openers.push((out.len(), mark.len(), restore));
+        }
         out.push_str(mark);
-        self.scopes.push(Scope { family, straight });
+        self.scopes.push(Scope { family, typed, outer, restorable: !typed });
     }
 
     /// Emit a closing mark for the innermost scope.
-    fn close(&mut self, out: &mut String, marks: &QuoteMarks) {
-        let outer = self.close_form();
-        let mark = if outer { &marks.close_quote } else { &marks.close_inner_quote };
-        self.scopes.pop();
+    fn close(
+        &mut self,
+        out: &mut String,
+        marks: &QuoteMarks,
+        openers: &mut Vec<(usize, usize, char)>,
+    ) {
+        let scope = self.scopes.pop().unwrap();
+        if scope.restorable {
+            openers.pop();
+        }
+        let mark = if scope.outer { &marks.close_quote } else { &marks.close_inner_quote };
         out.push_str(mark);
     }
 }
@@ -257,6 +271,46 @@ fn is_open_context(prev: Option<char>) -> bool {
 /// Convert the quotation marks in `s` with a fresh quoter.
 pub(crate) fn apply(s: &str, marks: &QuoteMarks) -> String {
     SmartQuoter::default().apply(s, marks)
+}
+
+/// citeproc-js's `LtoR_MAP`: the result of merging two adjacent punctuation
+/// characters (left, then right). The merged characters are split at a
+/// quotation mark: `swap-in` punctuation stays inside the quote and
+/// `swap-out` punctuation (`:`, `;`) outside.
+pub(crate) fn merge_ltr(left: char, right: char) -> Option<&'static str> {
+    Some(match (left, right) {
+        ('!', '.') => "!",
+        ('!', '?') => "!?",
+        ('!', ':') => "!",
+        ('!', ',') => "!,",
+        ('!', ';') => "!;",
+        ('?', '!') => "?!",
+        ('?', '.') => "?",
+        ('?', ':') => "?",
+        ('?', ',') => "?,",
+        ('?', ';') => "?;",
+        ('.', '!') => ".!",
+        ('.', '?') => ".?",
+        ('.', ':') => ".:",
+        ('.', ',') => ".,",
+        ('.', ';') => ".;",
+        (':', '!') => "!",
+        (':', '?') => "?",
+        (':', '.') => ":",
+        (':', ',') => ":,",
+        (':', ';') => ":;",
+        (',', '!') => ",!",
+        (',', '?') => ",?",
+        (',', ':') => ",:",
+        (',', '.') => ",.",
+        (',', ';') => ",;",
+        (';', '!') => "!",
+        (';', '?') => "?",
+        (';', ':') => ";",
+        (';', ',') => ";,",
+        (';', '.') => ";",
+        _ => return None,
+    })
 }
 
 /// Move `punct` into a trailing run of closing quotation marks in `text`.
@@ -306,6 +360,24 @@ mod tests {
         assert_eq!(convert("\"outer 'inner' outer\""), "“outer ‘inner’ outer”");
         assert_eq!(convert("\"one\" and \"two\""), "“one” and “two”");
         assert_eq!(convert("rock 'n' roll"), "rock “n” roll");
+    }
+
+    #[test]
+    fn straight_quotes_take_their_form_from_depth() {
+        // citeproc-js ignores the family of a straight quote: `'abc'` and
+        // `"abc"` both render as the locale's outer quotation, and adjacent
+        // openers nest outer-then-inner (`bugreports_NoCaseEscape`).
+        assert_eq!(convert("'abc'"), "“abc”");
+        assert_eq!(convert("\"abc\""), "“abc”");
+        assert_eq!(convert("'\"abc\"'"), "“‘abc’”");
+        assert_eq!(convert("\"'abc'\""), "“‘abc’”");
+    }
+
+    #[test]
+    fn typed_quotes_keep_their_family() {
+        assert_eq!(convert("‘abc’"), "‘abc’");
+        assert_eq!(convert("‘“abc”’"), "‘“abc”’");
+        assert_eq!(convert("“‘abc’”"), "“‘abc’”");
     }
 
     #[test]
