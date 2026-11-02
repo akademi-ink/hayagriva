@@ -1,0 +1,42 @@
+>>===== MODE =====>>
+bibliography
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+<div class="csl-bib-body"><div class="csl-entry"><b>Doe</b>, <b>J.</b> Q.</div></div>
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text macro="author"/>
+    </layout>
+  </citation>
+  <macro name="author">
+    <names variable="author">
+      <name initialize-with=". " name-as-sort-order="all" sort-separator=", "/>
+    </names>
+  </macro>
+  <bibliography>
+    <layout>
+      <text macro="author"/>
+    </layout>
+  </bibliography>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[[{ "id": "ITEM-1" }]]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  { "id": "ITEM-1", "type": "book", "author": [{ "family": "<b>Doe</b>", "given": "<b>John</b> Quiggly" }] }
+]
+<<===== INPUT =====<<

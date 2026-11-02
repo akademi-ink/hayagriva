@@ -243,15 +243,19 @@ impl Person {
 
     /// Formats the given name into initials.
     ///
-    /// For example, `"Judith Beatrice"` would yield `"J. B."` if the
-    /// `delimiter` argument is set to `Some(". ")`, `"Klaus-Peter"` would
-    /// become `"K-P"` without a delimiter (or with an empty delimiter).
+    /// This follows citeproc-js's `CSL.Util.Names.initializeWith` with
+    /// `initialize="true"`: the given name is split into initials and
+    /// abbreviations, lower-case name particles are kept in full, and the
+    /// `delimiter` (the style's `initialize-with` value) is placed after every
+    /// initial.
     ///
-    /// Whitespace at the end of the delimiter is kept when parts are separated
-    /// by whitespace (as in the first example), but not when parts of a
-    /// compound given name are separated by hyphens (for example,
-    /// `"Klaus-Peter"` produces `"K.-P."` instead of `"K. -P."` for a
-    /// delimiter of `Some(". ")`).
+    /// For example, `"Judith Beatrice"` yields `"J. B."` for a delimiter of
+    /// `Some(". ")` and `"Klaus-Peter"` becomes `"K.-P."` when hyphens are
+    /// kept (`with_hyphen`), or `"K. P."` when they are treated as spaces.
+    ///
+    /// Existing periods in the input are interpreted as initial separators
+    /// (`"M.E"` is two initials), so abbreviations like `"Ph."` and long
+    /// abbreviations such as `"TSerendorjiin"` are handled like citeproc-js.
     pub fn initials(
         &self,
         buf: &mut impl std::fmt::Write,
@@ -262,80 +266,35 @@ impl Person {
             return Ok(());
         };
 
-        let mut collect = true;
-        let mut non_empty = false;
-        // Whether we are at the start of a word (i.e., the initial char or following a whitespace)
-        let mut start_of_word = true;
-        // Whether the last char (excl. whitespace was lower case)
-        let mut last_was_lower = false;
+        buf.write_str(&initialize_given_name(
+            gn,
+            delimiter.unwrap_or_default(),
+            with_hyphen,
+            false,
+        ))
+    }
 
-        let delim_ends_in_whitespace = delimiter
-            .and_then(|d| d.chars().last().map(|d| d.is_whitespace()))
-            .unwrap_or_default();
+    /// Normalizes existing initials in the given name without initializing
+    /// full words (`initialize="false"` with `initialize-with` set).
+    ///
+    /// citeproc-js still parses the given name into initials and abbreviations
+    /// and rewrites their separators according to `delimiter`.
+    pub fn normalize_initials(
+        &self,
+        buf: &mut impl std::fmt::Write,
+        delimiter: Option<&str>,
+        with_hyphen: bool,
+    ) -> std::fmt::Result {
+        let Some(gn) = &self.given_name else {
+            return Ok(());
+        };
 
-        for (_, gr) in gn.grapheme_indices(true) {
-            if let Some(c) = gr.chars().next()
-                && (c.is_whitespace() || c == '-')
-            {
-                // The last word was in lower case. We enounter a whitespace and stop collecting
-                if last_was_lower {
-                    collect = false;
-                }
-                if !collect {
-                    let hyphenate = with_hyphen && c == '-';
-                    // Do not emit delim if we just had a lower case word
-                    if !last_was_lower && let Some(delimiter) = delimiter {
-                        // Use the given delimiter, including any spaces at
-                        // its end if there was a whitespace, but not if we
-                        // should add a hyphen in a compound given name.
-                        buf.write_str(if hyphenate {
-                            delimiter.trim_end()
-                        } else {
-                            delimiter
-                        })?;
-                    }
-
-                    collect = true;
-                    start_of_word = true;
-                    if hyphenate {
-                        buf.write_char('-')?;
-                    } else if last_was_lower {
-                        // Write a space after a lower case word
-                        buf.write_char(' ')?;
-                    }
-                }
-                continue;
-            }
-
-            if collect {
-                if gr.to_lowercase() != gr {
-                    // Upper case letter => stop collecting; print initials
-                    collect = false;
-                    last_was_lower = false;
-                } else if start_of_word {
-                    // We enter a lower-cased word
-                    last_was_lower = true;
-                }
-                if last_was_lower && start_of_word {
-                    start_of_word = false;
-                    if !delim_ends_in_whitespace {
-                        // Print a space if we just started a lower case word and the delimiter did not already put a space
-                        buf.write_char(' ')?;
-                    }
-                }
-                buf.write_str(gr)?;
-                non_empty = true;
-            }
-        }
-
-        if non_empty
-            && !collect
-            && let Some(delim) = delimiter
-        {
-            buf.write_str(delim.trim_end())?;
-        }
-
-        Ok(())
+        buf.write_str(&initialize_given_name(
+            gn,
+            delimiter.unwrap_or_default(),
+            with_hyphen,
+            true,
+        ))
     }
 
     /// Yields the first name of a person. Will add the delimiter after initials
@@ -577,6 +536,594 @@ impl FromStr for Person {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_strings(s.split(',').collect())
     }
+}
+
+
+/// The result of splitting a given name like citeproc-js's `nameDoppel`:
+/// alternating name fragments and separators (whitespace, hyphens, and the
+/// rich-text tags citeproc-js understands).
+struct NameChunks {
+    strings: Vec<String>,
+    tags: Vec<String>,
+}
+
+/// Length in bytes of a rich-text tag that citeproc-js treats as a name
+/// separator, if `s` starts with one.
+///
+/// Mirrors the tag alternatives of citeproc-js's `rexNameStr`:
+/// `<i>`, `<b>`, `<sc>`, `<sub>`, `<sup>` (and their closing forms) plus the
+/// opening `<span class="nocase">` / `<span class="nodecor">` forms and any
+/// `</span>`.
+fn markup_tag_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+
+    let mut i = 1;
+    if bytes.get(i) == Some(&b'/') {
+        i += 1;
+    }
+
+    const TAGS: [&str; 7] = [
+        "span class=\"nocase\"",
+        "span class=\"nodecor\"",
+        "i",
+        "sc",
+        "b",
+        "sub",
+        "sup",
+    ];
+
+    for tag in TAGS {
+        // A closing `</span>` carries no class attribute.
+        if tag.starts_with("span ") && bytes.get(1) == Some(&b'/') {
+            if s[i..].starts_with("span") && s.as_bytes().get(i + 4) == Some(&b'>') {
+                return Some(i + 5);
+            }
+            continue;
+        }
+
+        if s[i..].starts_with(tag) {
+            let end = i + tag.len();
+            if s.as_bytes().get(end) == Some(&b'>') {
+                return Some(end + 1);
+            }
+        }
+    }
+
+    None
+}
+
+fn is_separator_char(c: char) -> bool {
+    c == '-' || c.is_whitespace()
+}
+
+/// Match a name separator at the start of `s`: an optional run of hyphens and
+/// whitespace around a rich-text tag, or a run of hyphens and whitespace.
+fn match_name_separator(s: &str) -> Option<(String, usize)> {
+    let mut i = 0;
+    while let Some(c) = s[i..].chars().next() {
+        if is_separator_char(c) {
+            i += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if let Some(tag_len) = markup_tag_len(&s[i..]) {
+        let mut j = i + tag_len;
+        while let Some(c) = s[j..].chars().next() {
+            if is_separator_char(c) {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return Some((s[..j].to_string(), j));
+    }
+
+    (i > 0).then(|| (s[..i].to_string(), i))
+}
+
+fn split_name_chunks(name: &str) -> NameChunks {
+    let mut strings = Vec::new();
+    let mut tags = Vec::new();
+    let mut current = String::new();
+    let mut rest = name;
+
+    while !rest.is_empty() {
+        if let Some((separator, len)) = match_name_separator(rest) {
+            strings.push(std::mem::take(&mut current));
+            tags.push(separator);
+            rest = &rest[len..];
+        } else {
+            let c = rest.chars().next().unwrap();
+            current.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    strings.push(current);
+
+    NameChunks { strings, tags }
+}
+
+/// Strip leading rich-text tags (`/^(?:<[^>]+>)*/`).
+fn strip_leading_tags(s: &str) -> &str {
+    let mut rest = s;
+    while rest.starts_with('<') {
+        match rest.find('>') {
+            Some(end) => rest = &rest[end + 1..],
+            None => break,
+        }
+    }
+    rest
+}
+
+/// Return only the rich-text tags in `s`, or `s` itself when it has none
+/// (citeproc-js's `tagonly`).
+fn tags_only(s: &str) -> String {
+    let Some(first) = s.find('<') else {
+        return s.to_string();
+    };
+
+    let mut i = first;
+    let mut out = String::new();
+    while s.as_bytes().get(i) == Some(&b'<') {
+        match s[i..].find('>') {
+            Some(end) => {
+                out.push_str(&s[i..i + end + 1]);
+                i += end + 1;
+            }
+            None => break,
+        }
+    }
+
+    if out.is_empty() { s.to_string() } else { out }
+}
+
+/// Merge the tags of `tagstr` into `newstr`, keeping whitespace at the end of
+/// `newstr` (citeproc-js's `mergetag`).
+fn merge_tags(tagstr: &str, newstr: &str) -> String {
+    let mut tags = String::new();
+    let bytes = tagstr.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            // Include hyphens that directly precede the tag.
+            let mut start = i;
+            while start > 0 && bytes[start - 1] == b'-' {
+                start -= 1;
+            }
+            if let Some(end) = tagstr[i..].find('>') {
+                let mut end = i + end + 1;
+                while tagstr.as_bytes().get(end) == Some(&b'-') {
+                    end += 1;
+                }
+                tags.push_str(&tagstr[start..end]);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if tags.is_empty() {
+        return newstr.to_string();
+    }
+
+    let trimmed = newstr.trim_end_matches(char::is_whitespace).len();
+    if trimmed < newstr.len() {
+        format!("{}{}{}", &newstr[..trimmed], tags, &newstr[trimmed..])
+    } else {
+        format!("{newstr}{tags}")
+    }
+}
+
+fn is_initial_start(c: char) -> bool {
+    c.is_ascii_uppercase()
+        || matches!(c as u32,
+            0x0e01..=0x0e5b
+            | 0x00c0..=0x017f
+            | 0x0400..=0x042f
+            | 0x0590..=0x05d4
+            | 0x05d6..=0x05ff
+            | 0x0600..=0x06ff
+            | 0x0370
+            | 0x0372
+            | 0x0376
+            | 0x0386
+            | 0x0388..=0x03ab
+            | 0x03e2
+            | 0x03e4
+            | 0x03e6
+            | 0x03e8
+            | 0x03ea
+            | 0x03ec
+            | 0x03ee
+            | 0x03f4
+            | 0x03f7
+            | 0x03fd..=0x03ff)
+}
+
+fn is_initial_cont(c: char) -> bool {
+    c.is_ascii_alphabetic()
+        || matches!(c as u32,
+            0x0e01..=0x0e5b
+            | 0x00c0..=0x017f
+            | 0x0400..=0x052f
+            | 0x0600..=0x06ff
+            | 0x0370..=0x03ff
+            | 0x1f00..=0x1fff)
+}
+
+fn starts_with_romanesque(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| {
+        c == '&'
+            || c.is_ascii_alphabetic()
+            || matches!(c as u32,
+                0x0e01..=0x0e5b
+                | 0x00c0..=0x017f
+                | 0x0370..=0x03ff
+                | 0x0400..=0x052f
+                | 0x0590..=0x05d4
+                | 0x05d6..=0x05ff
+                | 0x1f00..=0x1fff
+                | 0x0600..=0x06ff
+                | 0x200c..=0x200e
+                | 0x0218..=0x021b
+                | 0x202a..=0x202e)
+    })
+}
+
+/// citeproc-js's `NAME_INITIAL_REGEXP`: an initial character, a run of
+/// letters, and a run of periods.
+fn match_initial(n: &str) -> Option<(String, String, String)> {
+    let mut chars = n.char_indices();
+    let (_, first) = chars.next()?;
+    if !is_initial_start(first) {
+        return None;
+    }
+
+    let mut m1 = first.to_string();
+    let mut m2 = String::new();
+    let mut m3 = String::new();
+    let mut rest = &n[first.len_utf8()..];
+
+    for c in rest.chars() {
+        if is_initial_cont(c) {
+            m2.push(c);
+        } else {
+            break;
+        }
+    }
+    rest = &rest[m2.len()..];
+    for c in rest.chars() {
+        if c == '.' {
+            m3.push(c);
+        } else {
+            break;
+        }
+    }
+
+    // `m[1] = m[1] + m[2]; m[2] = ""` for abbreviations with a period.
+    if !m2.is_empty() && !m3.is_empty() {
+        m1.push_str(&m2);
+        m2.clear();
+    }
+
+    Some((m1, m2, m3))
+}
+
+/// Collapse whitespace and hyphens around hyphens (`/\s*\-\s*/g` → `-`).
+fn normalize_hyphen_spacing(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    let mut pending_space = false;
+
+    while !rest.is_empty() {
+        let c = rest.chars().next().unwrap();
+        rest = &rest[c.len_utf8()..];
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if c == '-' && !out.is_empty() {
+            while out.ends_with(char::is_whitespace) {
+                out.pop();
+            }
+            out.push('-');
+            pending_space = false;
+            // Skip whitespace that follows the hyphen.
+            let skipped = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
+            rest = &rest[skipped..];
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(c);
+    }
+
+    out
+}
+
+/// Lower-case letters after a hyphen (temporarily marked with an en dash so
+/// the hyphen does not read as a name separator).
+fn hyphen_lowercase_to_en_dash(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '-'
+            && let Some(&next) = chars.peek()
+            && next.is_ascii_lowercase()
+        {
+            out.push('\u{2013}');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            in_space = true;
+        } else {
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// citeproc-js's `doNormalize`: rewrite separators between existing initials
+/// and abbreviations according to `terminator`.
+fn normalize_name_list(namelist: &mut [String], terminator: &str) {
+    let mut is_abbrev = Vec::with_capacity(namelist.len());
+    for item in namelist.iter_mut() {
+        let without_tags = strip_leading_tags(item);
+        let bytes = without_tags.as_bytes();
+        if without_tags.len() > 1 && without_tags.ends_with('.') {
+            // Strip the last period (citeproc-js keeps the tags in place).
+            if let Some(pos) = item.rfind('.') {
+                item.remove(pos);
+            }
+            is_abbrev.push(true);
+        } else if item.chars().count() == 1
+            && item.chars().next().is_some_and(char::is_uppercase)
+        {
+            is_abbrev.push(true);
+        } else if bytes.len() == 1 && bytes[0].is_ascii_uppercase() {
+            is_abbrev.push(true);
+        } else {
+            is_abbrev.push(false);
+        }
+    }
+
+    let len = namelist.len();
+    let mut i = 0;
+    while i < len {
+        if is_abbrev[i] {
+            if i + 2 < len {
+                namelist[i + 1] = tags_only(&namelist[i + 1]);
+                if !is_abbrev[i + 2] {
+                    namelist[i + 1] = format!("{} ", tags_only(&namelist[i + 1]));
+                }
+
+                let terminator = terminator.trim_end_matches('\u{feff}');
+                if namelist[i + 2].len() > 1 {
+                    namelist[i + 1] = format!("{terminator}{}", namelist[i + 1]);
+                } else {
+                    namelist[i + 1] = merge_tags(&namelist[i + 1], terminator);
+                }
+            }
+            if i + 1 == len {
+                namelist[i].push_str(terminator);
+            }
+        }
+        i += 2;
+    }
+}
+
+/// citeproc-js's `doInitialize`: replace every name fragment with its initial.
+fn initialize_name_list(namelist: &mut Vec<String>, terminator: &str) {
+    let len = namelist.len();
+    let mut i = 0;
+    while i < len {
+        let n = namelist[i].clone();
+        if n.is_empty() {
+            i += 2;
+            continue;
+        }
+
+        let mut m = match_initial(&n);
+        if m.is_none() && !starts_with_romanesque(&n) && n.len() > 1 && terminator.contains("%s")
+        {
+            let mut chars = n.chars();
+            let first = chars.next().unwrap();
+            m = Some((first.to_string(), chars.collect(), String::new()));
+        }
+
+        if let Some((m1, m2, m3)) = m {
+            if m1.chars().next().is_some_and(char::is_uppercase) {
+                let mut extra = String::new();
+                if !m2.is_empty() {
+                    let upper: String = m2
+                        .chars()
+                        .take_while(|c| c.is_uppercase())
+                        .collect();
+                    if upper.len() < m2.len() {
+                        extra = upper.to_lowercase();
+                    }
+                }
+
+                namelist[i] = format!("{m1}{extra}");
+                if i + 1 < len {
+                    if terminator.contains("%s") {
+                        namelist[i] = terminator.replace("%s", &namelist[i]);
+                    } else if namelist[i + 1].contains('-') {
+                        namelist[i + 1] = format!(
+                            "{}-",
+                            merge_tags(&namelist[i + 1].replace('-', ""), terminator)
+                        );
+                    } else {
+                        namelist[i + 1] = merge_tags(&namelist[i + 1], terminator);
+                    }
+                } else if terminator.contains("%s") {
+                    namelist[i] = terminator.replace("%s", &namelist[i]);
+                } else {
+                    namelist.push(terminator.to_string());
+                }
+            } else if starts_with_romanesque(&n) && m3.is_empty() {
+                namelist[i] = format!(" {n}");
+            }
+        } else if starts_with_romanesque(&n) {
+            namelist[i] = format!(" {n}");
+        }
+
+        i += 2;
+    }
+}
+
+fn restore_hyphens(s: String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{2013}' && chars.peek().is_some_and(|c| c.is_ascii_lowercase()) {
+            out.push('-');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn finish_name_list(namelist: &[String]) -> String {
+    let joined = namelist.join("");
+    let trimmed = joined.trim_end_matches(|c: char| {
+        matches!(c, '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r' | ' ' | '\u{feff}' | '\u{a0}')
+    });
+
+    // Normalize hyphens and compress ASCII whitespace, like citeproc-js.
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            // `\s*-\s*` -> `-`
+            let mut lookahead = chars.clone();
+            let mut saw_hyphen = false;
+            while let Some(&next) = lookahead.peek() {
+                if next == '-' {
+                    saw_hyphen = true;
+                    break;
+                }
+                if next.is_whitespace() {
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if saw_hyphen {
+                while let Some(&next) = chars.peek() {
+                    if next.is_whitespace() || next == '-' {
+                        chars.next();
+                        if next == '-' {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                out.push('-');
+                continue;
+            }
+
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\u{a0}') {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    restore_hyphens(out)
+}
+
+fn initialize_given_name(
+    name: &str,
+    terminator: &str,
+    with_hyphen: bool,
+    normalize_only: bool,
+) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+
+    if ["Lord", "Lady"].contains(&name)
+        || (!starts_with_romanesque(strip_leading_tags(name))
+            && !terminator.contains("%s"))
+    {
+        return name.to_string();
+    }
+
+    let mut name = if with_hyphen {
+        name.to_string()
+    } else {
+        name.replace('-', " ")
+    };
+
+    name = normalize_hyphen_spacing(&collapse_whitespace(&name));
+    name = hyphen_lowercase_to_en_dash(&name);
+
+    // Insert a space after every period that is not already followed by one.
+    let mut spaced = String::with_capacity(name.len() + 4);
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        spaced.push(c);
+        if c == '.'
+            && let Some(&next) = chars.peek()
+            && next != ' '
+        {
+            spaced.push(' ');
+        }
+    }
+
+    let mut chunks = split_name_chunks(&spaced);
+    if chunks.tags.is_empty() {
+        let only = &chunks.strings[0];
+        if let Some(last) = only.rsplit('.').next()
+            && last.chars().count() == 1
+            && last.chars().next().is_some_and(char::is_uppercase)
+        {
+            chunks.strings[0].push('.');
+        }
+    }
+
+    let mut namelist = vec![chunks.strings[0].clone()];
+    for i in 1..chunks.strings.len() {
+        namelist.push(chunks.tags[i - 1].clone());
+        namelist.push(chunks.strings[i].clone());
+    }
+
+    if normalize_only {
+        normalize_name_list(&mut namelist, terminator);
+    } else {
+        initialize_name_list(&mut namelist, terminator);
+    }
+
+    finish_name_list(&namelist)
 }
 
 #[cfg(test)]

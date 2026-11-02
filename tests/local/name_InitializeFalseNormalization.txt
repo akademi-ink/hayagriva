@@ -1,0 +1,42 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+Doe, M. E.
+Doe, ME
+Doe, M. E.
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <names variable="author">
+        <name initialize="false" initialize-with=". " name-as-sort-order="all" sort-separator=", "/>
+      </names>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[
+  [{ "id": "ITEM-1" }],
+  [{ "id": "ITEM-2" }],
+  [{ "id": "ITEM-3" }]
+]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  { "id": "ITEM-1", "type": "book", "author": [{ "family": "Doe", "given": "M.E" }] },
+  { "id": "ITEM-2", "type": "book", "author": [{ "family": "Doe", "given": "ME" }] },
+  { "id": "ITEM-3", "type": "book", "author": [{ "family": "Doe", "given": "M E" }] }
+]
+<<===== INPUT =====<<

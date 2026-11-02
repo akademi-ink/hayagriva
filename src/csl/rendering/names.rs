@@ -699,8 +699,14 @@ fn write_name<T: EntryLike>(
             if let Some(initialize_with) = name_opts.initialize_with {
                 if form == DisambiguatedNameForm::LongInitialized {
                     name.initials(ctx, Some(initialize_with), hyphen_init).unwrap();
+                } else if !name_opts.initialize {
+                    // `initialize="false"` still normalizes existing initials
+                    // and abbreviations (citeproc-js `doNormalize`).
+                    name.normalize_initials(ctx, Some(initialize_with), hyphen_init)
+                        .unwrap();
                 } else {
-                    name.first_name_with_delimiter(ctx, Some(initialize_with)).unwrap();
+                    // Escalated by given-name disambiguation to the full name.
+                    ctx.push_str(first);
                 }
             } else {
                 ctx.push_str(first);
