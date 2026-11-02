@@ -34,6 +34,7 @@ use crate::csl::taxonomy::NumberOrPageVariableResult;
 use crate::lang::{Case, CaseFolder};
 use crate::types::{ChunkKind, ChunkedString, Date, MaybeTyped, Person};
 
+pub use self::affix::{Affix, AffixRun};
 use self::elem::last_text_mut_child;
 pub use self::elem::{
     BufWriteFormat, Elem, ElemChild, ElemChildren, ElemMeta, Formatted, Formatting,
@@ -41,6 +42,7 @@ pub use self::elem::{
 use self::quotes::{QuoteMarks, SmartQuoter};
 use self::taxonomy::{EntryLike, NumberVariableResult, PageVariableResult};
 
+mod affix;
 #[cfg(feature = "archive")]
 pub mod archive;
 mod citation_label;
@@ -84,8 +86,8 @@ struct SpeculativeItemRender<'a, T: EntryLike> {
     hidden: bool,
     locale: Option<LocaleCode>,
     purpose: Option<CitePurpose>,
-    prefix: Option<String>,
-    suffix: Option<String>,
+    prefix: Option<Affix>,
+    suffix: Option<Affix>,
     collapse_verdict: Option<CollapseVerdict>,
     style_uses_year_suffix_var: bool,
 }
@@ -113,14 +115,14 @@ fn item_delimiter<'a, T: EntryLike>(
 
     let prev_ends_with_terminal = prev
         .suffix
-        .as_deref()
-        .and_then(|s| s.chars().next_back())
+        .as_ref()
+        .and_then(Affix::last_char)
         .is_some_and(|c| TERMINAL.contains(&c));
     let item_starts_with_terminal = prev.suffix.is_none()
         && item
             .prefix
-            .as_deref()
-            .and_then(|s| s.chars().next())
+            .as_ref()
+            .and_then(Affix::first_char)
             .is_some_and(|c| TERMINAL.contains(&c));
 
     if prev_ends_with_terminal {
@@ -194,6 +196,40 @@ fn pull_leading_punctuation(
         && quotes::move_punctuation_inside(&mut last.text, punct, marks)
     {
         text.remove(0);
+    }
+}
+
+/// Append a rich-text affix to a citation's children.
+///
+/// Every parsed run keeps its markup formatting on top of the citation
+/// layout's formatting and is passed through the smart-quote conversion.
+/// When `pull_punctuation` is set (a suffix), leading terminal punctuation is
+/// pulled into a preceding closing quote like the plain-string path.
+fn push_affix_children(
+    children: &mut Vec<ElemChild>,
+    affix: &Affix,
+    formatting: Formatting,
+    marks: &QuoteMarks,
+    pull_punctuation: bool,
+) {
+    let mut runs: Vec<Formatted> = affix
+        .runs()
+        .iter()
+        .filter(|run| !run.text.is_empty())
+        .map(|run| Formatted {
+            text: quotes::apply(&run.text, marks),
+            formatting: formatting.apply(run.formatting),
+        })
+        .collect();
+
+    if pull_punctuation && let Some(first) = runs.first_mut() {
+        pull_leading_punctuation(children, &mut first.text, marks);
+    }
+
+    for run in runs {
+        if !run.text.is_empty() {
+            children.push(run.into());
+        }
     }
 }
 
@@ -376,6 +412,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     ),
                 };
 
+                let prefix_plain = item.prefix.as_ref().map(Affix::as_plain);
                 let ctx = style.do_citation(
                     *entry,
                     cite_props.clone(),
@@ -383,7 +420,7 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     citation.locale.as_ref(),
                     item.purpose,
                     None,
-                    item.prefix.as_deref(),
+                    prefix_plain.as_deref(),
                 );
 
                 // Copy the identifier usage from the context. Assume it does
@@ -706,10 +743,13 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         }
 
                         if let Some(prefix) = &item.prefix {
-                            elem_children.push(ElemChild::Text(Formatted {
-                                text: quotes::apply(prefix, &marks),
+                            push_affix_children(
+                                &mut elem_children,
+                                prefix,
                                 formatting,
-                            }));
+                                &marks,
+                                false,
+                            );
                         }
 
                         elem_children.push(ElemChild::Elem(Elem {
@@ -722,16 +762,13 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                         }));
 
                         if let Some(suffix) = &item.suffix {
-                            let mut text = quotes::apply(suffix, &marks);
-                            if pull_punctuation {
-                                pull_leading_punctuation(
-                                    &mut elem_children,
-                                    &mut text,
-                                    &marks,
-                                );
-                            }
-                            elem_children
-                                .push(ElemChild::Text(Formatted { text, formatting }));
+                            push_affix_children(
+                                &mut elem_children,
+                                suffix,
+                                formatting,
+                                &marks,
+                                pull_punctuation,
+                            );
                         }
                     }
 
@@ -938,6 +975,7 @@ pub fn standalone_citation<T: EntryLike>(
             all_hidden = false;
         }
 
+        let prefix_plain = item.prefix.as_ref().map(Affix::as_plain);
         res.push(if let Some(CitePurpose::Year) = item.purpose {
             date_replacement(
                 &style,
@@ -954,7 +992,7 @@ pub fn standalone_citation<T: EntryLike>(
                 req.locale.as_ref(),
                 item.purpose,
                 None,
-                item.prefix.as_deref(),
+                prefix_plain.as_deref(),
             )
         });
     }
@@ -1021,6 +1059,7 @@ fn do_rerender<T: EntryLike>(
     item: &SpeculativeItemRender<T>,
     request: &CitationRequest<'_, T>,
 ) -> ElemChildren {
+    let prefix_plain = item.prefix.as_ref().map(Affix::as_plain);
     ctx.citation(
         item.entry,
         item.cite_props.clone(),
@@ -1028,7 +1067,7 @@ fn do_rerender<T: EntryLike>(
         request.locale.as_ref(),
         item.purpose,
         item.collapse_verdict,
-        item.prefix.as_deref(),
+        prefix_plain.as_deref(),
     )
 }
 
@@ -3303,16 +3342,17 @@ pub struct CitationItem<'a, T: EntryLike> {
     pub hidden: bool,
     /// Format the item in a special way.
     pub purpose: Option<CitePurpose>,
-    /// Literal text placed directly before the item's rendered content.
+    /// Text placed directly before the item's rendered content.
     ///
     /// The prefix is inserted inside the citation layout's inter-item
-    /// delimiters. It is not processed with locale or quote handling.
-    pub prefix: Option<String>,
-    /// Literal text placed directly after the item's rendered content.
+    /// delimiters. citeproc-js rich-text markup (`<i>`, `<b>`, `<sc>`,
+    /// `<sup>`, `<sub>`) is parsed into formatted runs; see [`Affix`].
+    pub prefix: Option<Affix>,
+    /// Text placed directly after the item's rendered content.
     ///
     /// The suffix is inserted inside the citation layout's inter-item
-    /// delimiters. It is not processed with locale or quote handling.
-    pub suffix: Option<String>,
+    /// delimiters. citeproc-js rich-text markup is parsed like the prefix.
+    pub suffix: Option<Affix>,
     /// Overrides the citation position derived from citation order.
     pub position: Option<CitePosition>,
     /// Overrides whether this citation is within `near-note-distance` of the
@@ -3386,13 +3426,29 @@ impl<'a, T: EntryLike> CitationItem<'a, T> {
         self
     }
 
-    /// Set literal affixes that are placed directly before and after this
-    /// item's rendered content, inside the citation layout's inter-item
-    /// delimiters.
+    /// Set affixes that are placed directly before and after this item's
+    /// rendered content, inside the citation layout's inter-item delimiters.
+    ///
+    /// citeproc-js rich-text markup in the strings (`<i>`, `<b>`, `<sc>`,
+    /// `<sup>`, `<sub>`) is parsed into formatted runs. Strings without
+    /// markup render exactly like before.
     pub fn with_affixes(
         mut self,
         prefix: Option<String>,
         suffix: Option<String>,
+    ) -> Self {
+        self.prefix = prefix.map(Affix::parse);
+        self.suffix = suffix.map(Affix::parse);
+        self
+    }
+
+    /// Set affixes that already carry formatted runs.
+    ///
+    /// Use [`Affix::parse`] to build them from citeproc-js markup.
+    pub fn with_formatted_affixes(
+        mut self,
+        prefix: Option<Affix>,
+        suffix: Option<Affix>,
     ) -> Self {
         self.prefix = prefix;
         self.suffix = suffix;
@@ -3588,6 +3644,20 @@ impl WritingContext {
     /// must happen if [`Display`] or formatting changes, as well as when we're
     /// done with an element.
     fn save_to_block(&mut self) {
+        self.save_to_block_inner(false);
+    }
+
+    /// Like [`Self::save_to_block`], but always starts a new text leaf even
+    /// when the last leaf has the same formatting.
+    ///
+    /// Serializers that open one tag pair per decorated blob need adjacent
+    /// equal-format runs to stay separate (citeproc-js writes one `<sup>` per
+    /// Unicode superscript character in a CSL ordinal).
+    fn save_to_block_separate(&mut self) {
+        self.save_to_block_inner(true);
+    }
+
+    fn save_to_block_inner(&mut self, separate: bool) {
         if self.buf.is_empty() {
             return;
         }
@@ -3595,7 +3665,8 @@ impl WritingContext {
         let format = *self.formatting();
 
         // Append to last child if formats match.
-        if let Some(child) = self.elem_stack.last_mut().0.last_mut()
+        if !separate
+            && let Some(child) = self.elem_stack.last_mut().0.last_mut()
             && let ElemChild::Text(child) = child
             && format == child.formatting
         {
@@ -4979,6 +5050,18 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.writing.prepare_variable_query(variable)?;
 
         self.instance.entry.resolve_date_variable(variable)
+    }
+
+    /// Resolve a date variable that may carry a range.
+    ///
+    /// Honors suppressions like [`Self::resolve_date_variable`].
+    fn resolve_date_range(
+        &self,
+        variable: csl_taxonomy::DateVariable,
+    ) -> Option<Cow<'a, crate::types::DateRange>> {
+        self.writing.prepare_variable_query(variable)?;
+
+        self.instance.entry.resolve_date_range(variable)
     }
 
     /// Resolve a literal date value (`"in press"`) for a date variable.
@@ -6683,6 +6766,68 @@ mod tests {
         assert_eq!(citation, "Book A, cited in Book B");
     }
 
+    #[test]
+    fn affix_markup_becomes_formatted_runs() {
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-markup-test</id>
+                <title>Affix Markup Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: My Title
+            "#,
+        )
+        .unwrap();
+
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![CitationItem::with_entry(library.get("item").unwrap()).with_affixes(
+                Some("<i>My Prefix</i> ".to_string()),
+                Some(" <sc>My Suffix</sc>".to_string()),
+            )],
+            &style,
+            None,
+            &[],
+            Some(1),
+        ));
+        let finished = driver.finish(BibliographyRequest::new(&style, None, &[]));
+        let mut plain = String::new();
+        finished.citations[0]
+            .citation
+            .write_buf(&mut plain, BufWriteFormat::Plain)
+            .unwrap();
+        assert_eq!(plain, "My Prefix My Title My Suffix");
+
+        fn find_text<'a>(
+            children: &'a ElemChildren,
+            text: &str,
+        ) -> Option<&'a Formatted> {
+            children.0.iter().find_map(|child| match child {
+                ElemChild::Text(formatted) if formatted.text == text => Some(formatted),
+                ElemChild::Elem(elem) => find_text(&elem.children, text),
+                _ => None,
+            })
+        }
+
+        let children = &finished.citations[0].citation;
+        let prefix = find_text(children, "My Prefix").expect("italic prefix run");
+        assert_eq!(prefix.formatting.font_style, citationberg::FontStyle::Italic);
+        let suffix = find_text(children, "My Suffix").expect("small-caps suffix run");
+        assert_eq!(suffix.formatting.font_variant, citationberg::FontVariant::SmallCaps);
+    }
+
     #[cfg(feature = "csl-json")]
     #[test]
     fn csl_json_date_conversion() {
@@ -6709,6 +6854,120 @@ mod tests {
         assert_eq!(
             item.resolve_date_literal(DateVariable::Issued).as_deref(),
             Some("(in press)")
+        );
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_date_range_conversion() {
+        // Season months in a range are normalized on both ends.
+        let item: citationberg::json::Item = serde_json::from_str(
+            r#"{"id":"a","issued":{"date-parts":[[1999,21],[2001,22]]}}"#,
+        )
+        .unwrap();
+        let range = item.resolve_date_range(DateVariable::Issued).expect("range");
+        assert_eq!(range.start.year, 1999);
+        assert_eq!(range.start.month, None);
+        assert_eq!(range.start.season, Some(citationberg::taxonomy::Season::Spring));
+        let end = range.end.expect("end");
+        assert_eq!(end.year, 2001);
+        assert_eq!(end.month, None);
+        assert_eq!(end.season, Some(citationberg::taxonomy::Season::Summer));
+        assert!(!range.open_end);
+
+        // The single-date accessor exposes the start and never panics.
+        let start = item.resolve_date_variable(DateVariable::Issued).expect("start");
+        assert_eq!(start.year, 1999);
+
+        // A zero end (`[[1987], [0]]`) is an open range.
+        let item: citationberg::json::Item =
+            serde_json::from_str(r#"{"id":"b","issued":{"date-parts":[[1987],[0]]}}"#)
+                .unwrap();
+        let range = item.resolve_date_range(DateVariable::Issued).expect("range");
+        assert!(range.open_end);
+        assert!(range.is_range());
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_date_range_rendering() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let en_locale =
+            fs::read_to_string(workspace.join("tests/data/locales-en-US.xml")).unwrap();
+        let en_locale: citationberg::Locale =
+            LocaleFile::from_xml(&en_locale).unwrap().into();
+        let locales = [en_locale];
+
+        let style = IndependentStyle::from_xml(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+  <info>
+    <id/>
+    <title/>
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <date prefix="(" suffix=")" variable="issued">
+        <date-part name="day" suffix=" "/>
+        <date-part form="long" name="month" suffix=" "/>
+        <date-part name="year"/>
+      </date>
+    </layout>
+  </citation>
+</style>"#,
+        )
+        .unwrap();
+
+        let render = |json: &str| -> String {
+            let item: citationberg::json::Item = serde_json::from_str(json).unwrap();
+            let mut driver = BibliographyDriver::new();
+            driver.citation(CitationRequest::new(
+                vec![CitationItem::with_entry(&item)],
+                &style,
+                None,
+                &locales,
+                None,
+            ));
+            let finished = driver.finish(BibliographyRequest {
+                style: &style,
+                locale: None,
+                locale_files: &locales,
+            });
+            let mut out = String::new();
+            finished.citations[0]
+                .citation
+                .write_buf(&mut out, BufWriteFormat::Plain)
+                .unwrap();
+            out
+        };
+
+        // Day, month and year all differ.
+        assert_eq!(
+            render(
+                r#"{"id":"a","type":"book","issued":{"date-parts":[[1987,8,3],[2003,10,23]]}}"#
+            ),
+            "(3 August 1987–23 October 2003)"
+        );
+        // Same year, different month.
+        assert_eq!(
+            render(
+                r#"{"id":"b","type":"book","issued":{"date-parts":[[2003,8],[2003,10]]}}"#
+            ),
+            "(August–October 2003)"
+        );
+        // Same month, different day: the start's suffix is dropped before the
+        // range delimiter.
+        assert_eq!(
+            render(
+                r#"{"id":"c","type":"book","issued":{"date-parts":[[2003,8,10],[2003,8,23]]}}"#
+            ),
+            "(10–23 August 2003)"
+        );
+        // An open range renders the delimiter and no end.
+        assert_eq!(
+            render(r#"{"id":"d","type":"book","issued":{"date-parts":[[1987],[0]]}}"#),
+            "(1987–)"
         );
     }
 

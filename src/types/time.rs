@@ -161,6 +161,60 @@ impl Date {
     }
 }
 
+/// A date variable value: a single date or a CSL date range.
+///
+/// CSL-JSON dates may carry two `date-parts` arrays. The engine keeps the
+/// optional end next to the start so that date rendering, sorting and
+/// disambiguation can consume ranges without panicking.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DateRange {
+    /// The start of the range, or the only date when there is no end.
+    pub start: Date,
+    /// The end of the range, if any.
+    pub end: Option<Date>,
+    /// Whether the range has an open end (`"date-parts": [[1987], [0]]`).
+    ///
+    /// citeproc-js renders such a range as the start date followed by the
+    /// range delimiter and nothing else (e.g. `1987–`).
+    pub open_end: bool,
+}
+
+impl DateRange {
+    /// A single date without an end.
+    pub const fn single(date: Date) -> Self {
+        Self { start: date, end: None, open_end: false }
+    }
+
+    /// Whether this value has an end, closed or open.
+    pub const fn is_range(&self) -> bool {
+        self.end.is_some() || self.open_end
+    }
+
+    /// Order two date ranges by their start, then by their end.
+    ///
+    /// citeproc-js's date sort key contains the start parts followed by the
+    /// end parts (`year_end`, `month_end`, `day_end`, with zero for missing
+    /// values), so a missing end sorts before a present one.
+    pub(crate) fn csl_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        self.start
+            .csl_cmp(&other.start)
+            .then_with(|| match (self.end, other.end) {
+                (Some(a), Some(b)) => a.csl_cmp(&b),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+    }
+}
+
+impl From<Date> for DateRange {
+    fn from(start: Date) -> Self {
+        Self::single(start)
+    }
+}
+
 /// This error can occur when trying to get a date from a string.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DateError {

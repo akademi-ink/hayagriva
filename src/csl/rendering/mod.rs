@@ -18,7 +18,7 @@ use crate::PageRanges;
 use crate::csl::Sorting;
 use crate::csl::taxonomy::{NumberVariableResult, PageVariableResult};
 use crate::lang::{Case, SentenceCase, TitleCase};
-use crate::types::{ChunkedString, Date, MaybeTyped, Numeric};
+use crate::types::{ChunkedString, Date, DateRange, MaybeTyped, Numeric};
 
 use super::taxonomy::{EntryLike, NumberOrPageVariableResult};
 use super::{
@@ -578,11 +578,16 @@ fn push_with_superscripts<T: EntryLike>(ctx: &mut Context<T>, text: &str) {
         rest.char_indices().find(|(_, c)| superscript_baseline(*c).is_some())
     {
         ctx.push_str(&rest[..pos]);
+        // citeproc-js writes one `<sup>` per Unicode superscript character
+        // (`1<sup>r</sup><sup>e</sup>` for the French ordinal). Flush each
+        // character as its own leaf so the serializer opens one tag pair per
+        // character even though the buffer coalescer merges equal formats.
         let fmt = ctx.push_format(citationberg::Formatting {
             vertical_align: Some(citationberg::VerticalAlign::Sup),
             ..Default::default()
         });
         ctx.push_str(superscript_baseline(c).unwrap());
+        ctx.writing.save_to_block_separate();
         ctx.pop_format(fmt);
         rest = &rest[pos + c.len_utf8()..];
     }
@@ -1075,21 +1080,22 @@ impl RenderCsl for citationberg::Date {
             return;
         }
 
-        let date = ctx.resolve_date_variable(variable);
+        let range = ctx.resolve_date_range(variable);
         let literal = ctx.resolve_date_literal(variable);
-        if date.is_none() && literal.is_none() {
+        if range.is_none() && literal.is_none() {
             return;
         }
         // A literal date has no machine-readable parts; render it at the year
         // position like citeproc-js (`date_OtherAlone`, `date_InPress`).
         let empty;
-        let date = match date.as_deref() {
-            Some(date) => date,
+        let range = match range.as_deref() {
+            Some(range) => range,
             None => {
-                empty = Date::from_year(0);
+                empty = DateRange::single(Date::from_year(0));
                 &empty
             }
         };
+        let date = &range.start;
 
         if let Some(sorting) = ctx.instance.sorting {
             let year;
@@ -1154,6 +1160,38 @@ impl RenderCsl for citationberg::Date {
                     .unwrap();
             }
 
+            // citeproc-js's `dateAsSortKey` appends the range end parts
+            // (`year_end`, `month_end`, `day_end`) to the start parts.
+            if let Some(end) = range.end {
+                if year {
+                    let end_year = if range.open_end { 0 } else { end.year };
+                    let (prefix, yr) = if end_year < 0 {
+                        ("N", i32::MAX + end_year)
+                    } else {
+                        ("P", end_year)
+                    };
+                    write!(ctx, "{prefix}{yr:09}").unwrap();
+                }
+
+                if month {
+                    write!(
+                        ctx,
+                        "{:02}",
+                        end.month.map(|m| m as i32 + 1).unwrap_or_default()
+                    )
+                    .unwrap();
+                }
+
+                if day {
+                    write!(
+                        ctx,
+                        "{:02}",
+                        end.day.map(|d| d as i32 + 1).unwrap_or_default()
+                    )
+                    .unwrap();
+                }
+            }
+
             return;
         }
 
@@ -1172,7 +1210,6 @@ impl RenderCsl for citationberg::Date {
 
         let parts = self.parts.or(base.and_then(|b| b.parts)).unwrap_or_default();
 
-        // TODO: Date ranges
         let mut first_part = true;
 
         // Localized (base) delimiter takes precedence over the cs:date
@@ -1202,20 +1239,31 @@ impl RenderCsl for citationberg::Date {
                 .term(Term::Other(OtherTerm::Bc), TermForm::default(), false)
                 .unwrap_or(" BC");
             let _ = write_year(date.year, false, ctx, ad, bc);
+            if let Some(end) = range.end {
+                ctx.push_str(DEFAULT_RANGE_DELIMITER);
+                if !range.open_end {
+                    let _ = write_year(end.year, false, ctx, ad, bc);
+                }
+            }
             if ctx.commit_elem_with_delimiter(loc, None) {
                 first_part = false;
             }
         }
 
-        for part in &base.unwrap_or(self).date_part {
-            match part.name {
-                DatePartName::Month if !parts.has_month() && date.season.is_none() => {
-                    continue;
-                }
-                DatePartName::Day if !parts.has_day() => continue,
-                _ => {}
-            }
+        let date_parts = &base.unwrap_or(self).date_part;
 
+        // Only the parts that this date node renders for the value take part
+        // in range collapsing.
+        let rendered: Vec<&citationberg::DatePart> = date_parts
+            .iter()
+            .filter(|part| date_part_has_value(part.name, &parts, range))
+            .collect();
+
+        let (collapse, splice_name) = date_range_collapse(range, &rendered);
+        let splice_idx = splice_name
+            .and_then(|name| rendered.iter().position(|part| part.name == name));
+
+        for (idx, part) in rendered.iter().enumerate() {
             let over_ride = base
                 .is_some()
                 .then(|| self.date_part.iter().find(|p| p.name == part.name))
@@ -1227,10 +1275,68 @@ impl RenderCsl for citationberg::Date {
             // value), and pushing the delimiter unconditionally would leave a
             // trailing delimiter behind (`2021 ;14(2)`, F-114).
             let loc = ctx.push_elem(citationberg::Formatting::default());
-            render_date_part(part, date, ctx, over_ride, first, literal.as_deref());
+            let is_splice = Some(idx) == splice_idx;
+            render_date_part(
+                part,
+                date,
+                ctx,
+                over_ride,
+                first,
+                literal.as_deref(),
+                DatePartOptions {
+                    // citeproc-js drops the suffix of the start date's
+                    // collapsing part: it is directly followed by the range
+                    // delimiter (`10–23 August 2003`).
+                    suppress_suffix: is_splice,
+                    ..DatePartOptions::default()
+                },
+            );
             let delimiter = if first_part { None } else { chosen_delim };
             if ctx.commit_elem_with_delimiter(loc, delimiter) {
                 first_part = false;
+            }
+
+            if !is_splice {
+                continue;
+            }
+
+            // Splice the end of the range in after the start date's
+            // collapsing part. The end repeats the parts that collapse, in
+            // document order, with the first end part's prefix dropped.
+            ctx.push_str(&date_part_range_delimiter(part, over_ride));
+            if range.open_end {
+                continue;
+            }
+            let Some(end) = range.end.as_ref() else { continue };
+
+            let mut first_end = true;
+            for end_part in rendered
+                .iter()
+                .take(idx + 1)
+                .filter(|part| collapse.contains(&part.name))
+            {
+                let over_ride = base
+                    .is_some()
+                    .then(|| self.date_part.iter().find(|p| p.name == end_part.name))
+                    .flatten();
+                let loc = ctx.push_elem(citationberg::Formatting::default());
+                render_date_part(
+                    end_part,
+                    end,
+                    ctx,
+                    over_ride,
+                    first,
+                    None,
+                    DatePartOptions {
+                        is_end: true,
+                        suppress_prefix: first_end,
+                        ..DatePartOptions::default()
+                    },
+                );
+                let delimiter = if first_end { None } else { chosen_delim };
+                if ctx.commit_elem_with_delimiter(loc, delimiter) {
+                    first_end = false;
+                }
             }
         }
 
@@ -1280,15 +1386,22 @@ impl RenderCsl for citationberg::Date {
             let parts = self.parts.or(base.and_then(|b| b.parts)).unwrap_or_default();
 
             let has_non_empty_vars = ctx.resolve_date_literal(variable).is_some()
-                || ctx.resolve_date_variable(variable).is_some_and(|date| {
-                    base.unwrap_or(self).date_part.iter().any(|part| match part.name {
-                        DatePartName::Year => true,
-                        DatePartName::Month => {
-                            (parts.has_month() || date.season.is_some())
-                                && (date.month.is_some() || date.season.is_some())
-                        }
-                        DatePartName::Day => parts.has_day() && date.day.is_some(),
-                    })
+                || ctx.resolve_date_range(variable).is_some_and(|range| {
+                    let renders = |date: &Date| {
+                        base.unwrap_or(self).date_part.iter().any(|part| {
+                            match part.name {
+                                DatePartName::Year => true,
+                                DatePartName::Month => {
+                                    (parts.has_month() || date.season.is_some())
+                                        && (date.month.is_some() || date.season.is_some())
+                                }
+                                DatePartName::Day => {
+                                    parts.has_day() && date.day.is_some()
+                                }
+                            }
+                        })
+                    };
+                    renders(&range.start) || range.end.is_some_and(|end| renders(&end))
                 });
             (
                 has_non_empty_vars,
@@ -1307,6 +1420,118 @@ impl RenderCsl for citationberg::Date {
     }
 }
 
+/// The CSL default for the delimiter between the ends of a date range.
+///
+/// citeproc-js backs this with the locale `year-range-delimiter` term, which
+/// every CSL locale leaves at its en-dash default.
+const DEFAULT_RANGE_DELIMITER: &str = "–";
+
+/// How one part of a date is written.
+#[derive(Clone, Copy, Default)]
+struct DatePartOptions {
+    /// Whether this piece belongs to the end of a range. The implicit year
+    /// suffix is only written for the start.
+    is_end: bool,
+    /// Omit the date part's prefix (the first part of a range end).
+    suppress_prefix: bool,
+    /// Omit the date part's suffix (the start part that the range delimiter
+    /// follows).
+    suppress_suffix: bool,
+}
+
+/// Whether a date part is rendered for a value.
+fn date_part_has_value(name: DatePartName, parts: &DateParts, range: &DateRange) -> bool {
+    match name {
+        DatePartName::Year => true,
+        // A month part also renders a season when the date carries one.
+        DatePartName::Month => {
+            parts.has_month()
+                || range.start.season.is_some()
+                || range.end.is_some_and(|end| end.season.is_some())
+        }
+        DatePartName::Day => parts.has_day(),
+    }
+}
+
+/// Whether the same date part has the same value in both dates.
+fn date_part_equal(name: DatePartName, start: &Date, end: &Date) -> bool {
+    match name {
+        DatePartName::Year => start.year == end.year,
+        DatePartName::Month => start.month == end.month && start.season == end.season,
+        DatePartName::Day => start.day == end.day,
+    }
+}
+
+/// Determine where a date range collapses.
+///
+/// Mirrors the build step of citeproc-js's `CSL.Node.date`: collect the parts
+/// that the node renders and that are present in the end value in canonical
+/// year/month/day order, find the first part whose start and end values
+/// differ (the default index is the day, i.e. 2), and collapse from there.
+/// The end is spliced in at the last collapsing part in document order.
+///
+/// Returns the collapsing parts (canonical order) and the part at which the
+/// range delimiter is written, or an empty plan when the value is no range or
+/// every rendered part collapses away.
+fn date_range_collapse(
+    range: &DateRange,
+    rendered: &[&citationberg::DatePart],
+) -> (Vec<DatePartName>, Option<DatePartName>) {
+    let Some(end) = range.end else {
+        return (Vec::new(), None);
+    };
+
+    let mut present: Vec<DatePartName> = Vec::new();
+    for name in [DatePartName::Year, DatePartName::Month, DatePartName::Day] {
+        if !rendered.iter().any(|part| part.name == name) {
+            continue;
+        }
+        let end_present = match name {
+            DatePartName::Year => true,
+            DatePartName::Month => end.month.is_some() || end.season.is_some(),
+            DatePartName::Day => end.day.is_some(),
+        };
+        if end_present {
+            present.push(name);
+        }
+    }
+
+    let mut first_diff = 2;
+    for (idx, name) in present.iter().enumerate() {
+        if !date_part_equal(*name, &range.start, &end) {
+            first_diff = idx;
+            break;
+        }
+    }
+
+    let collapsing: Vec<DatePartName> =
+        present.iter().skip(first_diff).copied().collect();
+    if collapsing.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    let splice = rendered
+        .iter()
+        .rev()
+        .map(|part| part.name)
+        .find(|name| collapsing.contains(name));
+
+    (collapsing, splice)
+}
+
+/// The delimiter written at a range splice: the collapsing date part's
+/// `range-delimiter` (a style override wins over the localized one), else the
+/// en-dash default.
+fn date_part_range_delimiter(
+    part: &citationberg::DatePart,
+    over_ride: Option<&citationberg::DatePart>,
+) -> String {
+    over_ride
+        .and_then(|o| o.range_delimiter.clone())
+        .or_else(|| part.range_delimiter.clone())
+        .unwrap_or_else(|| DEFAULT_RANGE_DELIMITER.to_string())
+}
+
 fn render_date_part<T: EntryLike>(
     date_part: &citationberg::DatePart,
     date: &Date,
@@ -1314,6 +1539,7 @@ fn render_date_part<T: EntryLike>(
     over_ride: Option<&citationberg::DatePart>,
     first: bool,
     literal: Option<&str>,
+    options: DatePartOptions,
 ) {
     let Some(val) = (match date_part.name {
         DatePartName::Day => date.day.map(|i| i as i32 + 1),
@@ -1340,8 +1566,17 @@ fn render_date_part<T: EntryLike>(
     let ambient = *ctx.writing.formatting();
     let idx = ctx.push_format(formatting);
 
-    let affixes = &date_part.affixes;
-    let affix_loc = (!is_only_suffix).then(|| ctx.apply_prefix(affixes, ambient));
+    // A range start drops the suffix of the part the range delimiter follows
+    // (`10–23 August 2003`) and the first part of a range end drops its
+    // prefix, both matching citeproc-js's queue splicing.
+    let mut affixes = date_part.affixes.clone();
+    if options.suppress_prefix {
+        affixes.prefix = None;
+    }
+    if options.suppress_suffix {
+        affixes.suffix = None;
+    }
+    let affix_loc = (!is_only_suffix).then(|| ctx.apply_prefix(&affixes, ambient));
     if date_part.name == DatePartName::Month {
         ctx.may_strip_periods(date_part.strip_periods);
     }
@@ -1425,6 +1660,7 @@ fn render_date_part<T: EntryLike>(
 
     if let DateStrongAnyForm::Year(_) = form
         && first
+        && !options.is_end
     {
         render_year_suffix_implicitly(ctx);
     }
@@ -1434,7 +1670,7 @@ fn render_date_part<T: EntryLike>(
     // period (`Jan. 2004`, not `Jan 2004`).
     ctx.stop_stripping_periods();
     if let Some(affix_loc) = affix_loc {
-        ctx.apply_suffix(affixes, affix_loc, ambient);
+        ctx.apply_suffix(&affixes, affix_loc, ambient);
     }
     ctx.pop_case(cidx);
     ctx.pop_format(idx);

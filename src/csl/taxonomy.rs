@@ -3,8 +3,8 @@ use std::cmp;
 use std::str::FromStr;
 
 use crate::types::{
-    ChunkedString, Date, EntryType, MaybeTyped, Numeric, Person, PersonRole, Publisher,
-    StringChunk,
+    ChunkedString, Date, DateRange, EntryType, MaybeTyped, Numeric, Person, PersonRole,
+    Publisher, StringChunk,
 };
 use crate::{Entry, PageRanges};
 use citationberg::taxonomy::{
@@ -35,6 +35,15 @@ pub trait EntryLike {
     ) -> Option<Cow<'_, ChunkedString>>;
     fn resolve_name_variable(&self, variable: NameVariable) -> Vec<Cow<'_, Person>>;
     fn resolve_date_variable(&self, variable: DateVariable) -> Option<Cow<'_, Date>>;
+    /// Resolve a date variable that may be a range.
+    ///
+    /// The default implementation wraps [`Self::resolve_date_variable`] as a
+    /// single date, so entry implementations that never carry ranges need not
+    /// override it.
+    fn resolve_date_range(&self, variable: DateVariable) -> Option<Cow<'_, DateRange>> {
+        self.resolve_date_variable(variable)
+            .map(|date| Cow::Owned(DateRange::single(*date)))
+    }
     /// A literal date value (`"in press"`, `"(in press)"`, …) for a date
     /// variable that has no machine-readable parts.
     fn resolve_date_literal(&self, variable: DateVariable) -> Option<Cow<'_, str>> {
@@ -1030,6 +1039,44 @@ fn split_given_suffix(
     (Some(given.to_string()), None, comma_suffix)
 }
 
+/// Convert one fixed CSL-JSON date component to the internal [`Date`].
+#[cfg(feature = "csl-json")]
+fn fixed_date_to_date(d: csl_json::FixedDate) -> Date {
+    // CSL-JSON numbers years historically (year -250 is 250 BCE) while the
+    // internal representation uses 0 for 1 BCE (cf. `Date` and `write_year`).
+    let year = if d.year <= 0 { d.year as i32 + 1 } else { d.year as i32 };
+
+    // citeproc-js normalizes out-of-range month values at render time
+    // (`CSL.Util.Dates.normalizeMonth`): values outside 1-24 are invalid,
+    // 17-24 wrap back into the 13-16 season range, and 13-16 name a season
+    // rather than a month.
+    let mut month = None;
+    let mut season = d.season;
+    if let Some(raw) = d.month {
+        let mut num = raw as i32 + 1;
+        if (1..=24).contains(&num) {
+            while num > 16 {
+                num -= 4;
+            }
+            if num > 12 {
+                season =
+                    citationberg::taxonomy::Season::try_from_csl_number((num - 12) as u8)
+                        .ok();
+            } else {
+                month = Some((num - 1) as u8);
+            }
+        }
+    }
+
+    Date {
+        year,
+        month,
+        day: d.day,
+        approximate: d.circa,
+        season,
+    }
+}
+
 impl EntryLike for citationberg::json::Item {
     fn resolve_standard_variable(
         &self,
@@ -1076,54 +1123,31 @@ impl EntryLike for citationberg::json::Item {
     }
 
     fn resolve_date_variable(&self, variable: DateVariable) -> Option<Cow<'_, Date>> {
-        match self.0.get(&variable.to_string())? {
-            csl_json::Value::Date(d) => {
-                let Ok(d) = csl_json::FixedDateRange::try_from(d.clone()) else {
-                    return None;
-                };
-                if d.end.is_some() {
-                    panic!("ranges are not supported")
-                }
-                let d = d.start;
+        self.resolve_date_range(variable).map(|range| Cow::Owned(range.start))
+    }
 
-                // CSL-JSON numbers years historically (year -250 is 250 BCE)
-                // while the internal representation uses 0 for 1 BCE
-                // (cf. `Date` and `write_year`).
-                let year = if d.year <= 0 { d.year as i32 + 1 } else { d.year as i32 };
+    fn resolve_date_range(&self, variable: DateVariable) -> Option<Cow<'_, DateRange>> {
+        let csl_json::Value::Date(d) = self.0.get(&variable.to_string())? else {
+            return None;
+        };
+        let Ok(d) = csl_json::FixedDateRange::try_from(d.clone()) else {
+            return None;
+        };
 
-                // citeproc-js normalizes out-of-range month values at render
-                // time (`CSL.Util.Dates.normalizeMonth`): values outside
-                // 1-24 are invalid, 17-24 wrap back into the 13-16 season
-                // range, and 13-16 name a season rather than a month.
-                let mut month = None;
-                let mut season = d.season;
-                if let Some(raw) = d.month {
-                    let mut num = raw as i32 + 1;
-                    if (1..=24).contains(&num) {
-                        while num > 16 {
-                            num -= 4;
-                        }
-                        if num > 12 {
-                            season = citationberg::taxonomy::Season::try_from_csl_number(
-                                (num - 12) as u8,
-                            )
-                            .ok();
-                        } else {
-                            month = Some((num - 1) as u8);
-                        }
-                    }
-                }
+        let start = fixed_date_to_date(d.start);
+        let Some(end) = d.end else {
+            return Some(Cow::Owned(DateRange::single(start)));
+        };
 
-                Some(Cow::Owned(Date {
-                    year,
-                    month,
-                    day: d.day,
-                    approximate: d.circa,
-                    season,
-                }))
-            }
-            _ => None,
-        }
+        // citeproc-js treats an all-zero end (`"date-parts": [[1987], [0]]`)
+        // as an open range: it renders the delimiter but no end date
+        // (`date_TextFormYeardateYearRangeOpen` expects `1987–`).
+        let open_end = end.year == 0 && end.month.is_none() && end.day.is_none();
+        Some(Cow::Owned(DateRange {
+            start,
+            end: Some(fixed_date_to_date(end)),
+            open_end,
+        }))
     }
 
     fn resolve_date_literal(&self, variable: DateVariable) -> Option<Cow<'_, str>> {
