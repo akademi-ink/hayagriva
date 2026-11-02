@@ -50,6 +50,7 @@ mod elem;
 mod quotes;
 mod rendering;
 mod sort;
+pub mod style;
 mod taxonomy;
 
 /// This struct formats a set of citations according to a style.
@@ -4427,6 +4428,37 @@ impl<'a, T: EntryLike> Context<'a, T> {
         loc
     }
 
+    /// Start a normal-reset scope: push the flip's declared formatting on the
+    /// format stack and record the absolute formatting inside the resulting
+    /// element.
+    ///
+    /// [`ElemMeta::NormalResetScope`] elements store the *absolute* formatting
+    /// (not a declaration) because the reset is written as a difference from
+    /// the surrounding formatting.
+    fn push_reset_scope_elem(
+        &mut self,
+        declared: citationberg::Formatting,
+        absolute: Formatting,
+    ) -> DisplayLoc {
+        let mut loc = self.writing.push_elem(declared);
+        loc.2 = absolute;
+        loc
+    }
+
+    /// Finish a normal-reset scope.
+    ///
+    /// Keeps the subtree as an explicit [`ElemMeta::NormalResetScope`] when it
+    /// rendered content; an empty flip (`<i></i>` inside italic) is dropped
+    /// like citeproc-js drops the empty span.
+    fn commit_reset_scope(&mut self, loc: DisplayLoc) {
+        self.writing.save_to_block();
+        if !self.writing.elem_stack.last().has_content() {
+            self.writing.commit_elem(loc, None, None);
+            return;
+        }
+        self.writing.commit_elem(loc, None, Some(ElemMeta::NormalResetScope));
+    }
+
     /// Remove the last subtree and discard it.
     ///
     /// Will panic if the location does not match.
@@ -4675,7 +4707,7 @@ impl<'a, T: EntryLike> Context<'a, T> {
                     // bold content is still case-transformed.
                     let nocase = stack.iter().any(|o| match o {
                         MarkupOpen::NoCase => true,
-                        MarkupOpen::Format(kind, _, _)
+                        MarkupOpen::Format { kind, .. }
                         | MarkupOpen::FormatOnly(kind, _, _) => matches!(
                             kind,
                             MarkupKind::SmallCaps | MarkupKind::Sup | MarkupKind::Sub
@@ -4702,7 +4734,7 @@ impl<'a, T: EntryLike> Context<'a, T> {
                             matches!(
                                 open,
                                 MarkupOpen::NoCase
-                                    | MarkupOpen::Format(_, _, true)
+                                    | MarkupOpen::Format { from_span: true, .. }
                                     | MarkupOpen::FormatOnly(_, _, true)
                             )
                         }),
@@ -4778,7 +4810,7 @@ impl<'a, T: EntryLike> Context<'a, T> {
                     matches!(
                         open,
                         MarkupOpen::NoCase
-                            | MarkupOpen::Format(_, _, true)
+                            | MarkupOpen::Format { from_span: true, .. }
                             | MarkupOpen::FormatOnly(_, _, true)
                     )
                 }) {
@@ -4794,6 +4826,15 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// scope: it has no positive tag to reproduce, and its all-normal scope
     /// (with the baseline sentinel) is what the writer diffs against the
     /// enclosing decorations.
+    ///
+    /// A flip (`<i>` inside italic, `<b>` inside bold, `<sc>` inside small
+    /// caps) declares a *normal* value, so there is no positive tag to open.
+    /// Instead of dropping the scope, the element is kept as a
+    /// [`ElemMeta::NormalResetScope`] carrying the absolute formatting in
+    /// effect inside it. That makes the reset boundary explicit: without it a
+    /// serializer cannot tell whether a nested scope that follows the reset
+    /// belongs inside or outside the reset (citeproc-js's `<i>A <b>B</b></i>`
+    /// reset scope ends right after the nested `<b>`).
     fn open_markup_scope(
         &mut self,
         kind: MarkupKind,
@@ -4805,8 +4846,17 @@ impl<'a, T: EntryLike> Context<'a, T> {
             let idx = self.push_format(formatting);
             stack.push(MarkupOpen::FormatOnly(kind, idx, from_span));
         } else {
-            let loc = self.push_scoped_elem(formatting);
-            stack.push(MarkupOpen::Format(kind, loc, from_span));
+            use citationberg::{FontStyle, FontVariant, FontWeight};
+            let reset = formatting.font_style == Some(FontStyle::Normal)
+                || formatting.font_variant == Some(FontVariant::Normal)
+                || formatting.font_weight == Some(FontWeight::Normal);
+            let loc = if reset {
+                let absolute = (*self.writing.formatting()).apply(formatting);
+                self.push_reset_scope_elem(formatting, absolute)
+            } else {
+                self.push_scoped_elem(formatting)
+            };
+            stack.push(MarkupOpen::Format { kind, loc, from_span, reset });
         }
     }
 
@@ -4856,7 +4906,12 @@ impl<'a, T: EntryLike> Context<'a, T> {
         while stack.len() > pos {
             match stack.pop().unwrap() {
                 MarkupOpen::NoCase => {}
-                MarkupOpen::Format(_, loc, _) => self.commit_elem(loc, None, None),
+                MarkupOpen::Format { loc, reset: true, .. } => {
+                    self.commit_reset_scope(loc);
+                }
+                MarkupOpen::Format { loc, reset: false, .. } => {
+                    self.commit_elem(loc, None, None);
+                }
                 MarkupOpen::FormatOnly(_, idx, _) => self.pop_format(idx),
             }
         }
@@ -5682,9 +5737,20 @@ enum MarkupKind {
 /// A rich-text scope opened by a tag in an input string.
 enum MarkupOpen {
     NoCase,
-    /// A formatting scope opened by a tag. The flag records whether the tag
-    /// was a `span`, which `</span>` closes regardless of its declaration.
-    Format(MarkupKind, DisplayLoc, bool),
+    /// A formatting scope opened by a tag. `from_span` records whether the
+    /// tag was a `span`, which `</span>` closes regardless of its
+    /// declaration. `reset` marks an all-normal flip scope, which serializers
+    /// must reproduce as an explicit reset span.
+    Format {
+        /// The tag's kind, used to match closing tags.
+        kind: MarkupKind,
+        /// The subtree of the scope.
+        loc: DisplayLoc,
+        /// Whether the tag was a `span`.
+        from_span: bool,
+        /// Whether the scope resets a decoration to its normal value.
+        reset: bool,
+    },
     /// A formatting change without an element scope (`nodecor`). The last
     /// flag is `from_span`; `</span>` closes it like a span scope.
     FormatOnly(MarkupKind, FormatIdx, bool),
@@ -5694,9 +5760,8 @@ impl MarkupOpen {
     fn matches(&self, kind: MarkupKind) -> bool {
         match self {
             MarkupOpen::NoCase => kind == MarkupKind::NoCase,
-            MarkupOpen::Format(open, _, _) | MarkupOpen::FormatOnly(open, _, _) => {
-                *open == kind
-            }
+            MarkupOpen::Format { kind: open, .. }
+            | MarkupOpen::FormatOnly(open, _, _) => *open == kind,
         }
     }
 }
@@ -6669,6 +6734,70 @@ mod tests {
     }
 
     #[test]
+    fn rich_text_flip_keeps_an_explicit_reset_scope() {
+        // `<i>` inside an italic declaration flips to normal. The engine must
+        // keep the flip's scope (rather than dropping it) and end it right
+        // after the nested `<b>`, because citeproc-js writes the reset span
+        // around the bold run: `<i>A <span style="font-style:normal;">X
+        // <b>Y</b></span> Z</i>`.
+        let style = citationberg::Style::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+                 <info><id/><title/><updated>2009-08-10T04:49:00+09:00</updated></info>
+                 <citation><layout><text variable="title"/></layout></citation>
+                 <bibliography>
+                   <layout><text variable="title" font-style="italic"/></layout>
+                 </bibliography>
+               </style>"#,
+        )
+        .unwrap();
+        let citationberg::Style::Independent(style) = style else { unreachable!() };
+
+        let library = from_yaml_str(
+            r#"a:
+                 type: Book
+                 title: A <i>X <b>Y</b></i> Z
+            "#,
+        )
+        .unwrap();
+        let entry = library.get("a").unwrap();
+
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![CitationItem::with_entry(entry)],
+            &style,
+            None,
+            &[],
+            None,
+        ));
+        let rendered = driver.finish(BibliographyRequest {
+            style: &style,
+            locale: None,
+            locale_files: &[],
+        });
+
+        let item = &rendered.bibliography.as_ref().unwrap().items[0];
+        let reset = item
+            .content
+            .find_meta(&ElemMeta::NormalResetScope)
+            .expect("the flip scope must be an explicit reset element");
+        assert_eq!(reset.formatting, Formatting::default());
+        // The scope ends immediately after the nested bold subtree: no reset
+        // run follows it.
+        assert_eq!(reset.children.0.len(), 2);
+        match &reset.children.0[1] {
+            ElemChild::Elem(bold) => {
+                assert_eq!(bold.formatting.font_weight, citationberg::FontWeight::Bold);
+                assert_eq!(bold.meta, None);
+            }
+            other => panic!("expected the nested bold element, got {other:?}"),
+        }
+
+        let mut output = String::new();
+        item.content.write_buf(&mut output, BufWriteFormat::Plain).unwrap();
+        assert_eq!(output, "A X Y Z");
+    }
+
+    #[test]
     #[cfg(feature = "archive")]
     /// See https://github.com/typst/hayagriva/issues/530
     fn issue_530() {
@@ -7208,6 +7337,139 @@ mod tests {
         assert_eq!(prefix.formatting.font_style, citationberg::FontStyle::Italic);
         let suffix = find_text(children, "My Suffix").expect("small-caps suffix run");
         assert_eq!(suffix.formatting.font_variant, citationberg::FontVariant::SmallCaps);
+    }
+
+    #[test]
+    fn affix_span_style_and_nesting_become_formatted_runs() {
+        // citeproc-js rich-text affixes also accept styled spans and nested
+        // combinations; the runs keep every declaration.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-span-test</id>
+                <title>Affix Span Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: My Title
+            "#,
+        )
+        .unwrap();
+
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![
+                CitationItem::with_entry(library.get("item").unwrap()).with_affixes(
+                    Some(
+                        r#"<span style="font-weight:bold">Bold <i>Both</i></span> "#
+                            .to_string(),
+                    ),
+                    Some(
+                        r#" <span style="font-variant:small-caps">Caps</span>"#
+                            .to_string(),
+                    ),
+                ),
+            ],
+            &style,
+            None,
+            &[],
+            Some(1),
+        ));
+        let finished = driver.finish(BibliographyRequest::new(&style, None, &[]));
+        let mut plain = String::new();
+        finished.citations[0]
+            .citation
+            .write_buf(&mut plain, BufWriteFormat::Plain)
+            .unwrap();
+        assert_eq!(plain, "Bold Both My Title Caps");
+
+        fn find_text<'a>(
+            children: &'a ElemChildren,
+            text: &str,
+        ) -> Option<&'a Formatted> {
+            children.0.iter().find_map(|child| match child {
+                ElemChild::Text(formatted) if formatted.text == text => Some(formatted),
+                ElemChild::Elem(elem) => find_text(&elem.children, text),
+                _ => None,
+            })
+        }
+
+        let children = &finished.citations[0].citation;
+        let bold = find_text(children, "Bold ").expect("bold prefix run");
+        assert_eq!(bold.formatting.font_weight, citationberg::FontWeight::Bold);
+        assert_eq!(bold.formatting.font_style, citationberg::FontStyle::Normal);
+        let both = find_text(children, "Both").expect("bold italic prefix run");
+        assert_eq!(both.formatting.font_weight, citationberg::FontWeight::Bold);
+        assert_eq!(both.formatting.font_style, citationberg::FontStyle::Italic);
+        let caps = find_text(children, "Caps").expect("small-caps suffix run");
+        assert_eq!(caps.formatting.font_variant, citationberg::FontVariant::SmallCaps);
+    }
+
+    #[test]
+    fn affix_nodecor_span_resets_the_layout_decoration() {
+        // The layout italicizes the citation; a `nodecor` span in a prefix
+        // flips its content back to roman type.
+        let style = IndependentStyle::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+              <info>
+                <id>affix-nodecor-test</id>
+                <title>Affix Nodecor Test</title>
+                <updated>2009-08-10T04:49:00+09:00</updated>
+              </info>
+              <citation>
+                <layout font-style="italic"><text variable="title"/></layout>
+              </citation>
+            </style>"#,
+        )
+        .unwrap();
+
+        let library = from_yaml_str(
+            r#"
+            item:
+                type: Book
+                title: My Title
+            "#,
+        )
+        .unwrap();
+
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![CitationItem::with_entry(library.get("item").unwrap()).with_affixes(
+                Some(r#"<span class="nodecor">Roman</span> "#.to_string()),
+                None,
+            )],
+            &style,
+            None,
+            &[],
+            Some(1),
+        ));
+        let finished = driver.finish(BibliographyRequest::new(&style, None, &[]));
+
+        fn find_text<'a>(
+            children: &'a ElemChildren,
+            text: &str,
+        ) -> Option<&'a Formatted> {
+            children.0.iter().find_map(|child| match child {
+                ElemChild::Text(formatted) if formatted.text == text => Some(formatted),
+                ElemChild::Elem(elem) => find_text(&elem.children, text),
+                _ => None,
+            })
+        }
+
+        let roman = find_text(&finished.citations[0].citation, "Roman")
+            .expect("nodecor prefix run");
+        assert_eq!(roman.formatting.font_style, citationberg::FontStyle::Normal);
+        assert_eq!(roman.formatting.font_weight, citationberg::FontWeight::Normal);
     }
 
     #[cfg(feature = "csl-json")]

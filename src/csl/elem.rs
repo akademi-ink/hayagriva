@@ -24,6 +24,11 @@ pub struct Elem {
     /// Serializers that reproduce citeproc-js HTML read this field; others
     /// can ignore it because [`ElemChild::Text`] leaves already carry their
     /// fully resolved formatting.
+    ///
+    /// A [`ElemMeta::NormalResetScope`] element is the one exception: its
+    /// formatting is the absolute formatting in effect inside the scope, so
+    /// the reset can be written as a difference from the surrounding
+    /// formatting.
     pub formatting: Formatting,
 }
 
@@ -519,6 +524,17 @@ pub enum ElemMeta {
     /// The element is the output of `cs:text` with a `variable` set to
     /// `citation-label`.
     CitationLabel,
+    /// A rich-text flip scope that resets decorations to their normal value
+    /// (`<i>` inside an italic scope, `<b>` inside a bold scope, …).
+    ///
+    /// The engine drops a rich-text scope when its declared formatting has no
+    /// positive tag to emit, but citeproc-js keeps the flip's scope open as an
+    /// explicit `font-style:normal`/`font-weight:normal` reset span. This
+    /// element preserves that boundary for serializers: its `formatting` is
+    /// the **absolute** formatting in effect inside the scope (not a
+    /// declaration to overlay), so a serializer can write the reset relative
+    /// to the formatting around it.
+    NormalResetScope,
 }
 
 /// A container for element children with useful methods.
@@ -591,7 +607,10 @@ impl ElemChildren {
     pub(super) fn remove_any_meta(&mut self) -> Option<ElemChild> {
         for i in 0..self.0.len() {
             if let ElemChild::Elem(e) = &mut self.0[i] {
-                if e.meta.is_some() {
+                // A normal-reset scope is a formatting boundary, not content:
+                // it must never be selected as a `second-field-align` field.
+                if e.meta.is_some() && !matches!(e.meta, Some(ElemMeta::NormalResetScope))
+                {
                     return Some(self.0.remove(i));
                 }
 

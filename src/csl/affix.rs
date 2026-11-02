@@ -1,13 +1,18 @@
 //! Rich-text citation-item affixes.
 //!
 //! citeproc-js parses a small HTML subset in per-item `prefix`/`suffix`
-//! values (`<i>`, `<b>`, `<sc>`, `<sup>`, `<sub>`) and splices the resulting
-//! formatted runs into the citation. [`Affix`] carries those runs; a plain
-//! string remains a single unformatted run so existing callers keep working.
+//! values (`<i>`, `<b>`, `<sc>`, `<sup>`, `<sub>`, and the `span` forms
+//! citeproc-js recognizes) and splices the resulting formatted runs into the
+//! citation. [`Affix`] carries those runs; a plain string remains a single
+//! unformatted run so existing callers keep working.
 
 use std::fmt::{self, Display};
 
-use citationberg::{FontStyle, FontVariant, FontWeight, Formatting, VerticalAlign};
+use citationberg::{
+    FontStyle, FontVariant, FontWeight, Formatting, TextDecoration, VerticalAlign,
+};
+
+use super::attribute_value;
 
 /// One formatted run of a rich-text affix.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -46,8 +51,11 @@ impl Affix {
     /// Parse citeproc-js rich-text markup into formatted runs.
     ///
     /// Supported tags are `<i>` (italic), `<b>` (bold), `<sc>` (small caps),
-    /// `<sup>` (superscript) and `<sub>` (subscript), including nesting and
-    /// closing tags. Unrecognized tags stay in the text verbatim.
+    /// `<sup>` (superscript), `<sub>` (subscript), `<span class="nocase">`
+    /// (text case only), `<span class="nodecor">` (reset all decorations) and
+    /// `<span style="…">` with the CSS properties citeproc-js understands.
+    /// Tags nest, and `</span>` closes the innermost span scope whatever it
+    /// declared. Unrecognized tags stay in the text verbatim.
     pub fn parse(text: impl AsRef<str>) -> Self {
         let text = text.as_ref();
         let mut runs: Vec<AffixRun> = Vec::new();
@@ -77,9 +85,17 @@ impl Affix {
             buf.push_str(&rest[..start]);
             flush(&mut runs, &mut buf, formatting);
             if closing {
-                if let Some(pos) = stack.iter().rposition(|(open, _)| *open == tag) {
+                if let Some(pos) =
+                    stack.iter().rposition(|(open, _)| open.matches_close(tag))
+                {
                     formatting = stack[pos].1;
                     stack.truncate(pos);
+                } else {
+                    // A closing tag without a matching scope stays literal,
+                    // like an unrecognized tag (`<span>` without a recognized
+                    // class/style is not a scope, so its `</span>` must not
+                    // vanish).
+                    buf.push_str(&rest[start..start + end + 1]);
                 }
             } else {
                 stack.push((tag, formatting));
@@ -172,6 +188,14 @@ enum MarkupTag {
     SmallCaps,
     Superscript,
     Subscript,
+    /// `<span class="nocase">`: affects text case, not run formatting.
+    NoCase,
+    /// `<span class="nodecor">`: resets every decoration to its normal value.
+    NoDecor,
+    /// `<span style="…">`: the declarations of the `style` attribute.
+    Styled(Formatting),
+    /// `</span>`, matching the innermost span scope of any kind.
+    Span,
 }
 
 impl MarkupTag {
@@ -183,7 +207,40 @@ impl MarkupTag {
             None => (false, tag),
         };
         let name = name.trim();
-        if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c == '/') {
+        if name.is_empty() || name.chars().any(|c| c == '/') {
+            return None;
+        }
+
+        // `span` tags carry their scope in attributes; `</span>` closes the
+        // innermost span scope whatever it declared.
+        if let Some(rest) = name.strip_prefix("span") {
+            if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+                return None;
+            }
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return if closing { Some((Self::Span, true)) } else { None };
+            }
+            if closing {
+                return Some((Self::Span, true));
+            }
+            if let Some(class) = attribute_value(rest, "class") {
+                return match class.trim() {
+                    "nocase" => Some((Self::NoCase, false)),
+                    "nodecor" => Some((Self::NoDecor, false)),
+                    _ => None,
+                };
+            }
+            if let Some(style) = attribute_value(rest, "style") {
+                let formatting = parse_css_formatting(style);
+                return (!formatting.is_empty())
+                    .then_some((Self::Styled(formatting), false));
+            }
+            return None;
+        }
+
+        // Bare tags do not take attributes.
+        if name.chars().any(char::is_whitespace) {
             return None;
         }
         let tag = match name.to_ascii_lowercase().as_str() {
@@ -197,6 +254,16 @@ impl MarkupTag {
         Some((tag, closing))
     }
 
+    /// Whether this open scope is the one a closing tag closes.
+    fn matches_close(self, close: Self) -> bool {
+        match close {
+            // `</span>` closes the innermost span scope, whatever it declared
+            // (`nocase`, `nodecor` or a styled span).
+            Self::Span => matches!(self, Self::NoCase | Self::NoDecor | Self::Styled(_)),
+            _ => self == close,
+        }
+    }
+
     /// The formatting this tag declares.
     fn formatting(self) -> citationberg::Formatting {
         let mut formatting = citationberg::Formatting::default();
@@ -206,9 +273,66 @@ impl MarkupTag {
             Self::SmallCaps => formatting.font_variant = Some(FontVariant::SmallCaps),
             Self::Superscript => formatting.vertical_align = Some(VerticalAlign::Sup),
             Self::Subscript => formatting.vertical_align = Some(VerticalAlign::Sub),
+            Self::NoCase => {}
+            Self::NoDecor => {
+                formatting.font_style = Some(FontStyle::Normal);
+                formatting.font_variant = Some(FontVariant::Normal);
+                formatting.font_weight = Some(FontWeight::Normal);
+                formatting.text_decoration = Some(TextDecoration::None);
+            }
+            Self::Styled(declared) => formatting = declared,
+            Self::Span => {}
         }
         formatting
     }
+}
+
+/// Map the CSS declarations citeproc-js accepts in `style` attributes to
+/// formatting. Unlike CSL variables, item affixes may carry several
+/// declarations in one span (`<span style="font-style:italic;font-weight:bold">`);
+/// every recognized declaration is applied, the last one winning per property.
+fn parse_css_formatting(style: &str) -> Formatting {
+    let mut formatting = Formatting::default();
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        match (property.as_str(), value.as_str()) {
+            ("font-style", "italic" | "oblique") => {
+                formatting.font_style = Some(FontStyle::Italic)
+            }
+            ("font-style", "normal") => formatting.font_style = Some(FontStyle::Normal),
+            ("font-variant", "small-caps") => {
+                formatting.font_variant = Some(FontVariant::SmallCaps)
+            }
+            ("font-variant", "normal") => {
+                formatting.font_variant = Some(FontVariant::Normal)
+            }
+            ("font-weight", "bold") => formatting.font_weight = Some(FontWeight::Bold),
+            ("font-weight", "normal") => {
+                formatting.font_weight = Some(FontWeight::Normal)
+            }
+            ("text-decoration", "underline") => {
+                formatting.text_decoration = Some(TextDecoration::Underline)
+            }
+            ("text-decoration", "none") => {
+                formatting.text_decoration = Some(TextDecoration::None)
+            }
+            ("vertical-align", "sup" | "super") => {
+                formatting.vertical_align = Some(VerticalAlign::Sup)
+            }
+            ("vertical-align", "sub" | "subscript") => {
+                formatting.vertical_align = Some(VerticalAlign::Sub)
+            }
+            ("vertical-align", "baseline") => {
+                formatting.vertical_align = Some(VerticalAlign::Baseline)
+            }
+            _ => {}
+        }
+    }
+    formatting
 }
 
 #[cfg(test)]
@@ -252,5 +376,77 @@ mod tests {
 
         let affix = Affix::parse("a <span>b</span>");
         assert_eq!(affix.as_plain(), "a <span>b</span>");
+    }
+
+    #[test]
+    fn span_style_declarations_become_runs() {
+        let affix = Affix::parse(r#"a <span style="font-style:italic">b</span> c"#);
+        let runs = affix.runs();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, "b");
+        assert_eq!(runs[1].formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(runs[2].formatting, Formatting::default());
+        assert_eq!(affix.as_plain(), "a b c");
+    }
+
+    #[test]
+    fn span_style_applies_every_declaration() {
+        let affix = Affix::parse(
+            r#"<span style="font-style: italic; font-weight:bold; font-variant: small-caps">x</span>"#,
+        );
+        let run = &affix.runs()[0];
+        assert_eq!(run.formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(run.formatting.font_weight, Some(FontWeight::Bold));
+        assert_eq!(run.formatting.font_variant, Some(FontVariant::SmallCaps));
+    }
+
+    #[test]
+    fn span_styles_nest_with_bare_tags() {
+        // A styled span inside `<i>` keeps the italic declaration and adds its
+        // own; `</span>` restores the italic-only scope.
+        let affix = Affix::parse(
+            r#"<i>a<span style="font-weight:bold">b<sup>c</sup></span>d</i>e"#,
+        );
+        let runs = affix.runs();
+        assert_eq!(runs.len(), 5);
+        assert_eq!(runs[0].text, "a");
+        assert_eq!(runs[0].formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(runs[1].text, "b");
+        assert_eq!(runs[1].formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(runs[1].formatting.font_weight, Some(FontWeight::Bold));
+        assert_eq!(runs[2].text, "c");
+        assert_eq!(runs[2].formatting.vertical_align, Some(VerticalAlign::Sup));
+        assert_eq!(runs[2].formatting.font_weight, Some(FontWeight::Bold));
+        assert_eq!(runs[3].text, "d");
+        assert_eq!(runs[3].formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(runs[3].formatting.font_weight, None);
+        assert_eq!(runs[4].formatting, Formatting::default());
+    }
+
+    #[test]
+    fn span_nocase_keeps_formatting_and_closes_at_span() {
+        let affix = Affix::parse(r#"<i><span class="nocase">a</span>b</i>"#);
+        let runs = affix.runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].formatting.font_style, Some(FontStyle::Italic));
+        assert_eq!(runs[1].formatting.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn span_nodecor_resets_decorations() {
+        let affix = Affix::parse(r#"<i><span class="nodecor">a</span>b</i>"#);
+        let runs = affix.runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].formatting.font_style, Some(FontStyle::Normal));
+        assert_eq!(runs[0].formatting.font_weight, Some(FontWeight::Normal));
+        assert_eq!(runs[0].formatting.text_decoration, Some(TextDecoration::None));
+        assert_eq!(runs[1].formatting.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn unknown_spans_stay_literal() {
+        let affix = Affix::parse(r#"a <span class="other">b</span> c"#);
+        assert_eq!(affix.as_plain(), r#"a <span class="other">b</span> c"#);
+        assert!(affix.runs().iter().all(|run| run.formatting == Formatting::default()));
     }
 }

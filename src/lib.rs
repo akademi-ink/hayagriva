@@ -154,6 +154,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "archive")]
 pub use crate::csl::archive;
 pub use citationberg;
+pub use csl::style::independent_style_with_month_day;
 pub use csl::{
     Affix, AffixRun, BibliographyDriver, BibliographyItem, BibliographyRequest, Brackets,
     BufWriteFormat, CitationItem, CitationRequest, CitePosition, CitePurpose, Elem,
