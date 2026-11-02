@@ -1,0 +1,43 @@
+>>===== MODE =====>>
+bibliography
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+<div class="csl-bib-body"><div class="csl-entry">2</div></div>
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0" default-locale="zh-CN">
+  <info>
+    <title>Empty ordinal term</title>
+    <id>http://example.com/empty-ordinal</id>
+    <updated>2026-11-02T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="title"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <number variable="edition" form="ordinal"/>
+    </layout>
+  </bibliography>
+</style>
+<<===== CSL =====<<
+
+>>===== INPUT =====>>
+[
+  {
+    "id": "ITEM-1",
+    "type": "book",
+    "title": "A Book",
+    "edition": "2"
+  }
+]
+<<===== INPUT =====<<
+
+>>===== VERSION =====>>
+1.0
+<<===== VERSION =====<<

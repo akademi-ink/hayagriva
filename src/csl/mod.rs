@@ -5150,85 +5150,106 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// requested gender, then the neutral form, in whole-number,
     /// last-two-digits and last-digit order, and fall back to the generic
     /// `ordinal` term.
+    ///
+    /// A locale that names any ordinal term owns the answer, even when the
+    /// matching term has no text: locales such as zh-CN define an empty
+    /// `ordinal` term to mean "numbers carry no suffix". Returning `None` in
+    /// that case would make `lookup_locale` fall through to en-US and append
+    /// its `nd`, turning a plain GB/T 7714 edition number ("2 版") into
+    /// "2nd 版".
     fn ordinal_suffix(&self, n: i32, gender: Option<GrammarGender>) -> Option<String> {
         use citationberg::OrdinalMatch;
 
-        self.style.lookup_locale(|locale| {
-            let terms = &locale.terms.as_ref()?.terms;
-            let generic = terms.iter().find(|t| {
-                t.name == Term::Other(OtherTerm::Ordinal) && t.form == TermForm::default()
-            });
+        self.style
+            .lookup_locale(|locale| {
+                let terms = &locale.terms.as_ref()?.terms;
+                if !terms.iter().any(|t| t.name.is_ordinal()) {
+                    // No ordinal data at all: let a later locale (and, for a
+                    // style locale, the archive locale file) answer.
+                    return None;
+                }
 
-            let legacy = generic.is_none()
-                && (1..=4).all(|n| {
-                    terms.iter().any(|t| {
-                        t.name == Term::Other(OtherTerm::OrdinalN(n))
-                            && t.form == TermForm::default()
-                    })
+                let generic = terms.iter().find(|t| {
+                    t.name == Term::Other(OtherTerm::Ordinal)
+                        && t.form == TermForm::default()
                 });
 
-            let mut find = |category: u8, gender: Option<GrammarGender>| {
-                terms.iter().find_map(|t| {
-                    if t.form != TermForm::default() || t.gender_form != gender {
-                        return None;
-                    }
-                    let Term::Other(OtherTerm::OrdinalN(o)) = t.name else {
-                        return None;
-                    };
-                    let hit = match category {
-                        0 => t.match_ == Some(OrdinalMatch::WholeNumber) && n == o as i32,
-                        1 => {
-                            (t.match_ == Some(OrdinalMatch::LastTwoDigits)
-                                || (t.match_.is_none() && o >= 10))
-                                && n % 100 == o as i32
-                        }
-                        _ => {
-                            (t.match_ == Some(OrdinalMatch::LastDigit)
-                                || (t.match_.is_none() && o < 10))
-                                && n % 10 == o as i32
-                        }
-                    };
-                    hit.then(|| t.single().or_else(|| t.multiple()))
-                        .flatten()
-                        .map(str::to_string)
-                })
-            };
-
-            for g in [gender, None] {
-                for category in 0..3 {
-                    if let Some(suffix) = find(category, g) {
-                        return Some(suffix);
-                    }
-                }
-            }
-
-            if legacy {
-                // CSL 1.0.0 locales define only ordinal-01 through ordinal-04
-                // and use the English 11–13 class rule.
-                let class: u8 = match (n, n % 10) {
-                    (11..=13, _) => 4,
-                    (_, v @ 1..=3) => v as u8,
-                    _ => 4,
-                };
-                for g in [gender, None] {
-                    let suffix = terms.iter().find_map(|t| {
-                        (t.form == TermForm::default()
-                            && t.gender_form == g
-                            && t.name == Term::Other(OtherTerm::OrdinalN(class)))
-                        .then(|| t.single().or_else(|| t.multiple()))
-                        .flatten()
-                        .map(str::to_string)
+                let legacy = generic.is_none()
+                    && (1..=4).all(|n| {
+                        terms.iter().any(|t| {
+                            t.name == Term::Other(OtherTerm::OrdinalN(n))
+                                && t.form == TermForm::default()
+                        })
                     });
-                    if suffix.is_some() {
-                        return suffix;
+
+                let mut find = |category: u8, gender: Option<GrammarGender>| {
+                    terms.iter().find_map(|t| {
+                        if t.form != TermForm::default() || t.gender_form != gender {
+                            return None;
+                        }
+                        let Term::Other(OtherTerm::OrdinalN(o)) = t.name else {
+                            return None;
+                        };
+                        let hit = match category {
+                            0 => {
+                                t.match_ == Some(OrdinalMatch::WholeNumber)
+                                    && n == o as i32
+                            }
+                            1 => {
+                                (t.match_ == Some(OrdinalMatch::LastTwoDigits)
+                                    || (t.match_.is_none() && o >= 10))
+                                    && n % 100 == o as i32
+                            }
+                            _ => {
+                                (t.match_ == Some(OrdinalMatch::LastDigit)
+                                    || (t.match_.is_none() && o < 10))
+                                    && n % 10 == o as i32
+                            }
+                        };
+                        hit.then(|| t.single().or_else(|| t.multiple()))
+                            .flatten()
+                            .map(str::to_string)
+                    })
+                };
+
+                for g in [gender, None] {
+                    for category in 0..3 {
+                        if let Some(suffix) = find(category, g) {
+                            return Some(Some(suffix));
+                        }
                     }
                 }
-            }
 
-            generic
-                .and_then(|t| t.single().or_else(|| t.multiple()))
-                .map(str::to_string)
-        })
+                if legacy {
+                    // CSL 1.0.0 locales define only ordinal-01 through ordinal-04
+                    // and use the English 11–13 class rule.
+                    let class: u8 = match (n, n % 10) {
+                        (11..=13, _) => 4,
+                        (_, v @ 1..=3) => v as u8,
+                        _ => 4,
+                    };
+                    for g in [gender, None] {
+                        let suffix = terms.iter().find_map(|t| {
+                            (t.form == TermForm::default()
+                                && t.gender_form == g
+                                && t.name == Term::Other(OtherTerm::OrdinalN(class)))
+                            .then(|| t.single().or_else(|| t.multiple()))
+                            .flatten()
+                            .map(str::to_string)
+                        });
+                        if suffix.is_some() {
+                            return Some(suffix);
+                        }
+                    }
+                }
+
+                Some(
+                    generic
+                        .and_then(|t| t.single().or_else(|| t.multiple()))
+                        .map(str::to_string),
+                )
+            })
+            .flatten()
     }
 
     /// Get the ordinal lookup object.
