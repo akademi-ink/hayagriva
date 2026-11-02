@@ -1260,19 +1260,22 @@ impl RenderCsl for citationberg::Date {
     }
 
     fn will_have_info<T: EntryLike>(&self, ctx: &mut Context<T>) -> (bool, UsageInfo) {
+        // The probe must not consume a variable: a date rendered inside a
+        // `cs:names` substitute is only marked as used once it actually
+        // renders, so that the rest of the layout can suppress it
+        // (`bugreports_LegislationCrash`). This mirrors `Text::will_have_info`.
         let suppressing = ctx.writing.suppress_queried_variables;
         ctx.writing.stop_suppressing_queried_variables();
-        let Some(variable) = self.variable else {
-            return (false, UsageInfo { has_vars: true, ..Default::default() });
-        };
 
-        if suppressing {
-            ctx.writing.start_suppressing_queried_variables();
-        }
+        let result = (|| {
+            let Some(variable) = self.variable else {
+                return (false, UsageInfo { has_vars: true, ..Default::default() });
+            };
 
-        if !self.will_render(ctx, variable.into()) {
-            (false, UsageInfo::default())
-        } else {
+            if !self.will_render(ctx, variable.into()) {
+                return (false, UsageInfo::default());
+            }
+
             let base = self.form.and_then(|form| ctx.localized_date(form));
             let parts = self.parts.or(base.and_then(|b| b.parts)).unwrap_or_default();
 
@@ -1295,7 +1298,12 @@ impl RenderCsl for citationberg::Date {
                     ..Default::default()
                 },
             )
+        })();
+
+        if suppressing {
+            ctx.writing.start_suppressing_queried_variables();
         }
+        result
     }
 }
 

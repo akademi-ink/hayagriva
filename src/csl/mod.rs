@@ -68,6 +68,12 @@ impl<T: EntryLike> Default for BibliographyDriver<'_, T> {
 #[derive(Clone, Debug, PartialEq)]
 struct SpeculativeItemRender<'a, T: EntryLike> {
     rendered: ElemChildren,
+    /// The item rendered for ambiguity detection. citeproc-js always scans
+    /// the "subsequent" cite form (`position="subsequent"`, `near-note` true,
+    /// no locator or affixes), so two items whose first forms differ can
+    /// still clash for disambiguation (`disambiguate_BasedOnSubsequentFormWithBackref2`,
+    /// `bugreports_EnvAndUrb`).
+    ambiguity_rendered: ElemChildren,
     entry: &'a T,
     cite_props: CiteProperties<'a>,
     checked_disambiguate: bool,
@@ -385,15 +391,27 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 cite_props.speculative.identifier_usage =
                     ctx.instance.identifier_usage.take();
 
+                let first_name = ctx.writing.first_name.clone();
+                let checked_disambiguate = ctx.writing.checked_disambiguate;
+                let rendered = ctx.flush();
+                let ambiguity_rendered = ambiguity_render(
+                    &style,
+                    *entry,
+                    &cite_props,
+                    item.locale.as_ref(),
+                    item.purpose,
+                    citation,
+                );
                 renders.push(SpeculativeItemRender {
                     entry,
                     cite_props,
-                    checked_disambiguate: ctx.writing.checked_disambiguate,
-                    first_name: ctx.writing.first_name.clone(),
+                    checked_disambiguate,
+                    first_name,
                     delim_override: None,
                     group_idx: None,
                     locator: item.locator.clone(),
-                    rendered: ctx.flush(),
+                    rendered,
+                    ambiguity_rendered,
                     hidden: item.hidden,
                     locale: item.locale.clone(),
                     purpose: item.purpose,
@@ -425,8 +443,9 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
             .map(|(idx, item)| (item.entry as *const T, idx))
             .collect();
         let disambiguate_levels = style_disambiguate_levels(bib_style.csl);
+        let mut choose_resolved: HashSet<*const T> = HashSet::new();
         for _ in 0..(4 + disambiguate_levels as usize) {
-            let ambiguous = find_ambiguous_sets(&res);
+            let ambiguous = find_ambiguous_sets(&res, &choose_resolved);
             if ambiguous.is_empty() {
                 break;
             }
@@ -454,9 +473,12 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                 }
 
                 // 2b. Disambiguate by allowing `cs:choose` disambiguation.
-                disambiguate_with_choose(&res, group, |entry, state| {
-                    mark(&mut rerender, entry, state)
-                });
+                disambiguate_with_choose(
+                    &res,
+                    group,
+                    |entry, state| mark(&mut rerender, entry, state),
+                    &mut choose_resolved,
+                );
 
                 if rerender.len() + suffixes.len() > len_rerender {
                     continue;
@@ -487,6 +509,14 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
                     }
                     if rerender_item {
                         item.rendered = do_rerender(&style_ctx, item, cite.request);
+                        item.ambiguity_rendered = ambiguity_render(
+                            &style_ctx,
+                            item.entry,
+                            &item.cite_props,
+                            item.locale.as_ref(),
+                            item.purpose,
+                            cite.request,
+                        );
                     }
                 }
             }
@@ -1002,6 +1032,59 @@ fn do_rerender<T: EntryLike>(
     )
 }
 
+/// Render an item the way citeproc-js scans for ambiguity.
+///
+/// `CSL.getAmbiguousCite` forces `position: subsequent` and `near-note: true`
+/// on the cited item, and passes neither locator nor affixes. This differs
+/// from the actual citation whenever the style branches on `position`.
+fn ambiguity_render<T: EntryLike>(
+    ctx: &StyleContext<'_>,
+    entry: &T,
+    cite_props: &CiteProperties<'_>,
+    locale: Option<&LocaleCode>,
+    purpose: Option<CitePurpose>,
+    request: &CitationRequest<'_, T>,
+) -> ElemChildren {
+    scan_render(ctx, entry, cite_props, locale, purpose, request, None).0
+}
+
+/// Like [`ambiguity_render`], but with a forced disambiguation state and also
+/// returning the properties of the first names element of the scan render.
+///
+/// citeproc-js scans disambiguation candidates with the names already expanded
+/// to their maximum, because the `disNames` counter is forward-only and keeps
+/// its value even when a step did not improve the visible render.
+fn scan_render<T: EntryLike>(
+    ctx: &StyleContext<'_>,
+    entry: &T,
+    cite_props: &CiteProperties<'_>,
+    locale: Option<&LocaleCode>,
+    purpose: Option<CitePurpose>,
+    request: &CitationRequest<'_, T>,
+    state: Option<DisambiguateState>,
+) -> (ElemChildren, Option<NameDisambiguationProperties>) {
+    let mut props = cite_props.clone();
+    props.certain.position = Some(CitePosition::Subsequent);
+    props.certain.near_note = Some(true);
+    props.certain.is_near_note = true;
+    props.speculative.ibid = IbidState::Different;
+    props.speculative.locator = None;
+    if let Some(state) = state {
+        props.speculative.disambiguation = state;
+    }
+    let ctx = ctx.do_citation(
+        entry,
+        props,
+        locale,
+        request.locale.as_ref(),
+        purpose,
+        None,
+        None,
+    );
+    let first_name = ctx.writing.first_name.clone();
+    (ctx.flush(), first_name)
+}
+
 fn date_replacement<T: EntryLike>(
     ctx: &StyleContext<'_>,
     entry: &T,
@@ -1451,11 +1534,22 @@ fn disambiguate_names<F, T>(
         })
         .collect();
 
-    // citeproc-js only keeps a disambiguation step when it reduces the number
-    // of clashes; otherwise it falls back to the last improving render.
+    // citeproc-js partitions the ambiguous set on every name-expansion step:
+    // items whose render key differs from the probe item leave the current
+    // list (they are already distinguishable from it) while the items that
+    // still clash keep growing. A step is only kept when it refines that
+    // partition, so increments that do not separate anything are discarded
+    // when the list dies.
+    //
+    // The previous implementation counted items that still had *any* partner;
+    // that misses the two-level case (`disambiguate_YearSuffixAtTwoLevels`):
+    // expanding to three names splits a four-item group into two pairs, but
+    // every item still has a partner, so the improvement was discarded and
+    // the whole group fell through to year-suffix (a–d) without name
+    // expansion.
     let mut best = props.clone();
-    let mut best_clashes = usize::MAX;
-    while !active.is_empty() {
+    let mut best_partitions = 1usize;
+    loop {
         if let Some(rule) = rule {
             expand_given_names(&data, &mut props, &active, rule);
         }
@@ -1467,28 +1561,36 @@ fn disambiguate_names<F, T>(
             })
             .collect();
 
-        let mut still = Vec::new();
-        for (pos, idx) in active.iter().enumerate() {
-            let unique = !keys
-                .iter()
-                .enumerate()
-                .any(|(other_pos, key)| other_pos != pos && *key == keys[pos]);
-            if !unique {
-                still.push(*idx);
+        // Group positions in `active` by identical render key.
+        let mut classes: Vec<Vec<usize>> = Vec::new();
+        for (pos, key) in keys.iter().enumerate() {
+            if let Some(class) = classes.iter_mut().find(|c| keys[c[0]] == *key) {
+                class.push(pos);
+            } else {
+                classes.push(vec![pos]);
             }
         }
 
-        if still.len() < best_clashes {
-            best_clashes = still.len();
+        if classes.len() > best_partitions {
+            best_partitions = classes.len();
             best = props.clone();
         }
 
-        if still.is_empty() || !add_names {
+        let ambiguous: Vec<usize> = classes
+            .iter()
+            .filter(|class| class.len() > 1)
+            .flat_map(|class| class.iter().map(|pos| active[*pos]))
+            .collect();
+
+        if ambiguous.is_empty() || !add_names {
+            if ambiguous.is_empty() {
+                best = props.clone();
+            }
             break;
         }
 
         let mut grew = false;
-        for idx in &still {
+        for idx in &ambiguous {
             let Some(props) = props[*idx].as_mut() else { continue };
             let visible = props.visible_count();
             if visible < props.name_count() {
@@ -1499,7 +1601,7 @@ fn disambiguate_names<F, T>(
         if !grew {
             break;
         }
-        active = still;
+        active = ambiguous;
     }
 
     for (idx, props) in best.iter().enumerate() {
@@ -1561,25 +1663,55 @@ fn style_disambiguate_levels(csl: &IndependentStyle) -> u8 {
     count
 }
 
+/// Expand the names of a [`NameDisambiguationProperties`] to the maximum
+/// form the style can render.
+fn maximal_name_props(
+    mut props: NameDisambiguationProperties,
+) -> NameDisambiguationProperties {
+    let count = props.name_count();
+    let visible = props.visible_count();
+    if visible < count {
+        props.add_name(count);
+    }
+    for idx in 0..count {
+        let Some(mut form) = props.form_at(idx) else { continue };
+        while let Some(next) = form.disambiguate(true) {
+            form = next;
+        }
+        props.set_form_at(idx, form);
+    }
+    props
+}
+
 /// Mark qualifying entries for disambiguation with `cs:choose`.
 ///
 /// Every member of an ambiguous group activates the next `disambiguate`
 /// level, matching citeproc-js: the first level is enabled for all clashing
 /// entries (including the first), and entries that remain ambiguous after a
 /// re-render activate the following level on the next sweep.
+///
+/// If the level makes the group unique once the names element is expanded to
+/// its maximum, the group is resolved at that level and the entries are
+/// recorded in `resolved`: citeproc-js scanned this level with its
+/// forward-only name counter at the maximum and committed only the
+/// `disambiguate` level (`bugreports_EnvAndUrb`).
 fn disambiguate_with_choose<F, T>(
     renders: &[SpeculativeCiteRender<'_, '_, T>],
     group: &AmbiguousGroup,
     mut mark: F,
+    resolved: &mut HashSet<*const T>,
 ) where
     T: EntryLike,
     F: FnMut(&T, DisambiguateState),
 {
-    let max_level = style_disambiguate_levels(renders[group[0].0].request.style);
+    let style = renders[group[0].0].request.style;
+    let max_level = style_disambiguate_levels(style);
     if max_level == 0 {
         return;
     }
 
+    // One candidate level per entry (the maximum over its occurrences).
+    let mut levels: Vec<(&T, u8)> = Vec::new();
     for &(cite_idx, item_idx) in group.iter() {
         let item = &renders[cite_idx].items[item_idx];
         if !item.checked_disambiguate
@@ -1598,7 +1730,61 @@ fn disambiguate_with_choose<F, T>(
         if current >= max_level {
             continue;
         }
-        mark(item.entry, DisambiguateState::Choose(current + 1));
+        let next = current + 1;
+        match levels.iter_mut().find(|(entry, _)| std::ptr::eq(*entry, item.entry)) {
+            Some(slot) => slot.1 = slot.1.max(next),
+            None => levels.push((item.entry, next)),
+        }
+    }
+    if levels.is_empty() {
+        return;
+    }
+
+    // Trial scan: render each entry at its candidate level with the names
+    // expanded to the maximum. If every entry is distinct, the level
+    // resolves the ambiguity as far as citeproc-js is concerned.
+    let mut trial_keys = Vec::with_capacity(levels.len());
+    let mut all_named = true;
+    for (entry, level) in &levels {
+        let Some(&(cite_idx, item_idx)) = group
+            .iter()
+            .find(|(cite_idx, item_idx)| {
+                std::ptr::eq(renders[*cite_idx].items[*item_idx].entry, *entry)
+            })
+        else {
+            all_named = false;
+            break;
+        };
+        let item = &renders[cite_idx].items[item_idx];
+        let style_ctx = renders[cite_idx].request.style();
+        let (children, props) = scan_render(
+            &style_ctx,
+            item.entry,
+            &item.cite_props,
+            item.locale.as_ref(),
+            item.purpose,
+            &renders[cite_idx].request,
+            Some(DisambiguateState::Choose(*level)),
+        );
+        match props {
+            Some(props) => trial_keys
+                .push(name_disambiguation_key(&maximal_name_props(props), &get_names(&children))),
+            None => {
+                all_named = false;
+                break;
+            }
+        }
+    }
+    let trial_resolved = all_named && {
+        let distinct: HashSet<&String> = trial_keys.iter().collect();
+        distinct.len() == trial_keys.len()
+    };
+
+    for (entry, level) in levels {
+        mark(entry, DisambiguateState::Choose(level));
+        if trial_resolved {
+            resolved.insert(entry as *const T);
+        }
     }
 }
 
@@ -1666,6 +1852,7 @@ fn disambiguate_year_suffix<F, T>(
 /// cite and item index.
 fn find_ambiguous_sets<T: EntryLike + PartialEq>(
     cites: &[SpeculativeCiteRender<'_, '_, T>],
+    resolved: &HashSet<*const T>,
 ) -> Vec<AmbiguousGroup> {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PotentialDisambiguation {
@@ -1680,12 +1867,15 @@ fn find_ambiguous_sets<T: EntryLike + PartialEq>(
 
     for (i, cite) in cites.iter().enumerate() {
         for (j, item) in cite.items.iter().enumerate() {
-            if item.cite_props.speculative.year_suffix.is_some() {
-                // This item already carries a suffix.
+            if item.cite_props.speculative.year_suffix.is_some()
+                || resolved.contains(&(item.entry as *const T))
+            {
+                // This item already carries a suffix, or a
+                // `disambiguate="true"` level was found to resolve it.
                 continue;
             }
 
-            let buf = ambiguity_key(&item.rendered);
+            let buf = ambiguity_key(&item.ambiguity_rendered);
             match map.entry(buf) {
                 HmEntry::Occupied(entry) => match *entry.get() {
                     PotentialDisambiguation::Single(pos) => {
@@ -4119,9 +4309,8 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.writing
             .elem_stack
             .last_mut_predicate(|p| !p.is_empty())
-            .and_then(|p| p.0.last_mut())
-            .and_then(get_last_text)
-            .and_then(|t| t.chars().next_back())
+            .and_then(|p| p.last_text_mut())
+            .and_then(|t| t.text.chars().next_back())
     }
 
     /// Add the appropriate opening quotation marks.
@@ -4151,8 +4340,8 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 self.writing
                     .elem_stack
                     .last_mut_predicate(|p| !p.is_empty())
-                    .and_then(|p| p.0.last_mut())
-                    .and_then(get_last_text)
+                    .and_then(|p| p.last_text_mut())
+                    .map(|f| &mut f.text)
                     .unwrap_or_else(|| {
                         used_buf = true;
                         self.writing.buf.as_string_mut()
