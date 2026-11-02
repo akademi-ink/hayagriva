@@ -232,6 +232,10 @@ pub struct CaseFolder {
     /// parsing flushes the buffer without ending the run, so first-word and
     /// after-punctuation detection must not use `last_reconfig`.
     case_start: usize,
+    /// Whether the next word continues a value whose beginning was already
+    /// case-folded before a markup boundary. Such a word is not the first
+    /// word of the value.
+    continuation: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -351,6 +355,7 @@ impl Default for CaseFolder {
             last_reconfig: 0,
             last_word: None,
             case_start: 0,
+            continuation: false,
         }
     }
 }
@@ -402,6 +407,16 @@ impl CaseFolder {
         }
 
         self.pristine = false;
+    }
+
+    /// Mark the next word as continuing an already-started value.
+    pub fn mark_continuation(&mut self) {
+        self.continuation = true;
+    }
+
+    /// Forget the continuation state of a value.
+    pub fn clear_continuation(&mut self) {
+        self.continuation = false;
     }
 
     /// Prevent whitespace trimming before and after the current position.
@@ -557,8 +572,11 @@ impl CaseFolder {
                     // Check if the word should be decapitalized.
                     let mut lookup = true;
 
-                    // Do not lowercase if the word follows punctuation.
+                    // Do not lowercase if the word follows punctuation. A
+                    // word that continues a value across a markup boundary
+                    // did not follow punctuation: the boundary is zero-width.
                     lookup &= !config.always_capitalize_after_punctuation
+                        || self.continuation
                         || !data.follows_punctuation;
 
                     if let Some(min_len) = config.always_capitalize_min_len {
@@ -639,9 +657,10 @@ impl CaseFolder {
 
     /// Whether no word precedes `data` since the last reconfiguration.
     fn is_first_word(&self, data: WordData) -> bool {
-        self.buf[self.case_start.min(data.start)..data.start]
-            .chars()
-            .all(char::is_whitespace)
+        !self.continuation
+            && self.buf[self.case_start.min(data.start)..data.start]
+                .chars()
+                .all(char::is_whitespace)
     }
 
     /// Whether the word at `data` directly follows `!`, `?` or `:`

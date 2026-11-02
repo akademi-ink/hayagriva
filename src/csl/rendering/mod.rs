@@ -47,12 +47,11 @@ impl RenderCsl for citationberg::Text {
         // The formatting inherited from the element's ancestors; affixes are
         // decorated by it but not by the element's own formatting (F-116).
         let ambient = *ctx.writing.formatting();
-        // While rendering bibliography entries, citeproc-js opens the
-        // formatting scope of a text element around its value only: affixes
-        // and quote marks stay outside and inherit the enclosing formatting.
-        // The value is rendered in its own scope element so that serializers
-        // can reproduce the tags.
-        let scoped = ctx.bibliography && !self.formatting.is_empty();
+        // citeproc-js opens the formatting scope of a text element around its
+        // value only: affixes and quote marks stay outside and inherit the
+        // enclosing formatting. The value is rendered in its own scope
+        // element so that serializers can reproduce the tags.
+        let scoped = !self.formatting.is_empty();
         let depth = ctx.push_elem(if scoped {
             citationberg::Formatting::default()
         } else {
@@ -446,7 +445,16 @@ impl RenderCsl for citationberg::Number {
 
             Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
                 MaybeTyped::Typed(num),
-            ))) => write!(ctx, "{num}").unwrap(),
+            ))) => {
+                if self.form == NumberForm::Ordinal {
+                    // The value carries text around its number
+                    // (`"7, p. 3-8"`); the ordinal form still applies to the
+                    // number itself.
+                    render_typed_num(num.as_ref(), self.form, gender, ctx);
+                } else {
+                    write!(ctx, "{num}").unwrap();
+                }
+            }
 
             Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
                 MaybeTyped::String(s),
@@ -544,6 +552,16 @@ fn render_typed_num<T: EntryLike>(
     gender: Option<GrammarGender>,
     ctx: &mut Context<T>,
 ) {
+    if form == NumberForm::Ordinal {
+        // Ordinal terms may be gender-specific (`gender-form`); resolve them
+        // ourselves so the gender of the variable's term picks the right form.
+        let mut text = String::new();
+        num.with_ordinal_suffixes(&mut text, |n| ctx.ordinal_suffix(n, gender))
+            .unwrap();
+        push_with_superscripts(ctx, &text);
+        return;
+    }
+
     let lookup = ctx.ordinal_lookup();
     num.with_form(&mut SuperscriptWriter(ctx), form, gender, &lookup)
         .unwrap();
@@ -578,17 +596,15 @@ fn push_with_superscripts<T: EntryLike>(ctx: &mut Context<T>, text: &str) {
         rest.char_indices().find(|(_, c)| superscript_baseline(*c).is_some())
     {
         ctx.push_str(&rest[..pos]);
-        // citeproc-js writes one `<sup>` per Unicode superscript character
-        // (`1<sup>r</sup><sup>e</sup>` for the French ordinal). Flush each
-        // character as its own leaf so the serializer opens one tag pair per
-        // character even though the buffer coalescer merges equal formats.
-        let fmt = ctx.push_format(citationberg::Formatting {
+        // One element scope per superscript character: citeproc-js writes
+        // `<sup>r</sup><sup>e</sup>` for an ordinal suffix, and the element
+        // boundary keeps `simplify_children` from merging the two runs.
+        let loc = ctx.push_scoped_elem(citationberg::Formatting {
             vertical_align: Some(citationberg::VerticalAlign::Sup),
             ..Default::default()
         });
         ctx.push_str(superscript_baseline(c).unwrap());
-        ctx.writing.save_to_block_separate();
-        ctx.pop_format(fmt);
+        ctx.commit_elem(loc, None, None);
         rest = &rest[pos + c.len_utf8()..];
     }
 
