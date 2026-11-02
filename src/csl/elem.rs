@@ -115,7 +115,16 @@ pub(super) fn simplify_children(children: ElemChildren) -> ElemChildren {
         ElemChildren(children.0.into_iter().fold(Vec::new(), |mut acc, child| {
             match (child, acc.last_mut()) {
                 (ElemChild::Text(t), Some(ElemChild::Text(last)))
-                    if last.formatting == t.formatting =>
+                    if last.formatting == t.formatting
+                        // citeproc-js opens one tag pair per superscript blob,
+                        // and an ordinal suffix is one blob per Unicode
+                        // superscript character (`1<sup>e</sup><sup>r</sup>`).
+                        // Merging equal-format superscript leaves would turn
+                        // that into `1<sup>er</sup>`.
+                        && !matches!(
+                            t.formatting.vertical_align,
+                            VerticalAlign::Sup | VerticalAlign::Sub
+                        ) =>
                 {
                     merge_text(&mut last.text, &t.text);
                     return acc;

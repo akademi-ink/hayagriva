@@ -139,10 +139,13 @@ impl StyleContext<'_> {
                 (a.collation_cmp(&b, self.locale()), a.is_none() || b.is_none())
             }
             SortKey::Variable { variable: Variable::Date(d), .. } => {
-                let a = a.entry.resolve_date_variable(*d);
-                let b = b.entry.resolve_date_variable(*d);
+                let a = a.entry.resolve_date_range(*d);
+                let b = b.entry.resolve_date_range(*d);
 
                 match (a, b) {
+                    // citeproc-js's date sort key carries the end parts after
+                    // the start parts, so equal starts are ordered by their
+                    // ends (`sort_DateVariableRange`).
                     (Some(a), Some(b)) => (a.csl_cmp(&b), false),
                     (Some(_), None) => (Ordering::Greater, true),
                     (None, Some(_)) => (Ordering::Less, true),
@@ -286,14 +289,25 @@ impl StyleContext<'_> {
                 ),
                 Variable::Date(d) => (
                     item.entry
-                        .resolve_date_variable(*d)
+                        .resolve_date_range(*d)
                         .map(|d| {
-                            format!(
+                            // The group key mirrors the date sort key: start
+                            // parts followed by the end parts.
+                            let mut key = format!(
                                 "{:09}{:02}{:02}",
-                                d.year + 100_000,
-                                d.month.unwrap_or(0),
-                                d.day.unwrap_or(0)
-                            )
+                                d.start.year + 100_000,
+                                d.start.month.unwrap_or(0),
+                                d.start.day.unwrap_or(0)
+                            );
+                            if let Some(end) = d.end {
+                                key.push_str(&format!(
+                                    "{:09}{:02}{:02}",
+                                    end.year + 100_000,
+                                    end.month.unwrap_or(0),
+                                    end.day.unwrap_or(0)
+                                ));
+                            }
+                            key
                         })
                         .unwrap_or_default(),
                     false,

@@ -3588,6 +3588,20 @@ impl WritingContext {
     /// must happen if [`Display`] or formatting changes, as well as when we're
     /// done with an element.
     fn save_to_block(&mut self) {
+        self.save_to_block_inner(false);
+    }
+
+    /// Like [`Self::save_to_block`], but always starts a new text leaf even
+    /// when the last leaf has the same formatting.
+    ///
+    /// Serializers that open one tag pair per decorated blob need adjacent
+    /// equal-format runs to stay separate (citeproc-js writes one `<sup>` per
+    /// Unicode superscript character in a CSL ordinal).
+    fn save_to_block_separate(&mut self) {
+        self.save_to_block_inner(true);
+    }
+
+    fn save_to_block_inner(&mut self, separate: bool) {
         if self.buf.is_empty() {
             return;
         }
@@ -3595,7 +3609,8 @@ impl WritingContext {
         let format = *self.formatting();
 
         // Append to last child if formats match.
-        if let Some(child) = self.elem_stack.last_mut().0.last_mut()
+        if !separate
+            && let Some(child) = self.elem_stack.last_mut().0.last_mut()
             && let ElemChild::Text(child) = child
             && format == child.formatting
         {
@@ -4979,6 +4994,18 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.writing.prepare_variable_query(variable)?;
 
         self.instance.entry.resolve_date_variable(variable)
+    }
+
+    /// Resolve a date variable that may carry a range.
+    ///
+    /// Honors suppressions like [`Self::resolve_date_variable`].
+    fn resolve_date_range(
+        &self,
+        variable: csl_taxonomy::DateVariable,
+    ) -> Option<Cow<'a, crate::types::DateRange>> {
+        self.writing.prepare_variable_query(variable)?;
+
+        self.instance.entry.resolve_date_range(variable)
     }
 
     /// Resolve a literal date value (`"in press"`) for a date variable.
@@ -6709,6 +6736,120 @@ mod tests {
         assert_eq!(
             item.resolve_date_literal(DateVariable::Issued).as_deref(),
             Some("(in press)")
+        );
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_date_range_conversion() {
+        // Season months in a range are normalized on both ends.
+        let item: citationberg::json::Item = serde_json::from_str(
+            r#"{"id":"a","issued":{"date-parts":[[1999,21],[2001,22]]}}"#,
+        )
+        .unwrap();
+        let range = item.resolve_date_range(DateVariable::Issued).expect("range");
+        assert_eq!(range.start.year, 1999);
+        assert_eq!(range.start.month, None);
+        assert_eq!(range.start.season, Some(citationberg::taxonomy::Season::Spring));
+        let end = range.end.expect("end");
+        assert_eq!(end.year, 2001);
+        assert_eq!(end.month, None);
+        assert_eq!(end.season, Some(citationberg::taxonomy::Season::Summer));
+        assert!(!range.open_end);
+
+        // The single-date accessor exposes the start and never panics.
+        let start = item.resolve_date_variable(DateVariable::Issued).expect("start");
+        assert_eq!(start.year, 1999);
+
+        // A zero end (`[[1987], [0]]`) is an open range.
+        let item: citationberg::json::Item =
+            serde_json::from_str(r#"{"id":"b","issued":{"date-parts":[[1987],[0]]}}"#)
+                .unwrap();
+        let range = item.resolve_date_range(DateVariable::Issued).expect("range");
+        assert!(range.open_end);
+        assert!(range.is_range());
+    }
+
+    #[cfg(feature = "csl-json")]
+    #[test]
+    fn csl_json_date_range_rendering() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let en_locale =
+            fs::read_to_string(workspace.join("tests/data/locales-en-US.xml")).unwrap();
+        let en_locale: citationberg::Locale =
+            LocaleFile::from_xml(&en_locale).unwrap().into();
+        let locales = [en_locale];
+
+        let style = IndependentStyle::from_xml(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+  <info>
+    <id/>
+    <title/>
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <date prefix="(" suffix=")" variable="issued">
+        <date-part name="day" suffix=" "/>
+        <date-part form="long" name="month" suffix=" "/>
+        <date-part name="year"/>
+      </date>
+    </layout>
+  </citation>
+</style>"#,
+        )
+        .unwrap();
+
+        let render = |json: &str| -> String {
+            let item: citationberg::json::Item = serde_json::from_str(json).unwrap();
+            let mut driver = BibliographyDriver::new();
+            driver.citation(CitationRequest::new(
+                vec![CitationItem::with_entry(&item)],
+                &style,
+                None,
+                &locales,
+                None,
+            ));
+            let finished = driver.finish(BibliographyRequest {
+                style: &style,
+                locale: None,
+                locale_files: &locales,
+            });
+            let mut out = String::new();
+            finished.citations[0]
+                .citation
+                .write_buf(&mut out, BufWriteFormat::Plain)
+                .unwrap();
+            out
+        };
+
+        // Day, month and year all differ.
+        assert_eq!(
+            render(
+                r#"{"id":"a","type":"book","issued":{"date-parts":[[1987,8,3],[2003,10,23]]}}"#
+            ),
+            "(3 August 1987–23 October 2003)"
+        );
+        // Same year, different month.
+        assert_eq!(
+            render(
+                r#"{"id":"b","type":"book","issued":{"date-parts":[[2003,8],[2003,10]]}}"#
+            ),
+            "(August–October 2003)"
+        );
+        // Same month, different day: the start's suffix is dropped before the
+        // range delimiter.
+        assert_eq!(
+            render(
+                r#"{"id":"c","type":"book","issued":{"date-parts":[[2003,8,10],[2003,8,23]]}}"#
+            ),
+            "(10–23 August 2003)"
+        );
+        // An open range renders the delimiter and no end.
+        assert_eq!(
+            render(r#"{"id":"d","type":"book","issued":{"date-parts":[[1987],[0]]}}"#),
+            "(1987–)"
         );
     }
 
