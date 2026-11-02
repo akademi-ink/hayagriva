@@ -4607,11 +4607,12 @@ impl<'a, T: EntryLike> Context<'a, T> {
             s.chars().next_back().is_some_and(|c| matches!(c, ' ' | '\u{a0}'))
         });
 
-        // Punctuation eats spaces. Whitespace should be trimmed.
+        // Collapse duplicated whitespace at a seam. citeproc-js keeps a
+        // single trailing space before punctuation that follows as its own
+        // string (`(n.d.) .` in `bugreports_NoTitle`), so only a following
+        // space is eaten here.
         if ends_with_space
-            && s.chars()
-                .next()
-                .is_some_and(|c| matches!(c, ' ' | '\u{a0}' | '.' | ',' | ']' | ')'))
+            && s.chars().next().is_some_and(|c| matches!(c, ' ' | '\u{a0}'))
             && let Some(buf) = last_buffer(&mut self.writing)
         {
             buf.truncate(buf.trim_end_matches([' ', '\u{a0}']).len());
