@@ -290,15 +290,64 @@ fn absorbs_period(last: char) -> bool {
 /// e.g. a group delimiter `". "` followed by a `" ("` prefix, or a sibling
 /// prefix `". "` after a text ending in `"."`.
 fn merge_text(last: &mut String, next: &str) {
-    let next = match (last.chars().next_back(), next.chars().next()) {
-        (Some(a), Some('.')) if absorbs_period(a) => &next[1..],
-        (Some(a), Some(b)) if a == b && is_collapsible_seam_char(a) => {
-            &next[b.len_utf8()..]
+    let Some(first) = next.chars().next() else { return };
+
+    if let Some(previous) = last.chars().next_back() {
+        if previous == first && is_collapsible_seam_char(previous) {
+            last.push_str(&next[first.len_utf8()..]);
+            return;
         }
-        _ => next,
-    };
+
+        // citeproc-js's left-to-right punctuation map: the pair is replaced by
+        // the merged character(s) at the seam (`;` + `:` -> `;`, `:` + `!` ->
+        // `!`, `,` + `.` -> `,.`).
+        if let Some(merged) = punctuation_merge(previous, first) {
+            last.pop();
+            last.push_str(merged);
+            last.push_str(&next[first.len_utf8()..]);
+            return;
+        }
+    }
 
     last.push_str(next);
+}
+
+/// citeproc-js's `LtoR_MAP`: how a trailing punctuation character and a
+/// following leading punctuation character combine.
+fn punctuation_merge(last: char, first: char) -> Option<&'static str> {
+    Some(match (last, first) {
+        ('!', '.') => "!",
+        ('!', '?') => "!?",
+        ('!', ':') => "!",
+        ('!', ',') => "!,",
+        ('!', ';') => "!;",
+        ('?', '!') => "?!",
+        ('?', '.') => "?",
+        ('?', ':') => "?",
+        ('?', ',') => "?,",
+        ('?', ';') => "?;",
+        ('.', '!') => ".!",
+        ('.', '?') => ".?",
+        ('.', ':') => ".:",
+        ('.', ',') => ".,",
+        ('.', ';') => ".;",
+        (':', '!') => "!",
+        (':', '?') => "?",
+        (':', '.') => ":",
+        (':', ',') => ":,",
+        (':', ';') => ":;",
+        (',', '!') => ",!",
+        (',', '?') => ",?",
+        (',', ':') => ",:",
+        (',', '.') => ",.",
+        (',', ';') => ",;",
+        (';', '!') => "!",
+        (';', '?') => "?",
+        (';', ':') => ";",
+        (';', ',') => ";,",
+        (';', '.') => ";",
+        _ => return None,
+    })
 }
 
 /// Remove trailing whitespace from the last text run of `children`.

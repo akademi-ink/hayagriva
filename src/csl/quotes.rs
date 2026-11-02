@@ -110,7 +110,11 @@ impl SmartQuoter {
     /// Close the innermost quotation created by a `quotes="true"` element and
     /// return its closing mark.
     pub fn close_quotes<'a>(&mut self, marks: &'a QuoteMarks) -> &'a str {
+        if self.scopes.is_empty() {
+            return &marks.close_quote;
+        }
         let outer = self.close_form();
+        self.scopes.pop();
         if outer { &marks.close_quote } else { &marks.close_inner_quote }
     }
 

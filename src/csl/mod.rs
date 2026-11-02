@@ -3465,7 +3465,10 @@ impl<'a, T: EntryLike> Context<'a, T> {
 
     /// Pull punctuation into a quote if applicable
     fn do_pull_punctuation<'s>(&mut self, mut s: &'s str) -> &'s str {
-        if self.writing.pull_punctuation && s.starts_with(['.', ',', ';', '!', '?']) {
+        // citeproc-js's punctuation-in-quote only swaps terminal punctuation
+        // dot, comma, exclamation and question marks inside the quote;
+        // semicolons and colons stay outside (FullMontyQuotesIn).
+        if self.writing.pull_punctuation && s.starts_with(['.', ',', '!', '?']) {
             let marks = QuoteMarks::get(self.style);
 
             let mut used_buf = false;
@@ -3558,7 +3561,8 @@ impl<'a, T: EntryLike> Context<'a, T> {
             // Verbatim content keeps its own capitalization but still takes
             // part in smart quoting and leaves the case folder inside a word,
             // so following text is not mistaken for a new sentence.
-            let quoted = self.smart_quote(text);
+            let normalized = normalize_punctuation_spacing(text);
+            let quoted = self.smart_quote(&normalized);
             self.writing.buf.push_verbatim(&quoted);
             self.writing.pull_punctuation = false;
         } else {
@@ -3606,7 +3610,8 @@ impl<'a, T: EntryLike> Context<'a, T> {
     }
 
     fn push_str_plain_seam(&mut self, s: &str, mid: bool) {
-        let quoted = self.smart_quote(s);
+        let normalized = normalize_punctuation_spacing(s);
+        let quoted = self.smart_quote(&normalized);
         self.push_str_raw_seam(&quoted, mid)
     }
 
@@ -3640,17 +3645,20 @@ impl<'a, T: EntryLike> Context<'a, T> {
             }
         }
 
+        // Only literal spaces collapse at a seam; newlines and tabs are
+        // significant delimiters in some styles (e.g. the punctuation tests'
+        // blank lines).
         let ends_with_space = last_buffer(&mut self.writing)
-            .is_some_and(|s| s.chars().next_back().is_some_and(|c| c.is_whitespace()));
+            .is_some_and(|s| s.chars().next_back().is_some_and(|c| matches!(c, ' ' | '\u{a0}')));
 
         // Punctuation eats spaces. Whitespace should be trimmed.
         if ends_with_space
             && s.chars().next().is_some_and(|c| {
-                c.is_whitespace() || c == '.' || c == ',' || c == ']' || c == ')'
+                matches!(c, ' ' | '\u{a0}' | '.' | ',' | ']' | ')')
             })
             && let Some(buf) = last_buffer(&mut self.writing)
         {
-            buf.truncate(buf.trim_end().len());
+            buf.truncate(buf.trim_end_matches([' ', '\u{a0}']).len());
         }
 
         // Do not print duplicate affixes.
@@ -4161,6 +4169,30 @@ fn nodecor_formatting() -> citationberg::Formatting {
         text_decoration: Some(TextDecoration::None),
         vertical_align: Some(VerticalAlign::Baseline),
     }
+}
+
+/// citeproc-js normalizes French punctuation spacing in every appended
+/// string: a space before `:`, `;`, `?`, `!` or `»` becomes a narrow
+/// no-break space, and the space after `«` becomes one as well.
+fn normalize_punctuation_spacing(s: &str) -> Cow<'_, str> {
+    if !s.contains([':', ';', '?', '!', '\u{00ab}', '\u{00bb}']) {
+        return Cow::Borrowed(s);
+    }
+
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ':' | ';' | '?' | '!' | '\u{00bb}' if out.ends_with(' ') => {
+                out.pop();
+                out.push('\u{202f}');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+
+    let out = out.replace("\u{00ab} ", "\u{00ab}\u{202f}");
+    Cow::Owned(out)
 }
 
 /// Parse a rich-text tag at the start of `s`, returning its length and the

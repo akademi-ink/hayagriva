@@ -1,0 +1,56 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+“a” “b”; “c!” “d”
+semicolon; colon
+colon! exclamation
+comma,. period
+His « Anonymous » Life
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <group delimiter="&#x0A;">
+      <group delimiter=" ">
+        <text value="a" quotes="true"/>
+        <text value="b" quotes="true" suffix=";"/>
+        <text value="c" quotes="true" suffix="!"/>
+        <text value="d" quotes="true"/>
+      </group>
+      <group>
+        <text value="semicolon" suffix=";"/>
+        <text value="colon" prefix=": "/>
+      </group>
+      <group>
+        <text value="colon" suffix=":"/>
+        <text value="exclamation" prefix="! "/>
+      </group>
+      <group>
+        <text value="comma" suffix=","/>
+        <text value="period" prefix=". "/>
+      </group>
+      <text variable="title"/>
+      </group>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[[{ "id": "ITEM-1" }]]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  { "id": "ITEM-1", "type": "book", "title": "His « Anonymous » Life" }
+]
+<<===== INPUT =====<<
