@@ -563,7 +563,7 @@ fn superscript_baseline(c: char) -> Option<&'static str> {
 }
 
 fn render_page_range<T: EntryLike>(range: &PageRanges, ctx: &mut Context<T>) {
-    let format = ctx.style.csl.settings.page_range_format.unwrap_or_default();
+    let format = ctx.style.csl.settings.page_range_format;
     let delim = ctx
         .term(OtherTerm::PageRangeDelimiter.into(), TermForm::default(), false)
         .or(Some("–"));
@@ -574,14 +574,61 @@ fn render_page_range<T: EntryLike>(range: &PageRanges, ctx: &mut Context<T>) {
         .try_for_each(|r| match r {
             crate::PageRangesPart::Ampersand => ctx.write_str(" & "),
             crate::PageRangesPart::Comma => ctx.write_str(", "),
-            crate::PageRangesPart::EscapedRange(start, end) => PageRangeFormat::Expanded
-                .format(ctx, &start.to_string(), &end.to_string(), delim),
+            crate::PageRangesPart::EscapedRange(start, end) => {
+                // An escaped hyphen is literal: keep it and the page numbers
+                // verbatim (`327\-30` renders `327-30`).
+                write!(ctx, "{start}-{end}")
+            }
             crate::PageRangesPart::SinglePage(page) => ctx.write_str(&page.to_string()),
             crate::PageRangesPart::Range(start, end) => {
-                format.format(ctx, &start.to_string(), &end.to_string(), delim)
+                format_page_range(ctx, start, end, format, delim)
             }
         })
         .unwrap();
+}
+
+/// Format one page range like citeproc-js.
+///
+/// citeproc-js only applies the page-range formatter when both ends share the
+/// same non-numeric prefix; otherwise it keeps the range verbatim with a
+/// literal hyphen (`N110-5`, `n11564-1568`). Without a `page-range-format`
+/// the numbers are not expanded (`110-5` renders `110–5`).
+fn format_page_range<T: EntryLike>(
+    ctx: &mut Context<T>,
+    start: &Numeric,
+    end: &Numeric,
+    format: Option<PageRangeFormat>,
+    delim: Option<&str>,
+) -> std::fmt::Result {
+    let start = start.to_string();
+    let end = end.to_string();
+    let (start_prefix, _) = split_page_number(&start);
+    let (end_prefix, _) = split_page_number(&end);
+
+    if start_prefix != end_prefix {
+        return write!(ctx, "{}-{}", start.trim(), end.trim());
+    }
+
+    match format {
+        Some(format) => format.format(ctx, start.trim(), end.trim(), delim),
+        None => write!(ctx, "{}{}{}", start.trim(), delim.unwrap_or("–"), end.trim()),
+    }
+}
+
+/// Split a page number string into its non-numeric prefix and the numeric
+/// remainder (`n11564` -> `("n", "11564")`, `123N110` -> `("123N", "110")`).
+fn split_page_number(s: &str) -> (&str, &str) {
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_lowercase() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    (&trimmed[..start], &trimmed[start..])
 }
 
 /// Convert the hyphen of a roman-numeral range (`xxv-xxviii`) in a page value

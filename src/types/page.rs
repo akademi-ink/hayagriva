@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, fmt::Display, num::TryFromIntError, str::FromStr};
 
+use crate::types::numeric::NumericValue;
 use crate::{MaybeTyped, Numeric, NumericError};
 
 use super::{custom_deserialize, serialize_display};
@@ -79,12 +80,15 @@ impl PageRanges {
         for range in &self.ranges {
             match range {
                 PageRangesPart::SinglePage(_) => count += 1,
-                PageRangesPart::Range(s, e) | PageRangesPart::EscapedRange(s, e) => {
+                PageRangesPart::Range(s, e) => {
                     if s != e {
                         return true;
                     }
                     count += 1
                 }
+                // An escaped hyphen is literal: the value is one page-like
+                // string, not a range (`327\-30` stays singular).
+                PageRangesPart::EscapedRange(_, _) => count += 1,
                 _ => {}
             }
         }
@@ -304,7 +308,7 @@ impl FromStr for PageRangesPart {
             let start = parts.next().ok_or(PageRangesPartErr::Empty)?;
             let end = parts.next().ok_or(PageRangesPartErr::Empty)?;
 
-            let r = Self::EscapedRange(parse_number(start)?, parse_number(end)?);
+            let r = Self::EscapedRange(parse_page_number(start)?, parse_page_number(end)?);
             if parts.next().is_some() {
                 return Err(PageRangesPartErr::Malformed);
             }
@@ -316,7 +320,7 @@ impl FromStr for PageRangesPart {
                 (None, None) => unreachable!(),
                 (Some(start), None) => Self::SinglePage(parse_number(start)?),
                 (Some(start), Some(end)) => {
-                    Self::Range(parse_number(start)?, parse_number(end)?)
+                    Self::Range(parse_page_number(start)?, parse_page_number(end)?)
                 }
                 _ => unreachable!(),
             };
@@ -333,6 +337,43 @@ serialize_display!(PageRanges);
 
 fn parse_number(s: &str) -> Result<Numeric, NumericError> {
     Numeric::from_str(s)
+}
+
+/// Parse one side of a page range, including page numbers that embed a digit
+/// prefix (`8n11564`, `123N110`, `456K200`, `000c23`).
+///
+/// `Numeric` only accepts a non-numeric prefix before the number; citeproc-js's
+/// page-range grammar allows digits inside the prefix. Such values are stored
+/// as a `Numeric` with the whole prefix, so the range formatter can compare
+/// prefixes and keep citeproc's hyphen-vs-en-dash rule.
+fn parse_page_number(s: &str) -> Result<Numeric, NumericError> {
+    if let Ok(numeric) = Numeric::from_str(s) {
+        return Ok(numeric);
+    }
+
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_lowercase() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+
+    if start == 0 || start == end {
+        return Err(NumericError::NoNumber);
+    }
+
+    let value = trimmed[start..end]
+        .parse::<i32>()
+        .map_err(|_| NumericError::NoNumber)?;
+    Ok(Numeric {
+        value: NumericValue::Number(value),
+        prefix: Some(Box::new(trimmed[..start].to_string())),
+        suffix: None,
+    })
 }
 
 /// Split `s` into maximal chunks such that two successive chars satisfy `pred`.

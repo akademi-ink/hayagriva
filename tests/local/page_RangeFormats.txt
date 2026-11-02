@@ -1,0 +1,46 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+110–115
+N110-5
+n11564–n11568
+n11564-1568
+110–115
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0" page-range-format="expanded">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="page"/>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[
+  [{ "id": "ITEM-1" }],
+  [{ "id": "ITEM-2" }],
+  [{ "id": "ITEM-3" }],
+  [{ "id": "ITEM-4" }],
+  [{ "id": "ITEM-5" }]
+]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  { "id": "ITEM-1", "type": "book", "page": "110-115" },
+  { "id": "ITEM-2", "type": "book", "page": "N110 - 5" },
+  { "id": "ITEM-3", "type": "book", "page": "n11564 - n1568" },
+  { "id": "ITEM-4", "type": "book", "page": "n11564 - 1568" },
+  { "id": "ITEM-5", "type": "book", "page": "110-5" }
+]
+<<===== INPUT =====<<
