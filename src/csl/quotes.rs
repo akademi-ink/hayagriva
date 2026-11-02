@@ -72,6 +72,20 @@ impl QuoteMarks {
     }
 }
 
+/// A straight opening mark emitted by the quoter, remembered so it can be
+/// restored when no closing mark matches it.
+#[derive(Debug, Clone, Copy)]
+struct Opener {
+    /// Index of the text piece the mark was written to.
+    piece: usize,
+    /// Byte position in that piece.
+    pos: usize,
+    /// Length of the emitted mark.
+    len: usize,
+    /// The character to restore (unmatched single quotes become apostrophes).
+    restore: char,
+}
+
 /// A quotation scope opened by a quotation mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Scope {
@@ -127,7 +141,12 @@ impl SmartQuoter {
     /// opening mark.
     pub fn open_quotes<'a>(&mut self, marks: &'a QuoteMarks) -> &'a str {
         let outer = self.next_form(true, false);
-        self.scopes.push(Scope { family: true, typed: false, outer, restorable: false });
+        self.scopes.push(Scope {
+            family: true,
+            typed: false,
+            outer,
+            restorable: false,
+        });
         if outer { &marks.open_quote } else { &marks.open_inner_quote }
     }
 
@@ -142,88 +161,136 @@ impl SmartQuoter {
 
     /// Convert the quotation marks in `s`.
     pub fn apply(&mut self, s: &str, marks: &QuoteMarks) -> String {
-        if !s.chars().any(is_quote_like) {
-            return s.to_string();
+        let mut pieces = vec![s.to_string()];
+        self.apply_pieces(&mut pieces, marks);
+        pieces.pop().unwrap()
+    }
+
+    /// Convert the quotation marks across a sequence of text pieces that
+    /// belong to one logical string.
+    ///
+    /// Markup boundaries split a CSL-JSON value into several pieces, but
+    /// citeproc-js's quote flip-flopper runs over the value before markup is
+    /// resolved: a quotation opened before an `<i>` tag is still open after
+    /// it. Carrying the state (and the previous character) across pieces
+    /// reproduces that.
+    pub fn apply_pieces(&mut self, pieces: &mut [String], marks: &QuoteMarks) {
+        if !pieces.iter().any(|piece| piece.chars().any(is_quote_like)) {
+            return;
         }
 
         let start_depth = self.scopes.len();
-        let mut out = String::with_capacity(s.len() + 8);
-
-        // Straight opening marks that have not been closed yet, as (byte
-        // position in `out`, emitted length, character to restore). They are
-        // restored at the end of the string.
-        let mut openers: Vec<(usize, usize, char)> = Vec::new();
-
-        let mut chars = s.chars().peekable();
+        let mut openers: Vec<Opener> = Vec::new();
         let mut prev: Option<char> = None;
         // Whether `prev` opened a quotation scope: adjacent openers nest
         // (`'"abc"'`), while a closing mark is never an opener.
         let mut prev_opened = false;
-        while let Some(c) = chars.next() {
-            let next = chars.peek().copied();
-            let opens_context = is_open_context(prev) || prev_opened;
-            let mut did_open = false;
-            match c {
-                '"' | '“' => {
-                    if c == '“' {
-                        self.open(&mut out, &mut openers, marks, c, true, true);
-                        did_open = true;
-                    } else if opens_context {
-                        self.open(&mut out, &mut openers, marks, c, true, false);
-                        did_open = true;
-                    } else if self.scopes.last().is_some_and(|s| s.family) {
-                        self.close(&mut out, marks, &mut openers);
-                    } else {
-                        out.push(c);
+
+        for (piece_idx, piece) in pieces.iter_mut().enumerate() {
+            let mut out = String::with_capacity(piece.len() + 8);
+            let mut chars = piece.chars().peekable();
+            while let Some(c) = chars.next() {
+                let next = chars.peek().copied();
+                let opens_context = is_open_context(prev) || prev_opened;
+                let mut did_open = false;
+                match c {
+                    '"' | '“' => {
+                        if c == '“' {
+                            self.open(
+                                &mut out,
+                                &mut openers,
+                                piece_idx,
+                                marks,
+                                c,
+                                true,
+                                true,
+                            );
+                            did_open = true;
+                        } else if opens_context {
+                            self.open(
+                                &mut out,
+                                &mut openers,
+                                piece_idx,
+                                marks,
+                                c,
+                                true,
+                                false,
+                            );
+                            did_open = true;
+                        } else if self.scopes.last().is_some_and(|s| s.family) {
+                            self.close(&mut out, marks, &mut openers);
+                        } else {
+                            out.push(c);
+                        }
                     }
-                }
-                '\'' | '‘' | '’' => {
-                    let apostrophe = matches!(c, '\'' | '’')
-                        && prev.is_some_and(char::is_alphanumeric)
-                        && next.is_some_and(char::is_alphanumeric);
-                    if c == '‘' {
-                        self.open(&mut out, &mut openers, marks, c, false, true);
-                        did_open = true;
-                    } else if apostrophe {
-                        // An apostrophe never opens or closes a scope.
-                        out.push('’');
-                    } else if opens_context {
-                        self.open(&mut out, &mut openers, marks, c, false, false);
-                        did_open = true;
-                    } else if self.scopes.last().is_some_and(|s| !s.family) {
-                        self.close(&mut out, marks, &mut openers);
-                    } else {
-                        out.push(if c == '\'' { '’' } else { c });
+                    '\'' | '‘' | '’' => {
+                        let apostrophe = matches!(c, '\'' | '’')
+                            && prev.is_some_and(char::is_alphanumeric)
+                            && next.is_some_and(char::is_alphanumeric);
+                        if c == '‘' {
+                            self.open(
+                                &mut out,
+                                &mut openers,
+                                piece_idx,
+                                marks,
+                                c,
+                                false,
+                                true,
+                            );
+                            did_open = true;
+                        } else if apostrophe {
+                            // An apostrophe never opens or closes a scope.
+                            out.push('’');
+                        } else if opens_context {
+                            self.open(
+                                &mut out,
+                                &mut openers,
+                                piece_idx,
+                                marks,
+                                c,
+                                false,
+                                false,
+                            );
+                            did_open = true;
+                        } else if self.scopes.last().is_some_and(|s| !s.family) {
+                            self.close(&mut out, marks, &mut openers);
+                        } else {
+                            out.push(if c == '\'' { '’' } else { c });
+                        }
                     }
-                }
-                '”' => {
-                    if self.scopes.last().is_some_and(|s| s.family) {
-                        self.close(&mut out, marks, &mut openers);
-                    } else {
-                        out.push(c);
+                    '”' => {
+                        if self.scopes.last().is_some_and(|s| s.family) {
+                            self.close(&mut out, marks, &mut openers);
+                        } else {
+                            out.push(c);
+                        }
                     }
+                    _ => out.push(c),
                 }
-                _ => out.push(c),
+                prev_opened = did_open;
+                prev = Some(c);
             }
-            prev_opened = did_open;
-            prev = Some(c);
+            *piece = out;
         }
 
         // Restore the straight opening marks that were never closed and drop
-        // their scopes.
-        for (pos, len, restore) in openers.into_iter().rev() {
-            out.replace_range(pos..pos + len, &restore.to_string());
+        // their scopes, like citeproc-js neutralizes unmatched quote tags.
+        for opener in openers.into_iter().rev() {
+            pieces[opener.piece].replace_range(
+                opener.pos..opener.pos + opener.len,
+                &opener.restore.to_string(),
+            );
         }
         self.scopes.truncate(start_depth);
-
-        out
     }
 
     /// Emit an opening mark for `orig`.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         out: &mut String,
-        openers: &mut Vec<(usize, usize, char)>,
+        openers: &mut Vec<Opener>,
+        piece: usize,
         marks: &QuoteMarks,
         orig: char,
         family: bool,
@@ -236,24 +303,20 @@ impl SmartQuoter {
             // restored; unmatched double quotes stay straight (citeproc-js
             // behavior).
             let restore = if orig == '\'' { '’' } else { orig };
-            openers.push((out.len(), mark.len(), restore));
+            openers.push(Opener { piece, pos: out.len(), len: mark.len(), restore });
         }
         out.push_str(mark);
         self.scopes.push(Scope { family, typed, outer, restorable: !typed });
     }
 
     /// Emit a closing mark for the innermost scope.
-    fn close(
-        &mut self,
-        out: &mut String,
-        marks: &QuoteMarks,
-        openers: &mut Vec<(usize, usize, char)>,
-    ) {
+    fn close(&mut self, out: &mut String, marks: &QuoteMarks, openers: &mut Vec<Opener>) {
         let scope = self.scopes.pop().unwrap();
         if scope.restorable {
             openers.pop();
         }
-        let mark = if scope.outer { &marks.close_quote } else { &marks.close_inner_quote };
+        let mark =
+            if scope.outer { &marks.close_quote } else { &marks.close_inner_quote };
         out.push_str(mark);
     }
 }

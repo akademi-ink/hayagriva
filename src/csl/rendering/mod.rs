@@ -47,12 +47,11 @@ impl RenderCsl for citationberg::Text {
         // The formatting inherited from the element's ancestors; affixes are
         // decorated by it but not by the element's own formatting (F-116).
         let ambient = *ctx.writing.formatting();
-        // While rendering bibliography entries, citeproc-js opens the
-        // formatting scope of a text element around its value only: affixes
-        // and quote marks stay outside and inherit the enclosing formatting.
-        // The value is rendered in its own scope element so that serializers
-        // can reproduce the tags.
-        let scoped = ctx.bibliography && !self.formatting.is_empty();
+        // citeproc-js opens the formatting scope of a text element around its
+        // value only: affixes and quote marks stay outside and inherit the
+        // enclosing formatting. The value is rendered in its own scope
+        // element so that serializers can reproduce the tags.
+        let scoped = !self.formatting.is_empty();
         let depth = ctx.push_elem(if scoped {
             citationberg::Formatting::default()
         } else {

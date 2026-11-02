@@ -768,6 +768,18 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
 
                     let mut children = simplify_children(ElemChildren(elem_children));
                     coalesce_text_runs(&mut children, formatting);
+                    // citeproc-js opens the citation layout's formatting
+                    // around the whole cite, affixes and delimiters included,
+                    // and keeps it open across nested reset scopes (e.g. a
+                    // bold layout around node-level markup that flips bold
+                    // off). Record it as a scope so serializers can do the
+                    // same instead of splitting the tag at every reset run.
+                    if formatting != Formatting::default() && children.has_content() {
+                        children = ElemChildren(vec![
+                            Elem { children, display: None, meta: None, formatting }
+                                .into(),
+                        ]);
+                    }
                     children
                 },
             })
@@ -1746,12 +1758,9 @@ fn disambiguate_with_choose<F, T>(
     let mut trial_keys = Vec::with_capacity(levels.len());
     let mut all_named = true;
     for (entry, level) in &levels {
-        let Some(&(cite_idx, item_idx)) = group
-            .iter()
-            .find(|(cite_idx, item_idx)| {
-                std::ptr::eq(renders[*cite_idx].items[*item_idx].entry, *entry)
-            })
-        else {
+        let Some(&(cite_idx, item_idx)) = group.iter().find(|(cite_idx, item_idx)| {
+            std::ptr::eq(renders[*cite_idx].items[*item_idx].entry, *entry)
+        }) else {
             all_named = false;
             break;
         };
@@ -1767,8 +1776,10 @@ fn disambiguate_with_choose<F, T>(
             Some(DisambiguateState::Choose(*level)),
         );
         match props {
-            Some(props) => trial_keys
-                .push(name_disambiguation_key(&maximal_name_props(props), &get_names(&children))),
+            Some(props) => trial_keys.push(name_disambiguation_key(
+                &maximal_name_props(props),
+                &get_names(&children),
+            )),
             None => {
                 all_named = false;
                 break;
@@ -4272,7 +4283,11 @@ impl<'a, T: EntryLike> Context<'a, T> {
     /// use it to reproduce citeproc-js's tags for a formatting declaration.
     fn push_scoped_elem(&mut self, format: citationberg::Formatting) -> DisplayLoc {
         let mut loc = self.writing.push_elem(format);
-        if self.bibliography {
+        // Record the declaration as a scope for both citation and
+        // bibliography trees. Serializers reproduce citeproc-js's formatting
+        // tags from it; plain-text consumers ignore it because the leaves
+        // still carry their fully resolved formatting.
+        if !format.is_empty() {
             loc.2 = Formatting::default().apply(format);
         }
         loc
@@ -4437,7 +4452,10 @@ impl<'a, T: EntryLike> Context<'a, T> {
             .is_some_and(|c| matches!(c, '.' | ',' | '!' | '?'))
         {
             (
-                merged.chars().filter(|c| matches!(c, '.' | ',' | '!' | '?')).collect(),
+                merged
+                    .chars()
+                    .filter(|c| matches!(c, '.' | ',' | '!' | '?'))
+                    .collect(),
                 merged.chars().filter(|c| matches!(c, ':' | ';')).collect(),
             )
         } else {
@@ -4473,20 +4491,25 @@ impl<'a, T: EntryLike> Context<'a, T> {
             return;
         }
 
-        let mut stack: Vec<MarkupOpen> = Vec::new();
+        /// One piece of a rich-text string: text or a tag.
+        enum Token {
+            Text(usize),
+            Tag(MarkupTag, usize, usize),
+        }
+
+        let mut texts: Vec<String> = Vec::new();
+        let mut tokens: Vec<Token> = Vec::new();
         let mut start = 0;
         let mut i = 0;
-        let mut any_pushed = false;
 
         while i < s.len() {
             if s.as_bytes()[i] == b'<' {
                 if let Some((len, tag)) = parse_markup_tag(&s[i..]) {
-                    let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
-                    let mid = any_pushed;
-                    any_pushed |= !s[start..i].is_empty();
-                    self.push_markup_text(&s[start..i], nocase, mid);
-                    self.apply_markup_tag(tag, &mut stack);
-                    any_pushed = true;
+                    if start < i {
+                        texts.push(s[start..i].to_string());
+                        tokens.push(Token::Text(texts.len() - 1));
+                    }
+                    tokens.push(Token::Tag(tag, i, i + len));
                     i += len;
                     start = i;
                     continue;
@@ -4494,9 +4517,62 @@ impl<'a, T: EntryLike> Context<'a, T> {
             }
             i += 1;
         }
+        if start < s.len() {
+            texts.push(s[start..].to_string());
+            tokens.push(Token::Text(texts.len() - 1));
+        }
 
-        let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
-        self.push_markup_text(&s[start..], nocase, any_pushed);
+        // citeproc-js converts quotes over the whole value before markup is
+        // resolved, so a quotation opened before a formatting tag is still
+        // open after it (`flipflop_SingleQuotesOnItalics`).
+        let marks = QuoteMarks::get(self.style);
+        self.writing.quoter.apply_pieces(&mut texts, &marks);
+
+        let mut stack: Vec<MarkupOpen> = Vec::new();
+        let mut any_pushed = false;
+
+        for token in tokens {
+            match token {
+                Token::Text(idx) => {
+                    let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
+                    let mid = any_pushed;
+                    any_pushed |= !texts[idx].is_empty();
+                    self.push_markup_text(&texts[idx], nocase, mid, true);
+                }
+                Token::Tag(tag, tag_start, tag_end) => {
+                    let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
+
+                    // citeproc-js leaves a closing tag with no matching open
+                    // scope in the string; the HTML writer escapes its angle
+                    // brackets (`flipflop_ItalicsSimple` ITEM-6).
+                    let matched_close = match &tag {
+                        MarkupTag::Close(kind) => {
+                            stack.iter().any(|open| open.matches(*kind))
+                        }
+                        MarkupTag::CloseSpan => stack.iter().any(|open| {
+                            matches!(
+                                open,
+                                MarkupOpen::NoCase
+                                    | MarkupOpen::Format(_, _, true)
+                                    | MarkupOpen::FormatOnly(_, _, true)
+                            )
+                        }),
+                        MarkupTag::Open(_) | MarkupTag::OpenSpan(_) => true,
+                    };
+                    if matched_close {
+                        self.apply_markup_tag(tag, &mut stack);
+                    } else {
+                        self.push_markup_text(
+                            &s[tag_start..tag_end],
+                            nocase,
+                            false,
+                            true,
+                        );
+                    }
+                    any_pushed = true;
+                }
+            }
+        }
 
         self.close_markup_scopes(&mut stack, 0);
     }
@@ -4505,8 +4581,9 @@ impl<'a, T: EntryLike> Context<'a, T> {
     ///
     /// `mid` marks segments that continue a string already partly pushed:
     /// their leading whitespace and the preceding trailing whitespace must
-    /// survive the case-folder's sentence-start trimming.
-    fn push_markup_text(&mut self, text: &str, nocase: bool, mid: bool) {
+    /// survive the case-folder's sentence-start trimming. `quoted` marks text
+    /// whose quotation marks were already converted over the whole string.
+    fn push_markup_text(&mut self, text: &str, nocase: bool, mid: bool, quoted: bool) {
         if text.is_empty() {
             return;
         }
@@ -4515,11 +4592,15 @@ impl<'a, T: EntryLike> Context<'a, T> {
             // part in smart quoting and leaves the case folder inside a word,
             // so following text is not mistaken for a new sentence.
             let normalized = normalize_punctuation_spacing(text);
-            let quoted = self.smart_quote(&normalized);
-            self.writing.buf.push_verbatim(&quoted);
+            let quoted_text = if quoted {
+                normalized.into_owned()
+            } else {
+                self.smart_quote(&normalized)
+            };
+            self.writing.buf.push_verbatim(&quoted_text);
             self.writing.pull_punctuation = false;
         } else {
-            self.push_str_plain_seam(text, mid);
+            self.push_str_plain_seam_quoted(text, mid, quoted);
         }
     }
 
@@ -4528,8 +4609,13 @@ impl<'a, T: EntryLike> Context<'a, T> {
         match tag {
             MarkupTag::Open(MarkupKind::NoCase) => stack.push(MarkupOpen::NoCase),
             MarkupTag::Open(kind) => {
-                let idx = self.push_format(markup_formatting(kind));
-                stack.push(MarkupOpen::Format(kind, idx));
+                Self::open_markup_scope(self, kind, false, stack);
+            }
+            MarkupTag::OpenSpan(MarkupKind::NoCase) => {
+                stack.push(MarkupOpen::NoCase);
+            }
+            MarkupTag::OpenSpan(kind) => {
+                Self::open_markup_scope(self, kind, true, stack);
             }
             MarkupTag::Close(kind) => {
                 // Close the innermost matching scope, tolerating malformed
@@ -4540,7 +4626,12 @@ impl<'a, T: EntryLike> Context<'a, T> {
             }
             MarkupTag::CloseSpan => {
                 if let Some(pos) = stack.iter().rposition(|open| {
-                    matches!(open, MarkupOpen::Span(_) | MarkupOpen::NoCase)
+                    matches!(
+                        open,
+                        MarkupOpen::NoCase
+                            | MarkupOpen::Format(_, _, true)
+                            | MarkupOpen::FormatOnly(_, _, true)
+                    )
                 }) {
                     self.close_markup_scopes(stack, pos);
                 }
@@ -4548,13 +4639,76 @@ impl<'a, T: EntryLike> Context<'a, T> {
         }
     }
 
+    /// Open the formatting scope of a rich-text tag.
+    ///
+    /// `nodecor` is applied as a plain run formatting rather than an element
+    /// scope: it has no positive tag to reproduce, and its all-normal scope
+    /// (with the baseline sentinel) is what the writer diffs against the
+    /// enclosing decorations.
+    fn open_markup_scope(
+        &mut self,
+        kind: MarkupKind,
+        from_span: bool,
+        stack: &mut Vec<MarkupOpen>,
+    ) {
+        let formatting = self.flip_markup_formatting(kind);
+        if kind == MarkupKind::NoDecor {
+            let idx = self.push_format(formatting);
+            stack.push(MarkupOpen::FormatOnly(kind, idx, from_span));
+        } else {
+            let loc = self.push_scoped_elem(formatting);
+            stack.push(MarkupOpen::Format(kind, loc, from_span));
+        }
+    }
+
+    /// Formatting applied when a rich-text tag opens.
+    ///
+    /// citeproc-js's flip-flopper toggles a decoration against the formatting
+    /// already in effect: an `<i>` inside an italic scope flips to normal (and
+    /// a nested `<i>` inside that flips back to italic), and the same holds
+    /// for bold and small caps. This is what makes nested same-decoration
+    /// input markup render as citeproc-js's explicit reset spans.
+    fn flip_markup_formatting(&self, kind: MarkupKind) -> citationberg::Formatting {
+        use citationberg::{FontStyle, FontVariant, FontWeight};
+
+        let mut formatting = markup_formatting(kind);
+        let current = *self.writing.formatting();
+        match kind {
+            MarkupKind::Italic => {
+                formatting.font_style =
+                    Some(if current.font_style == FontStyle::Italic {
+                        FontStyle::Normal
+                    } else {
+                        FontStyle::Italic
+                    });
+            }
+            MarkupKind::Bold => {
+                formatting.font_weight =
+                    Some(if current.font_weight == FontWeight::Bold {
+                        FontWeight::Normal
+                    } else {
+                        FontWeight::Bold
+                    });
+            }
+            MarkupKind::SmallCaps => {
+                formatting.font_variant =
+                    Some(if current.font_variant == FontVariant::SmallCaps {
+                        FontVariant::Normal
+                    } else {
+                        FontVariant::SmallCaps
+                    });
+            }
+            _ => {}
+        }
+        formatting
+    }
+
     fn close_markup_scopes(&mut self, stack: &mut Vec<MarkupOpen>, pos: usize) {
         while stack.len() > pos {
             match stack.pop().unwrap() {
                 MarkupOpen::NoCase => {}
-                MarkupOpen::Format(_, idx) | MarkupOpen::Span(idx) => {
-                    self.pop_format(idx)
-                }
+                MarkupOpen::Format(_, loc, _) => self.commit_elem(loc, None, None),
+                MarkupOpen::FormatOnly(_, idx, _) => self.pop_format(idx),
             }
         }
     }
@@ -4565,8 +4719,13 @@ impl<'a, T: EntryLike> Context<'a, T> {
     }
 
     fn push_str_plain_seam(&mut self, s: &str, mid: bool) {
+        self.push_str_plain_seam_quoted(s, mid, false)
+    }
+
+    fn push_str_plain_seam_quoted(&mut self, s: &str, mid: bool, quoted: bool) {
         let normalized = normalize_punctuation_spacing(s);
-        let quoted = self.smart_quote(&normalized);
+        let quoted =
+            if quoted { normalized.into_owned() } else { self.smart_quote(&normalized) };
         self.push_str_raw_seam(&quoted, mid)
     }
 
@@ -4600,6 +4759,16 @@ impl<'a, T: EntryLike> Context<'a, T> {
             }
         }
 
+        fn last_formatting(ctx: &mut WritingContext) -> Option<Formatting> {
+            if !ctx.buf.is_empty() {
+                return Some(*ctx.formatting());
+            }
+            ctx.elem_stack
+                .last_mut_predicate(|s| !s.is_empty())
+                .and_then(|e| e.last_text_mut())
+                .map(|text| text.formatting)
+        }
+
         // Only literal spaces collapse at a seam; newlines and tabs are
         // significant delimiters in some styles (e.g. the punctuation tests'
         // blank lines).
@@ -4618,15 +4787,31 @@ impl<'a, T: EntryLike> Context<'a, T> {
             buf.truncate(buf.trim_end_matches([' ', '\u{a0}']).len());
         }
 
-        // Do not print duplicate affixes.
+        // Do not print duplicate affixes. Usually the later copy replaces
+        // the earlier one, which keeps a period outside a following
+        // subsequent-author substitution (`fullstyles_ChicagoAuthorDateSimple`).
+        // When the earlier mark sits inside a different formatting scope,
+        // however, truncating it would move the mark out of its tags
+        // (`punctuation_FieldDuplicates`): keep it and drop the duplicate
+        // prefix from `s` instead.
+        let mut duplicate_prefix = 0;
         if s.chars().all(|c| !c.is_alphabetic()) {
             let trimmed = s.trim_end();
-            if let Some(last) = last_buffer(&mut self.writing)
-                && let Some(strip) = last.strip_suffix(trimmed)
-            {
-                last.truncate(strip.len());
+            if !trimmed.is_empty() {
+                let current = *self.writing.formatting();
+                let last_formatting = last_formatting(&mut self.writing);
+                if let Some(last) = last_buffer(&mut self.writing)
+                    && last.ends_with(trimmed)
+                {
+                    if last_formatting.is_some_and(|f| f == current) {
+                        last.truncate(last.len() - trimmed.len());
+                    } else {
+                        duplicate_prefix = trimmed.len();
+                    }
+                }
             }
         }
+        let s = &s[duplicate_prefix..];
 
         if self.writing.strip_periods {
             // Replicate citeproc.js behavior: remove a period if the
@@ -5224,16 +5409,21 @@ enum MarkupKind {
 /// A rich-text scope opened by a tag in an input string.
 enum MarkupOpen {
     NoCase,
-    Format(MarkupKind, FormatIdx),
-    Span(FormatIdx),
+    /// A formatting scope opened by a tag. The flag records whether the tag
+    /// was a `span`, which `</span>` closes regardless of its declaration.
+    Format(MarkupKind, DisplayLoc, bool),
+    /// A formatting change without an element scope (`nodecor`). The last
+    /// flag is `from_span`; `</span>` closes it like a span scope.
+    FormatOnly(MarkupKind, FormatIdx, bool),
 }
 
 impl MarkupOpen {
     fn matches(&self, kind: MarkupKind) -> bool {
         match self {
             MarkupOpen::NoCase => kind == MarkupKind::NoCase,
-            MarkupOpen::Format(open, _) => *open == kind,
-            MarkupOpen::Span(_) => false,
+            MarkupOpen::Format(open, _, _) | MarkupOpen::FormatOnly(open, _, _) => {
+                *open == kind
+            }
         }
     }
 }
@@ -5241,6 +5431,8 @@ impl MarkupOpen {
 /// A parsed rich-text tag: either an opening or a closing tag.
 enum MarkupTag {
     Open(MarkupKind),
+    /// A `span` opening tag; `</span>` closes it whatever it declared.
+    OpenSpan(MarkupKind),
     Close(MarkupKind),
     /// `</span>` closes the innermost span scope, whatever it declared.
     CloseSpan,
@@ -5341,11 +5533,11 @@ fn parse_markup_tag(s: &str) -> Option<(usize, MarkupTag)> {
                 "nodecor" => MarkupKind::NoDecor,
                 _ => return None,
             };
-            return Some((len, MarkupTag::Open(kind)));
+            return Some((len, MarkupTag::OpenSpan(kind)));
         }
         if let Some(style) = attribute_value(rest, "style") {
             let kind = parse_css_formatting(style)?;
-            return Some((len, MarkupTag::Open(kind)));
+            return Some((len, MarkupTag::OpenSpan(kind)));
         }
         return None;
     }
