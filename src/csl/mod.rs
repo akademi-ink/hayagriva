@@ -953,6 +953,10 @@ impl<T: EntryLike + Hash + PartialEq + Eq + Debug> BibliographyDriver<'_, T> {
         if let Some(bib) = &mut bib_render {
             for item in &mut bib.items {
                 strip_empty_displays(&mut item.content);
+                // citeproc-js purges empty display blobs before its
+                // first-position prefix adjustment, then hoists a leading
+                // space out in front of the display block that becomes first.
+                crate::csl::elem::migrate_leading_display_space(&mut item.content);
             }
         }
         for citation in &mut final_citations {

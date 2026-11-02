@@ -404,6 +404,40 @@ pub(super) fn trim_trailing_whitespace(children: &mut ElemChildren) {
     }
 }
 
+/// Move a leading space from the entry's first display block out in front of
+/// that block.
+///
+/// citeproc-js migrates a first-position child's prefix upward through the
+/// output queue (`CSL.Output.Queue.adjust.upward`). When an empty
+/// `display="block"` group precedes a `display="left-margin"` group, the
+/// latter becomes the first child and its leading space ends up on the entry
+/// itself, before the opening `<div>`, instead of inside it
+/// (`bugreports_NoCaseEscape`). Only a space directly at the start of the
+/// first display child is moved; a leading space inside a later block stays
+/// where it is.
+pub(super) fn migrate_leading_display_space(children: &mut ElemChildren) {
+    let Some(ElemChild::Elem(first)) = children.0.first_mut() else {
+        return;
+    };
+    if first.display.is_none() {
+        return;
+    }
+    let Some(ElemChild::Text(text)) = first.children.0.first_mut() else {
+        return;
+    };
+    if !text.text.starts_with(' ') {
+        return;
+    }
+    text.text.remove(0);
+    children.0.insert(
+        0,
+        ElemChild::Text(Formatted {
+            text: " ".to_string(),
+            formatting: Formatting::default(),
+        }),
+    );
+}
+
 /// Collapse duplicated collapsible characters at the seams between adjacent
 /// text leaves, also across element boundaries (e.g. a group suffix followed
 /// by a sibling's prefix). Seams between differently formatted leaves are
