@@ -465,7 +465,15 @@ impl RenderCsl for citationberg::Number {
             }
             Some(NumberOrPageVariableResult::Number(NumberVariableResult::Regular(
                 MaybeTyped::String(s),
-            ))) => ctx.push_str(&s),
+            ))) => {
+                // A non-pure numeric field can still carry several values
+                // with embedded labels and ranges (`"7, p. 3-8"`). citeproc-js
+                // normalizes those (ordinal master value, plural page label,
+                // en-dash range) instead of printing the field verbatim.
+                if !render_number_field_string(&s, self.form, gender, ctx) {
+                    ctx.push_str(&s);
+                }
+            }
 
             Some(NumberOrPageVariableResult::Number(
                 NumberVariableResult::Transparent(n),
@@ -544,6 +552,194 @@ impl RenderCsl for citationberg::Number {
             (false, UsageInfo { has_vars: true, ..Default::default() })
         }
     }
+}
+
+
+/// One component of a non-pure numeric field (`"7, p. 3-8"`).
+struct NumberFieldPart {
+    /// Whether the component is preceded by an embedded `p.`/`pp.` label.
+    page_label: bool,
+    /// The numeric value itself, without the label.
+    value: String,
+    /// The text that joins this component to the next one.
+    join: String,
+}
+
+/// Parse and render a numeric field that citeproc-js would split into several
+/// values (`processNumber`). Only fields carrying an embedded page label are
+/// handled, which is the shape that cannot be expressed as a single
+/// [`Numeric`]: `"7, p. 3-8"` renders as `7th, pp. 3–8`.
+///
+/// Returns `false` when the string is not such a field, so the caller prints
+/// it verbatim (`"5 ed."` stays `"5 ed."`).
+fn render_number_field_string<T: EntryLike>(
+    s: &str,
+    form: NumberForm,
+    gender: Option<GrammarGender>,
+    ctx: &mut Context<T>,
+) -> bool {
+    if !s.contains("p. ") && !s.contains("pp. ") {
+        return false;
+    }
+
+    let mut parts = Vec::new();
+    let mut rest = s;
+    loop {
+        let (chunk, join, next) = split_number_field(rest);
+        let (page_label, value) = strip_page_label(chunk);
+        parts.push(NumberFieldPart {
+            page_label,
+            value: value.trim().to_string(),
+            join: join.to_string(),
+        });
+        match next {
+            Some(next) => rest = next,
+            None => break,
+        }
+    }
+
+    // A plain comma-separated page list inherits the label it follows
+    // (`p. 3, 5`); citeproc-js keeps the current label until a new one starts.
+    for i in 1..parts.len() {
+        if !parts[i].page_label
+            && parts[i - 1].page_label
+            && !parts[i].value.is_empty()
+        {
+            parts[i].page_label = true;
+        }
+    }
+
+    let has_number = parts.iter().any(|p| Numeric::from_str(&p.value).is_ok());
+    if !has_number || !parts.iter().any(|p| p.page_label) {
+        return false;
+    }
+
+    let range_delim = ctx
+        .term(OtherTerm::PageRangeDelimiter.into(), TermForm::default(), false)
+        .unwrap_or("–")
+        .to_string();
+
+    let mut previous_page = None;
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let previous = &parts[i - 1];
+            let previous_is_page = previous.page_label;
+            let is_page = part.page_label;
+            if is_page && previous_is_page && (previous.join == "–" || previous.join == "-")
+            {
+                ctx.push_str(&range_delim);
+            } else {
+                ctx.push_str(&previous.join);
+            }
+        }
+
+        // The label is printed once per run, in the short form
+        // (`p.`/`pp.`), pluralized when the run holds several values.
+        if part.page_label && previous_page != Some(true) {
+            let plural = parts
+                .iter()
+                .skip(i)
+                .take_while(|p| p.page_label)
+                .count()
+                > 1;
+            if let Some(label) = ctx.term(
+                Term::from(NumberOrPageVariable::Page(PageVariable::Page)),
+                TermForm::Short,
+                plural,
+            ) {
+                ctx.push_str(label);
+                ctx.push_str(" ");
+            }
+        }
+        previous_page = Some(part.page_label);
+
+        // Ordinal forms apply to the field's own (unlabelled) values, not to
+        // embedded page numbers.
+        if form == NumberForm::Ordinal && !part.page_label {
+            match Numeric::from_str(&part.value) {
+                Ok(num) => render_typed_num(&num, form, gender, ctx),
+                Err(_) => ctx.push_str(&part.value),
+            }
+        } else {
+            ctx.push_str(&part.value);
+        }
+    }
+
+    true
+}
+
+/// Split off the first component of a numeric field, its joining text, and
+/// the remainder. Joiners mirror citeproc-js's `processNumber` regex: comma or
+/// semicolon with whitespace, `&`/`and` joins, and numeric hyphen ranges.
+fn split_number_field(s: &str) -> (&str, &str, Option<&str>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match byte {
+            b',' | b';' if bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace) => {
+                let mut end = i + 1;
+                while bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
+                    end += 1;
+                }
+                return (&s[..i], &s[i..end], Some(&s[end..]));
+            }
+            b'&' if i > 0
+                && bytes[i - 1].is_ascii_whitespace()
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace) =>
+            {
+                return (&s[..i], " & ", Some(&s[i + 1..]));
+            }
+            b'-' | 0xe2 if is_numeric_range_at(s, i) => {
+                let (join_start, join_end, next) = range_join_bounds(s, i);
+                return (&s[..join_start], &s[join_start..join_end], Some(next));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (s, "", None)
+}
+
+/// Whether the hyphen/en-dash at byte `i` separates two numeric values.
+fn is_numeric_range_at(s: &str, i: usize) -> bool {
+    let before = s[..i].trim_end().chars().next_back();
+    let after = match s.as_bytes()[i] {
+        b'-' => s[i + 1..].trim_start().chars().next(),
+        // U+2013 is three UTF-8 bytes; the byte check only screens candidates.
+        0xe2 if s[i..].starts_with('–') => s[i + '–'.len_utf8()..].trim_start().chars().next(),
+        _ => None,
+    };
+    before.is_some_and(|c| c.is_ascii_digit())
+        && after.is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Bounds of the joining text for a numeric range at byte `i`: the dash plus
+/// any surrounding whitespace.
+fn range_join_bounds(s: &str, i: usize) -> (usize, usize, &str) {
+    let dash_len = if s[i..].starts_with('–') { '–'.len_utf8() } else { 1 };
+    let mut start = i;
+    while start > 0 && s.as_bytes()[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    let mut end = i + dash_len;
+    while s.as_bytes().get(end).is_some_and(u8::is_ascii_whitespace) {
+        end += 1;
+    }
+    (start, end, &s[end..])
+}
+
+/// Strip a leading `p.`/`pp.` label from a numeric component.
+fn strip_page_label(chunk: &str) -> (bool, &str) {
+    let trimmed = chunk.trim_start();
+    for label in ["pp.", "p."] {
+        if let Some(rest) = trimmed.strip_prefix(label)
+            && rest.starts_with(char::is_whitespace)
+        {
+            return (true, rest.trim_start());
+        }
+    }
+    (false, chunk)
 }
 
 fn render_typed_num<T: EntryLike>(
