@@ -751,8 +751,18 @@ fn render_label_with_var<T: EntryLike>(
     let ambient = *ctx.writing.formatting();
     let idx = ctx.push_format(label.formatting);
 
-    let affixes = &label.affixes;
-    let affix_loc = ctx.apply_prefix(affixes, ambient);
+    // citeproc-js merges a label suffix that starts with terminal punctuation
+    // into punctuation the term already ends with: `eds.` plus `.)` renders
+    // `(eds.)`, not `(eds..)`. Only the label path does this; layout suffixes
+    // keep their own collapse rules.
+    let mut affixes = label.affixes.clone();
+    if let Some(suffix) = affixes.suffix.clone()
+        && suffix.starts_with('.')
+        && ctx.last_char() == Some('.')
+    {
+        affixes.suffix = Some(suffix[1..].to_string());
+    }
+    let affix_loc = ctx.apply_prefix(&affixes, ambient);
 
     ctx.may_strip_periods(label.strip_periods);
     let cidx = ctx.push_case(label.text_case);
@@ -761,7 +771,7 @@ fn render_label_with_var<T: EntryLike>(
 
     ctx.pop_case(cidx);
     ctx.stop_stripping_periods();
-    ctx.apply_suffix(affixes, affix_loc, ambient);
+    ctx.apply_suffix(&affixes, affix_loc, ambient);
     ctx.pop_format(idx);
 }
 
@@ -1649,8 +1659,8 @@ impl From<TextCase> for Case {
         match case {
             TextCase::Uppercase => Case::Uppercase,
             TextCase::Lowercase => Case::Lowercase,
-            TextCase::TitleCase => Case::Title(TitleCase::default()),
-            TextCase::SentenceCase => Case::Sentence(SentenceCase::default()),
+            TextCase::TitleCase => Case::CslTitle,
+            TextCase::SentenceCase => Case::CslSentence,
             TextCase::CapitalizeFirst => Case::FirstUpper,
             TextCase::CapitalizeAll => Case::AllUpper,
         }

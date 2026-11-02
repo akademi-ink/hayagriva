@@ -1,0 +1,46 @@
+>>===== MODE =====>>
+citation
+<<===== MODE =====<<
+
+>>===== RESULT =====>>
+Out-of-Fashion Initiatives: A Second Story
+iPad Is a Thing
+Saline Solution of β-Carotine
+About Arvâsî
+Redirecting Intercultural Research For
+<<===== RESULT =====<<
+
+>>===== CSL =====>>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+  <info>
+    <id />
+    <title />
+    <updated>2009-08-10T04:49:00+09:00</updated>
+  </info>
+  <citation>
+    <layout>
+      <text variable="title" text-case="title"/>
+    </layout>
+  </citation>
+</style>
+<<===== CSL =====<<
+
+>>===== CITATION-ITEMS =====>>
+[
+  [{ "id": "ITEM-1" }],
+  [{ "id": "ITEM-2" }],
+  [{ "id": "ITEM-3" }],
+  [{ "id": "ITEM-4" }],
+  [{ "id": "ITEM-5" }]
+]
+<<===== CITATION-ITEMS =====<<
+
+>>===== INPUT =====>>
+[
+  { "id": "ITEM-1", "type": "book", "title": "out-of-fashion initiatives: a second story" },
+  { "id": "ITEM-2", "type": "book", "title": "iPad is a thing" },
+  { "id": "ITEM-3", "type": "book", "title": "saline solution of β-carotine" },
+  { "id": "ITEM-4", "type": "book", "title": "about arvâsî" },
+  { "id": "ITEM-5", "type": "book", "title": "redirecting intercultural research for" }
+]
+<<===== INPUT =====<<

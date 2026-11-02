@@ -29,7 +29,7 @@ use crate::csl::elem::{
 use crate::csl::rendering::RenderCsl;
 use crate::csl::rendering::names::{DisambiguatedNameForm, NameDisambiguationProperties};
 use crate::csl::taxonomy::NumberOrPageVariableResult;
-use crate::lang::CaseFolder;
+use crate::lang::{Case, CaseFolder};
 use crate::types::{ChunkKind, ChunkedString, Date, MaybeTyped, Person};
 
 use self::elem::last_text_mut_child;
@@ -2675,7 +2675,7 @@ pub(crate) struct WritingContext {
     /// children.
     format_stack: NonEmptyStack<Formatting>,
     /// Text cases.
-    cases: NonEmptyStack<Option<TextCase>>,
+    cases: NonEmptyStack<Option<Case>>,
     /// Inheritable name options.
     name_options: NonEmptyStack<InheritableNameOptions>,
     /// Delimiters from ancestor delimiting elements (e.g., `cs:group`).
@@ -2983,7 +2983,7 @@ impl WritingContext {
     }
 
     /// Set the case of the next text.
-    fn push_case(&mut self, case: Option<TextCase>) -> CaseIdx {
+    fn push_case(&mut self, case: Option<Case>) -> CaseIdx {
         let idx = self.cases.len();
         self.cases.push(case);
         CaseIdx(idx)
@@ -2999,8 +2999,7 @@ impl WritingContext {
     }
     /// Reconfigures the case folder's case to the current
     fn reconfigure(&mut self) {
-        self.buf
-            .reconfigure((*self.cases.last()).map(Into::into).unwrap_or_default());
+        self.buf.reconfigure((*self.cases.last()).unwrap_or_default());
     }
 
     /// Set the delimiter of the children of a [`citationberg::Group`] or
@@ -3436,6 +3435,20 @@ impl<'a, T: EntryLike> Context<'a, T> {
         self.writing.ensure_space()
     }
 
+    /// The last character rendered so far, if any.
+    fn last_char(&mut self) -> Option<char> {
+        self.writing.save_to_block();
+        if let Some(c) = self.writing.buf.as_string_mut().chars().next_back() {
+            return Some(c);
+        }
+        self.writing
+            .elem_stack
+            .last_mut_predicate(|p| !p.is_empty())
+            .and_then(|p| p.0.last_mut())
+            .and_then(get_last_text)
+            .and_then(|t| t.chars().next_back())
+    }
+
     /// Add the appropriate opening quotation marks.
     fn push_quotes(&mut self) {
         let marks = QuoteMarks::get(self.style);
@@ -3492,16 +3505,126 @@ impl<'a, T: EntryLike> Context<'a, T> {
     }
 
     /// Add a string to the buffer.
+    ///
+    /// Strings from CSL-JSON variables may contain citeproc-js's rich-text
+    /// markup (`<i>`, `<b>`, `<sc>`, `<sup>`, `<sub>`, `<span class="nocase">`
+    /// and `<span style="...">`). Tags are turned into formatting scopes and
+    /// `nocase` content bypasses case folding; the tags themselves never reach
+    /// the output.
     fn push_str(&mut self, s: &str) {
+        if !s.contains('<') {
+            self.push_str_plain(s);
+            return;
+        }
+
+        let mut stack: Vec<MarkupOpen> = Vec::new();
+        let mut start = 0;
+        let mut i = 0;
+        let mut any_pushed = false;
+
+        while i < s.len() {
+            if s.as_bytes()[i] == b'<' {
+                if let Some((len, tag)) = parse_markup_tag(&s[i..]) {
+                    let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
+                    let mid = any_pushed;
+                    any_pushed |= !s[start..i].is_empty();
+                    self.push_markup_text(&s[start..i], nocase, mid);
+                    self.apply_markup_tag(tag, &mut stack);
+                    any_pushed = true;
+                    i += len;
+                    start = i;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        let nocase = stack.iter().any(|o| matches!(o, MarkupOpen::NoCase));
+        self.push_markup_text(&s[start..], nocase, any_pushed);
+
+        self.close_markup_scopes(&mut stack, 0);
+    }
+
+    /// Push a text segment found between rich-text tags.
+    ///
+    /// `mid` marks segments that continue a string already partly pushed:
+    /// their leading whitespace and the preceding trailing whitespace must
+    /// survive the case-folder's sentence-start trimming.
+    fn push_markup_text(&mut self, text: &str, nocase: bool, mid: bool) {
+        if text.is_empty() {
+            return;
+        }
+        if nocase {
+            // Verbatim content keeps its own capitalization but still takes
+            // part in smart quoting and leaves the case folder inside a word,
+            // so following text is not mistaken for a new sentence.
+            let quoted = self.smart_quote(text);
+            self.writing.buf.push_verbatim(&quoted);
+            self.writing.pull_punctuation = false;
+        } else {
+            self.push_str_plain_seam(text, mid);
+        }
+    }
+
+    /// Apply one rich-text tag, recording the scopes it opens.
+    fn apply_markup_tag(&mut self, tag: MarkupTag, stack: &mut Vec<MarkupOpen>) {
+        match tag {
+            MarkupTag::Open(MarkupKind::NoCase) => stack.push(MarkupOpen::NoCase),
+            MarkupTag::Open(kind) => {
+                let idx = self.push_format(markup_formatting(kind));
+                stack.push(MarkupOpen::Format(kind, idx));
+            }
+            MarkupTag::Close(kind) => {
+                // Close the innermost matching scope, tolerating malformed
+                // nesting by closing everything opened inside it.
+                if let Some(pos) = stack.iter().rposition(|open| open.matches(kind)) {
+                    self.close_markup_scopes(stack, pos);
+                }
+            }
+            MarkupTag::CloseSpan => {
+                if let Some(pos) = stack.iter().rposition(|open| {
+                    matches!(open, MarkupOpen::Span(_) | MarkupOpen::NoCase)
+                }) {
+                    self.close_markup_scopes(stack, pos);
+                }
+            }
+        }
+    }
+
+    fn close_markup_scopes(&mut self, stack: &mut Vec<MarkupOpen>, pos: usize) {
+        while stack.len() > pos {
+            match stack.pop().unwrap() {
+                MarkupOpen::NoCase => {}
+                MarkupOpen::Format(_, idx) | MarkupOpen::Span(idx) => self.pop_format(idx),
+            }
+        }
+    }
+
+    /// Add a string to the buffer without rich-text parsing.
+    fn push_str_plain(&mut self, s: &str) {
+        self.push_str_plain_seam(s, false)
+    }
+
+    fn push_str_plain_seam(&mut self, s: &str, mid: bool) {
         let quoted = self.smart_quote(s);
-        self.push_str_raw(&quoted)
+        self.push_str_raw_seam(&quoted, mid)
     }
 
     /// Add a string to the buffer without smart quote conversion.
     fn push_str_raw(&mut self, s: &str) {
+        self.push_str_raw_seam(s, false)
+    }
+
+    fn push_str_raw_seam(&mut self, s: &str, mid: bool) {
         let s = self.do_pull_punctuation(s);
 
+        if mid {
+            self.writing.buf.prevent_trimming();
+        }
         self.writing.reconfigure();
+        if mid {
+            self.writing.buf.prevent_trimming();
+        }
 
         fn last_buffer(ctx: &mut WritingContext) -> Option<&mut String> {
             let last = ctx
@@ -3686,6 +3809,28 @@ impl<'a, T: EntryLike> Context<'a, T> {
                 })
                 .unwrap_or(true)
         {
+            // Turkish and Azeri casing is locale-dependent even for the
+            // language-independent `uppercase`/`lowercase` transforms
+            // (`i` uppercases to `İ`, `I` lowercases to `ı`).
+            let turkic = self
+                .instance
+                .locale
+                .map(|locale| locale.0.clone())
+                .or_else(|| self.instance.entry.language().map(Cow::into_owned))
+                .is_some_and(|locale| {
+                    locale
+                        .split(['-', '_'])
+                        .next()
+                        .is_some_and(|lang| {
+                            lang.eq_ignore_ascii_case("tr")
+                                || lang.eq_ignore_ascii_case("az")
+                        })
+                });
+            let case = case.map(|case| match (case, turkic) {
+                (TextCase::Uppercase, true) => Case::UppercaseTurkic,
+                (TextCase::Lowercase, true) => Case::LowercaseTurkic,
+                _ => case.into(),
+            });
             self.writing.push_case(case)
         } else {
             self.writing.push_case(None)
@@ -3943,6 +4088,184 @@ struct CaseIdx(NonZeroUsize);
 
 #[must_use = "delimiter stack must be popped"]
 struct DelimiterIdx(NonZeroUsize);
+
+/// A rich-text tag kind from CSL-JSON input (citeproc-js's accepted HTML
+/// subset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkupKind {
+    Italic,
+    Bold,
+    SmallCaps,
+    Underline,
+    Sup,
+    Sub,
+    NoCase,
+    NoDecor,
+}
+
+/// A rich-text scope opened by a tag in an input string.
+enum MarkupOpen {
+    NoCase,
+    Format(MarkupKind, FormatIdx),
+    Span(FormatIdx),
+}
+
+impl MarkupOpen {
+    fn matches(&self, kind: MarkupKind) -> bool {
+        match self {
+            MarkupOpen::NoCase => kind == MarkupKind::NoCase,
+            MarkupOpen::Format(open, _) => *open == kind,
+            MarkupOpen::Span(_) => false,
+        }
+    }
+}
+
+/// A parsed rich-text tag: either an opening or a closing tag.
+enum MarkupTag {
+    Open(MarkupKind),
+    Close(MarkupKind),
+    /// `</span>` closes the innermost span scope, whatever it declared.
+    CloseSpan,
+}
+
+/// Formatting applied by a rich-text tag.
+fn markup_formatting(kind: MarkupKind) -> citationberg::Formatting {
+    use citationberg::{
+        FontStyle, FontVariant, FontWeight, Formatting, TextDecoration, VerticalAlign,
+    };
+
+    let mut formatting = Formatting::default();
+    match kind {
+        MarkupKind::Italic => formatting.font_style = Some(FontStyle::Italic),
+        MarkupKind::Bold => formatting.font_weight = Some(FontWeight::Bold),
+        MarkupKind::SmallCaps => formatting.font_variant = Some(FontVariant::SmallCaps),
+        MarkupKind::Underline => formatting.text_decoration = Some(TextDecoration::Underline),
+        MarkupKind::Sup => formatting.vertical_align = Some(VerticalAlign::Sup),
+        MarkupKind::Sub => formatting.vertical_align = Some(VerticalAlign::Sub),
+        MarkupKind::NoDecor => return nodecor_formatting(),
+        MarkupKind::NoCase => {}
+    }
+    formatting
+}
+
+/// Formatting that nullifies any inherited decoration (`nodecor`).
+fn nodecor_formatting() -> citationberg::Formatting {
+    use citationberg::{
+        FontStyle, FontVariant, FontWeight, Formatting, TextDecoration, VerticalAlign,
+    };
+
+    Formatting {
+        font_style: Some(FontStyle::Normal),
+        font_variant: Some(FontVariant::Normal),
+        font_weight: Some(FontWeight::Normal),
+        text_decoration: Some(TextDecoration::None),
+        vertical_align: Some(VerticalAlign::Baseline),
+    }
+}
+
+/// Parse a rich-text tag at the start of `s`, returning its length and the
+/// scope it opens or closes.
+///
+/// Recognized tags mirror citeproc-js's CSL-JSON markup: `<i>`, `<b>`, `<sc>`,
+/// `<sup>`, `<sub>`, `<span class="nocase">`/`<span class="nodecor">` and
+/// `<span style="...">` with the CSS properties citeproc-js understands.
+fn parse_markup_tag(s: &str) -> Option<(usize, MarkupTag)> {
+    if !s.starts_with('<') {
+        return None;
+    }
+
+    let close = s.starts_with("</");
+    let body_start = if close { 2 } else { 1 };
+    let end = s[body_start..].find('>')? + body_start;
+    let mut body = &s[body_start..end];
+    let len = end + 1;
+    if let Some(stripped) = body.strip_suffix('/') {
+        body = stripped.trim_end();
+    }
+
+    if body == "span" {
+        return if close { Some((len, MarkupTag::CloseSpan)) } else { None };
+    }
+
+    if let Some(rest) = body.strip_prefix("span") {
+        if close {
+            return Some((len, MarkupTag::CloseSpan));
+        }
+        if let Some(class) = attribute_value(rest, "class") {
+            let kind = match class.trim() {
+                "nocase" => MarkupKind::NoCase,
+                "nodecor" => MarkupKind::NoDecor,
+                _ => return None,
+            };
+            return Some((len, MarkupTag::Open(kind)));
+        }
+        if let Some(style) = attribute_value(rest, "style") {
+            let kind = parse_css_formatting(style)?;
+            return Some((len, MarkupTag::Open(kind)));
+        }
+        return None;
+    }
+
+    let kind = match body {
+        "i" => MarkupKind::Italic,
+        "b" => MarkupKind::Bold,
+        "sc" => MarkupKind::SmallCaps,
+        "sup" => MarkupKind::Sup,
+        "sub" => MarkupKind::Sub,
+        _ => return None,
+    };
+    Some((len, if close { MarkupTag::Close(kind) } else { MarkupTag::Open(kind) }))
+}
+
+/// Map the CSS declarations citeproc-js accepts in `style` attributes to a
+/// markup kind. Only the first recognized declaration is used.
+fn parse_css_formatting(style: &str) -> Option<MarkupKind> {
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        let kind = match (property.as_str(), value.as_str()) {
+            ("font-style", "italic" | "oblique") => MarkupKind::Italic,
+            ("font-variant", "small-caps") => MarkupKind::SmallCaps,
+            ("font-weight", "bold") => MarkupKind::Bold,
+            ("text-decoration", "underline") => MarkupKind::Underline,
+            ("vertical-align", "sup" | "super") => MarkupKind::Sup,
+            ("vertical-align", "sub" | "subscript") => MarkupKind::Sub,
+            ("font-style" | "font-variant" | "font-weight", "normal")
+            | ("vertical-align", "baseline") => MarkupKind::NoDecor,
+            _ => continue,
+        };
+        return Some(kind);
+    }
+    None
+}
+
+/// The value of an HTML attribute (double- or single-quoted).
+fn attribute_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = tag.trim_start();
+    while !rest.is_empty() {
+        let eq = rest.find('=')?;
+        let key = rest[..eq].trim();
+        let after = rest[eq + 1..].trim_start();
+        let (value, remaining) = if let Some(after) = after.strip_prefix('"') {
+            let end = after.find('"')?;
+            (&after[..end], &after[end + 1..])
+        } else if let Some(after) = after.strip_prefix('\'') {
+            let end = after.find('\'')?;
+            (&after[..end], &after[end + 1..])
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            (&after[..end], &after[end..])
+        };
+        if key.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
+        rest = remaining.trim_start();
+    }
+    None
+}
 
 impl<T: EntryLike> Write for Context<'_, T> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
@@ -4578,6 +4901,53 @@ mod tests {
 
         assert_eq!(c1, "Downs (1957)");
         assert_eq!(c2, "Brady & Collier (2010)");
+    }
+
+    #[test]
+    fn input_rich_text_markup() {
+        // citeproc-js parses a small HTML subset in CSL-JSON strings:
+        // formatting tags become runs, `nocase` content bypasses text-case,
+        // and the tags never reach the output.
+        let style = citationberg::Style::from_xml(
+            r#"<style xmlns="http://purl.org/net/xbiblio/csl" class="note" version="1.0">
+                 <info><id/><title/><updated>2009-08-10T04:49:00+09:00</updated></info>
+                 <citation>
+                   <layout><text variable="title" text-case="title" quotes="true"/></layout>
+                 </citation>
+               </style>"#,
+        )
+        .unwrap();
+        let citationberg::Style::Independent(style) = style else { unreachable!() };
+
+        let library = crate::io::from_yaml_str(
+            r#"a:
+                 type: Book
+                 title: a <i>smith</i> <b>pencil</b> <span class="nocase">SMITH</span>
+            "#,
+        )
+        .unwrap();
+        let entry = library.get("a").unwrap();
+
+        let mut driver = BibliographyDriver::new();
+        driver.citation(CitationRequest::new(
+            vec![CitationItem::with_entry(entry)],
+            &style,
+            None,
+            &[],
+            None,
+        ));
+        let rendered = driver.finish(BibliographyRequest {
+            style: &style,
+            locale: None,
+            locale_files: &[],
+        });
+        let mut output = String::new();
+        rendered.citations[0]
+            .citation
+            .write_buf(&mut output, BufWriteFormat::Plain)
+            .unwrap();
+        // No locale files are loaded, so quotes fall back to straight quotes.
+        assert_eq!(output, "\"A Smith Pencil SMITH\"");
     }
 
     #[test]

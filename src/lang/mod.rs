@@ -116,6 +116,18 @@ pub enum Case {
     FirstUpper,
     /// Capitalize the first letter of each word.
     AllUpper,
+    /// CSL `text-case="title"` as implemented by citeproc-js: capitalize
+    /// lower-case words that are not stop words, never lower-case a word that
+    /// already contains capitals, and capitalize stop words only in the first
+    /// position, after `!`, `?` or `:`, and at the end of the title.
+    CslTitle,
+    /// CSL `text-case="sentence"` as implemented by citeproc-js: capitalize
+    /// the first word and lower-case everything else.
+    CslSentence,
+    /// Uppercase with Turkish/Azeri dotted/dotless i rules.
+    UppercaseTurkic,
+    /// Lowercase with Turkish/Azeri dotted/dotless i rules.
+    LowercaseTurkic,
 }
 
 impl Case {
@@ -173,7 +185,7 @@ impl CharClass {
                 }
             }
             _ if c.is_whitespace()
-                || (hyphen_separates && matches!(c, '-' | '–' | '—')) =>
+                || (hyphen_separates && matches!(c, '-' | '–' | '—' | '/')) =>
             {
                 match self {
                     Self::MaybeNewSentence => Self::NewSentence,
@@ -216,6 +228,10 @@ pub struct CaseFolder {
     last_reconfig: usize,
     /// Index of the last word in the buffer.
     last_word: Option<WordData>,
+    /// Start of the current case run (set on every reconfiguration). Markup
+    /// parsing flushes the buffer without ending the run, so first-word and
+    /// after-punctuation detection must not use `last_reconfig`.
+    case_start: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -334,6 +350,7 @@ impl Default for CaseFolder {
             buf: String::new(),
             last_reconfig: 0,
             last_word: None,
+            case_start: 0,
         }
     }
 }
@@ -360,9 +377,22 @@ impl CaseFolder {
                 self.buf.extend(s.chars().flat_map(char::to_uppercase));
                 self.char_class = CharClass::default();
             }
+            Case::UppercaseTurkic => {
+                self.buf.extend(s.chars().flat_map(turkic_upper));
+                self.char_class = CharClass::default();
+            }
             Case::Lowercase => {
                 self.buf.extend(s.chars().flat_map(char::to_lowercase));
                 self.char_class = CharClass::default();
+            }
+            Case::LowercaseTurkic => {
+                self.buf.extend(s.chars().flat_map(turkic_lower));
+                self.char_class = CharClass::default();
+            }
+            Case::CslTitle | Case::CslSentence => {
+                for c in s.chars() {
+                    self.push(c);
+                }
             }
             _ => {
                 for c in s.chars() {
@@ -405,6 +435,7 @@ impl CaseFolder {
         let prev_class = self.char_class;
         let hyphen_separates = match self.case {
             Case::Title(props) => props.hyphen_word_separator,
+            Case::CslTitle => true,
             _ => false,
         };
         self.char_class = prev_class.step(c, hyphen_separates);
@@ -452,8 +483,10 @@ impl CaseFolder {
                 }
             }
             Case::Uppercase => self.buf.extend(c.to_uppercase()),
+            Case::UppercaseTurkic => self.buf.extend(turkic_upper(c)),
             Case::Lowercase => self.buf.extend(c.to_lowercase()),
-            Case::NoTransform => self.buf.push(c),
+            Case::LowercaseTurkic => self.buf.extend(turkic_lower(c)),
+            Case::CslTitle | Case::CslSentence | Case::NoTransform => self.buf.push(c),
         }
 
         self.last_word = match self.last_word {
@@ -509,6 +542,14 @@ impl CaseFolder {
         };
 
         match self.case {
+            Case::CslTitle => {
+                self.process_csl_title_word(data);
+                return;
+            }
+            Case::CslSentence => {
+                self.process_csl_sentence_word(data);
+                return;
+            }
             Case::Title(config) => {
                 if config.keep_all_uppercase_words && data.is_all_upper() {
                     verdict = WordVerdict::AllUpper;
@@ -577,6 +618,98 @@ impl CaseFolder {
         }
     }
 
+    /// The alphabetic word at `data` (trailing punctuation is not part of the
+    /// word, matching citeproc-js's punctuation-split tokens).
+    fn word_text(&self, data: WordData) -> &str {
+        let mut end = data.start;
+        while end < data.end
+            && self.buf[end..]
+                .chars()
+                .next()
+                .map(char::is_alphanumeric)
+                .unwrap_or_default()
+        {
+            end += 1;
+            while !self.buf.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        &self.buf[data.start..end]
+    }
+
+    /// Whether no word precedes `data` since the last reconfiguration.
+    fn is_first_word(&self, data: WordData) -> bool {
+        self.buf[self.case_start.min(data.start)..data.start]
+            .chars()
+            .all(char::is_whitespace)
+    }
+
+    /// Whether the word at `data` directly follows `!`, `?` or `:`
+    /// (citeproc-js's `afterPunct`; commas, periods and dashes do not count).
+    fn follows_strong_punctuation(&self, data: WordData) -> bool {
+        self.buf[self.case_start.min(data.start)..data.start]
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace() && !matches!(c, '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '"' | '\''))
+            .is_some_and(|c| matches!(c, '!' | '?' | ':'))
+    }
+
+    /// citeproc-js `text-case="title"`: capitalize a word only when it is
+    /// entirely lower case, and only when it is not a stop word (except in
+    /// first position, after `!`/`?`/`:`, or as the last word).
+    fn process_csl_title_word(&mut self, data: WordData) {
+        let word = self.word_text(data).to_string();
+        let lower = word.to_lowercase();
+        // citeproc-js never touches words that already contain capitals.
+        if word != lower {
+            return;
+        }
+        let chars = word.chars().count();
+        // Single-character words are only capitalized in first position,
+        // after strong punctuation, or before a hyphen (citeproc-js requires
+        // `word.length > 1` for the ordinary capitalization rule).
+        let is_stop =
+            chars < 2 || en::CSL_SKIP_WORDS.binary_search(&lower.as_str()).is_ok();
+        // A stop word directly before a hyphen is capitalized ("Pro-
+        // Environmental"), but not when it also follows one ("Out-of-Fashion").
+        let followed_by_hyphen = self.buf[data.end..]
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '-' | '\u{2013}' | '\u{2014}' | '/'));
+        let preceded_by_hyphen = self.buf[..data.start]
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| matches!(c, '-' | '\u{2013}' | '\u{2014}' | '/'));
+        let hyphen_rule = followed_by_hyphen && !preceded_by_hyphen;
+
+        if is_stop
+            && !self.is_first_word(data)
+            && !self.follows_strong_punctuation(data)
+            && !hyphen_rule
+        {
+            return;
+        }
+        // citeproc-js's `_capitalise` leaves lone Greek letters untouched
+        // (they are often math symbols in titles).
+        if chars == 1
+            && word.chars().next().is_some_and(|c| ('\u{0370}'..='\u{03ff}').contains(&c))
+        {
+            return;
+        }
+        capitalize_char(&mut self.buf, data.start);
+    }
+
+    /// citeproc-js `text-case="sentence"`: capitalize the first word and
+    /// lower-case every other word.
+    fn process_csl_sentence_word(&mut self, data: WordData) {
+        if self.is_first_word(data) {
+            capitalize_char(&mut self.buf, data.start);
+        } else {
+            map_chars(&mut self.buf, data.start..data.end, |c| Some(c.to_lowercase()));
+        }
+    }
+
     fn may_trim_end(&mut self) {
         let trim = match self.case {
             Case::Title(config) => config.trim_end,
@@ -592,6 +725,22 @@ impl CaseFolder {
             self.buf.pop();
         }
         match self.case {
+            // citeproc-js capitalizes a trailing stop word to avoid ending a
+            // title in lower case ("... Research For").
+            Case::CslTitle => {
+                let Some(data) = self.last_word else { return };
+                if data.start < self.case_start {
+                    return;
+                }
+                let word = self.word_text(data).to_string();
+                let lower = word.to_lowercase();
+                if word == lower
+                    && lower.chars().count() > 1
+                    && en::CSL_SKIP_WORDS.binary_search(&lower.as_str()).is_ok()
+                {
+                    capitalize_char(&mut self.buf, data.start);
+                }
+            }
             Case::Title(config) if config.always_capitalize_last_word => {
                 let start = match self.last_word {
                     Some(data) => Some(data.start),
@@ -623,8 +772,15 @@ impl CaseFolder {
             return;
         }
 
+        // A case change ends the current case run: fold the pending word
+        // before the new case takes over, so the last word of a title is
+        // capitalized even when the closing quote or punctuation follows in
+        // a different case context.
+        self.process_word();
         self.may_trim_end();
+        self.last_word = None;
         self.last_reconfig = self.buf.len();
+        self.case_start = self.buf.len();
         self.pristine = true;
         self.case = case;
     }
@@ -716,6 +872,30 @@ where
             }
         }
     }
+}
+
+/// Uppercase a character with Turkish/Azeri dotted-i rules.
+fn turkic_upper(c: char) -> std::vec::IntoIter<char> {
+    let chars: Vec<char> = if c == 'i' {
+        vec!['\u{0130}']
+    } else if c == '\u{0131}' {
+        vec!['I']
+    } else {
+        c.to_uppercase().collect()
+    };
+    chars.into_iter()
+}
+
+/// Lowercase a character with Turkish/Azeri dotted-i rules.
+fn turkic_lower(c: char) -> std::vec::IntoIter<char> {
+    let chars: Vec<char> = if c == 'I' {
+        vec!['\u{0131}']
+    } else if c == '\u{0130}' {
+        vec!['i']
+    } else {
+        c.to_lowercase().collect()
+    };
+    chars.into_iter()
 }
 
 fn capitalize_char(buf: &mut String, start: usize) {
