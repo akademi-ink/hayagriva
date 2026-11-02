@@ -443,7 +443,7 @@ impl RenderCsl for Names {
                             if options.is_suppressed(
                                 i,
                                 p.len(),
-                                !ctx.instance.cite_props.certain.is_first,
+                                !ctx.instance.cite_props.certain.is_first_position(),
                             ) {
                                 0
                             } else {
@@ -486,7 +486,7 @@ impl RenderCsl for Names {
                             if options.is_suppressed(
                                 i,
                                 p.len(),
-                                !ctx.instance.cite_props.certain.is_first,
+                                !ctx.instance.cite_props.certain.is_first_position(),
                             ) {
                                 None
                             } else {
