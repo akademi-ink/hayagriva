@@ -1126,6 +1126,14 @@ fn scan_render<T: EntryLike>(
     request: &CitationRequest<'_, T>,
     state: Option<DisambiguateState>,
 ) -> (ElemChildren, Option<NameDisambiguationProperties>) {
+    // citeproc-js scans ambiguity on the regular cite: a suppress-author cite
+    // ("Sari (2024)" written as `Sari [-@key]`) must not collapse to a bare
+    // year, or two different authors of the same year look ambiguous and get
+    // spurious a/b suffixes. The visible render keeps the suppressed author.
+    let purpose = match purpose {
+        Some(CitePurpose::SuppressAuthor) => None,
+        other => other,
+    };
     let mut props = cite_props.clone();
     props.certain.position = Some(CitePosition::Subsequent);
     props.certain.near_note = Some(true);
